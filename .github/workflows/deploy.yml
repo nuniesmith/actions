@@ -78,6 +78,18 @@ on:
         required: false
         type: boolean
         default: true
+      
+      # Destroy Options (for destroy action)
+      destroy_scope:
+        description: 'What to destroy (for destroy action)'
+        required: false
+        type: string
+        default: 'service-only'
+      
+      confirm_destruction:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: false
+        type: string
 
     secrets:
       # Core Infrastructure
