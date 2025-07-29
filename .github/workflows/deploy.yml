@@ -531,8 +531,6 @@ jobs:
           cat > ~/.config/linode-cli/config << EOF
           [DEFAULT]
           default-user = DEFAULT
-          
-          [DEFAULT]
           token = ${{ secrets.LINODE_TOKEN }}
           EOF
           chmod 600 ~/.config/linode-cli/config
@@ -580,8 +578,6 @@ jobs:
           cat > ~/.config/linode-cli/config << EOF
           [DEFAULT]
           default-user = DEFAULT
-          
-          [DEFAULT]
           token = ${{ secrets.LINODE_TOKEN }}
           EOF
           chmod 600 ~/.config/linode-cli/config
@@ -647,8 +643,6 @@ jobs:
           region = ${{ env.TARGET_REGION }}
           type = ${{ env.SERVER_TYPE }}
           image = linode/arch
-          
-          [DEFAULT]
           token = ${{ secrets.LINODE_TOKEN }}
           EOF
           chmod 600 ~/.config/linode-cli/config
