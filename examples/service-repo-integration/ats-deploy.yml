@@ -53,7 +53,7 @@ on:
         description: 'Destroy and recreate Linode server'
         required: false
         type: boolean
-        default: false
+        default: true
       
       # Destroy Options (for destroy action)
       destroy_scope:
