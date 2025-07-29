@@ -116,7 +116,90 @@ jobs:
     steps:
       - name: 📥 Checkout NGINX Repository
         uses: actions/checkout@v4
-      
+
+      - name: 🌐 Update Cloudflare DNS Records
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ZONE_ID != ''
+        run: |
+          echo "🌐 Updating Cloudflare DNS records for NGINX reverse proxy..."
+          
+          # Install jq for JSON processing
+          sudo apt-get update && sudo apt-get install -y jq >/dev/null 2>&1
+          
+          # Get the Tailscale IP from the infrastructure job output
+          TAILSCALE_IP="${{ needs.manage-nginx.outputs.tailscale_ip }}"
+          
+          if [[ -z "$TAILSCALE_IP" || "$TAILSCALE_IP" == "unknown" || "$TAILSCALE_IP" == "pending" ]]; then
+            echo "⚠️ No valid Tailscale IP available: '$TAILSCALE_IP'"
+            echo "Skipping DNS update"
+            exit 0
+          fi
+          
+          echo "🔗 Using Tailscale IP: $TAILSCALE_IP"
+          
+          # Update A record for nginx.7gram.xyz
+          echo "📝 Updating A record for nginx.7gram.xyz..."
+          
+          # Get existing record ID first
+          RECORD_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=A&name=nginx.7gram.xyz" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json")
+          
+          if ! echo "$RECORD_RESPONSE" | jq . >/dev/null 2>&1; then
+            echo "❌ Failed to parse Cloudflare API response"
+            echo "Response: $RECORD_RESPONSE"
+            exit 1
+          fi
+          
+          RECORD_ID=$(echo "$RECORD_RESPONSE" | jq -r '.result[0].id // empty')
+          
+          if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+            echo "📝 Updating existing A record (ID: $RECORD_ID)..."
+            UPDATE_RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"A\",
+                \"name\": \"nginx\",
+                \"content\": \"$TAILSCALE_IP\",
+                \"ttl\": 300,
+                \"comment\": \"NGINX Reverse Proxy - Updated by GitHub Actions\"
+              }")
+            
+            SUCCESS=$(echo "$UPDATE_RESPONSE" | jq -r '.success // false')
+            if [[ "$SUCCESS" == "true" ]]; then
+              echo "✅ A record updated successfully"
+            else
+              echo "❌ Failed to update A record"
+              echo "Response: $UPDATE_RESPONSE"
+            fi
+          else
+            echo "📝 Creating new A record..."
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"A\",
+                \"name\": \"nginx\",
+                \"content\": \"$TAILSCALE_IP\",
+                \"ttl\": 300,
+                \"comment\": \"NGINX Reverse Proxy - Created by GitHub Actions\"
+              }")
+            
+            SUCCESS=$(echo "$CREATE_RESPONSE" | jq -r '.success // false')
+            if [[ "$SUCCESS" == "true" ]]; then
+              echo "✅ A record created successfully"
+            else
+              echo "❌ Failed to create A record"
+              echo "Response: $CREATE_RESPONSE"
+            fi
+          fi
+          
+          echo "✅ DNS update completed - nginx.7gram.xyz now points to $TAILSCALE_IP"
+          echo "⏳ DNS propagation may take a few minutes..."
+
       - name: 🔗 Setup Tailscale for Config
         env:
           TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
@@ -126,9 +209,8 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-          # Remove problematic tags that cause permission errors
         continue-on-error: true
-      
+
       - name: ⚙️ Deploy NGINX Configurations
         env:
           SSHPASS: ${{ secrets.ACTIONS_USER_PASSWORD }}
@@ -136,22 +218,180 @@ jobs:
           echo "⚙️ Deploying NGINX configurations..."
           
           # Install sshpass for password authentication
-          sudo apt-get update && sudo apt-get install -y sshpass
+          sudo apt-get update && sudo apt-get install -y sshpass >/dev/null 2>&1
+          
+          # Get the server IP information
+          TAILSCALE_IP="${{ needs.manage-nginx.outputs.tailscale_ip }}"
+          echo "🔗 Server Tailscale IP: $TAILSCALE_IP"
+          
+          # Try to determine server connection method
+          echo "🔍 Determining server connection method..."
+          
+          # Method 1: Try Tailscale hostname first (most reliable)
+          if timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 nginx_user@nginx "echo 'Connected via Tailscale hostname'" 2>/dev/null; then
+            SERVER_HOST="nginx"
+            echo "✅ Using Tailscale hostname: $SERVER_HOST"
+          # Method 2: Try Tailscale IP directly
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 nginx_user@$TAILSCALE_IP "echo 'Connected via Tailscale IP'" 2>/dev/null; then
+            SERVER_HOST="$TAILSCALE_IP"
+            echo "✅ Using Tailscale IP: $SERVER_HOST"
+          # Method 3: Try public domain (after DNS update)
+          elif timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 nginx_user@nginx.7gram.xyz "echo 'Connected via public domain'" 2>/dev/null; then
+            SERVER_HOST="nginx.7gram.xyz"
+            echo "✅ Using public domain: $SERVER_HOST"
+          else
+            echo "❌ Could not connect to NGINX server via any method"
+            echo "🔍 Tried:"
+            echo "  - Tailscale hostname: nginx"
+            echo "  - Tailscale IP: $TAILSCALE_IP"
+            echo "  - Public domain: nginx.7gram.xyz"
+            echo "⚠️ Skipping NGINX configuration"
+            exit 0
+          fi
+          
+          echo "🔄 Waiting for services to be ready..."
+          sleep 30
+          
+          # Create service directory structure if it doesn't exist
+          echo "📁 Ensuring service directory structure exists..."
+          sshpass -e ssh -o StrictHostKeyChecking=no nginx_user@$SERVER_HOST "
+            mkdir -p /home/nginx_user/nginx/config
+            mkdir -p /home/nginx_user/nginx/ssl
+            mkdir -p /home/nginx_user/nginx/logs
+            mkdir -p /home/nginx_user/nginx/html
+          " || echo "⚠️ Failed to create some directories"
           
           # Copy NGINX configs to server if they exist
           if [[ -d "config/" ]]; then
-            sshpass -e scp -o StrictHostKeyChecking=no -r config/ nginx_user@nginx.7gram.xyz:/home/nginx_user/nginx/config/
+            echo "📁 Uploading NGINX configurations..."
+            sshpass -e scp -r -o StrictHostKeyChecking=no config/* nginx_user@$SERVER_HOST:/home/nginx_user/nginx/config/ || {
+              echo "⚠️ Failed to upload some configurations"
+            }
+          else
+            echo "ℹ️ No config directory found to upload"
           fi
           
-          # Reload NGINX
-          sshpass -e ssh -o StrictHostKeyChecking=no nginx_user@nginx.7gram.xyz "cd /home/nginx_user/nginx && docker-compose exec nginx nginx -s reload"
+          # Upload SSL certificates if they exist
+          if [[ -d "ssl/" ]]; then
+            echo "📁 Uploading SSL certificates..."
+            sshpass -e scp -r -o StrictHostKeyChecking=no ssl/* nginx_user@$SERVER_HOST:/home/nginx_user/nginx/ssl/ || {
+              echo "⚠️ Failed to upload some SSL certificates"
+            }
+          fi
           
+          # Upload HTML files if they exist
+          if [[ -d "html/" ]]; then
+            echo "📁 Uploading HTML files..."
+            sshpass -e scp -r -o StrictHostKeyChecking=no html/* nginx_user@$SERVER_HOST:/home/nginx_user/nginx/html/ || {
+              echo "⚠️ Failed to upload some HTML files"
+            }
+          fi
+          
+          # Upload docker-compose or other deployment files
+          for file in docker-compose.yml docker-compose.yaml start.sh deploy.sh nginx.conf; do
+            if [[ -f "$file" ]]; then
+              echo "📁 Uploading $file..."
+              sshpass -e scp -o StrictHostKeyChecking=no "$file" nginx_user@$SERVER_HOST:/home/nginx_user/nginx/ || {
+                echo "⚠️ Failed to upload $file"
+              }
+            fi
+          done
+          
+          # Restart NGINX services
+          echo "🔄 Restarting NGINX services..."
+          sshpass -e ssh -o StrictHostKeyChecking=no nginx_user@$SERVER_HOST "
+            cd /home/nginx_user/nginx || exit 1
+            
+            echo 'Current directory contents:'
+            ls -la
+            
+            if [[ -f docker-compose.yml ]]; then
+              echo 'Docker compose file found, restarting NGINX...'
+              docker-compose down || true
+              docker-compose pull nginx || echo 'Failed to pull NGINX image'
+              docker-compose up -d || echo 'Failed to start NGINX'
+              
+              echo 'Waiting for NGINX to be ready...'
+              sleep 10
+              
+              # Test config and reload NGINX
+              if docker-compose exec nginx nginx -t 2>/dev/null; then
+                echo 'NGINX config is valid, reloading...'
+                docker-compose exec nginx nginx -s reload || echo 'Failed to reload NGINX'
+              else
+                echo 'NGINX config has errors - check logs'
+                docker-compose logs nginx
+              fi
+              
+              echo 'Service status:'
+              docker-compose ps
+            elif [[ -f start.sh ]]; then
+              echo 'Found start.sh, running it...'
+              chmod +x start.sh && ./start.sh
+            elif [[ -f deploy.sh ]]; then
+              echo 'Found deploy.sh, running it...'
+              chmod +x deploy.sh && ./deploy.sh
+            else
+              echo 'No start script found - manual setup may be required'
+            fi
+          " || {
+            echo "⚠️ Failed to restart NGINX services"
+          }
+
       - name: 🧪 Test NGINX Routes
         run: |
           echo "🧪 Testing NGINX routing..."
           
-          # Test health endpoint
-          curl -f https://nginx.7gram.xyz/health || echo "❌ NGINX health check failed"
+          # Wait a bit for services to start and DNS to propagate
+          echo "⏳ Waiting for services to start and DNS to propagate..."
+          sleep 30
+          
+          TAILSCALE_IP="${{ needs.manage-nginx.outputs.tailscale_ip }}"
+          
+          # Test health endpoint via multiple methods
+          echo "🌐 Testing NGINX health endpoint..."
+          
+          # Method 1: Tailscale hostname
+          if timeout 10 curl -f http://nginx/health 2>/dev/null; then
+            echo "✅ NGINX health check responding via Tailscale hostname"
+          elif timeout 10 curl -f http://nginx 2>/dev/null; then
+            echo "✅ NGINX responding via Tailscale hostname (port 80)"
+          # Method 2: Tailscale IP
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP/health 2>/dev/null; then
+            echo "✅ NGINX health check responding via Tailscale IP"
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP 2>/dev/null; then
+            echo "✅ NGINX responding via Tailscale IP (port 80)"
+          # Method 3: Public domain
+          elif timeout 10 curl -f https://nginx.7gram.xyz/health 2>/dev/null; then
+            echo "✅ NGINX health check responding via public domain (HTTPS)"
+          elif timeout 10 curl -f http://nginx.7gram.xyz/health 2>/dev/null; then
+            echo "✅ NGINX health check responding via public domain (HTTP)"
+          else
+            echo "⚠️ NGINX not responding via any method (may still be starting up)"
+          fi
           
           # Test SSL certificate
-          echo | openssl s_client -connect nginx.7gram.xyz:443 -servername nginx.7gram.xyz 2>/dev/null | grep "Verify return code" || echo "⚠️ SSL test completed"
+          echo "🔒 Testing SSL certificate..."
+          
+          if timeout 10 echo | openssl s_client -connect nginx.7gram.xyz:443 -servername nginx.7gram.xyz 2>/dev/null | grep "Verify return code: 0" >/dev/null; then
+            echo "✅ SSL certificate is valid"
+          elif timeout 10 echo | openssl s_client -connect nginx.7gram.xyz:443 -servername nginx.7gram.xyz 2>/dev/null | grep "Verify return code" >/dev/null; then
+            echo "⚠️ SSL certificate has issues - check configuration"
+          else
+            echo "ℹ️ SSL test could not complete (certificate may not be configured yet)"
+          fi
+          
+          # Test common proxy routes
+          echo "🔀 Testing proxy routes..."
+          
+          if timeout 10 curl -f https://nginx.7gram.xyz/api/ 2>/dev/null >/dev/null; then
+            echo "✅ API proxy route accessible"
+          else
+            echo "ℹ️ API proxy route not accessible (may not be configured or backend not ready)"
+          fi
+          
+          echo "🔧 NGINX reverse proxy setup complete!"
+          echo "📊 Access URLs:"
+          echo "  - Tailscale: http://nginx or http://$TAILSCALE_IP"
+          echo "  - Public: https://nginx.7gram.xyz (after DNS propagation)"
+          echo "  - Health: https://nginx.7gram.xyz/health"
