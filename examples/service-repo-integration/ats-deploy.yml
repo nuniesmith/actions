@@ -96,6 +96,8 @@ jobs:
       JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
       ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+      TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
       NETDATA_CLAIM_TOKEN: ${{ secrets.NETDATA_CLAIM_TOKEN }}
       NETDATA_CLAIM_ROOM: ${{ secrets.NETDATA_CLAIM_ROOM }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -197,17 +199,6 @@ jobs:
           
           echo "✅ DNS update completed - ats.7gram.xyz now points to $TAILSCALE_IP"
           echo "⏳ DNS propagation may take a few minutes..."
-
-      - name: 🔗 Setup Tailscale for Post-Deploy Access
-        env:
-          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
-        uses: tailscale/github-action@v2
-        with:
-          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-        continue-on-error: true
 
       - name: 🎮 Configure Game Server
         env:
