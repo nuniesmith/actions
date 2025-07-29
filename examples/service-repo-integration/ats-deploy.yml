@@ -363,3 +363,94 @@ jobs:
           echo "📊 Access URLs:"
           echo "  - Tailscale: http://ats:8080 or http://$TAILSCALE_IP:8080"
           echo "  - Public: https://ats.7gram.xyz (after DNS propagation)"
+
+      - name: 📊 Verify Netdata Cloud Connection
+        env:
+          SSHPASS: ${{ secrets.ACTIONS_USER_PASSWORD }}
+        run: |
+          echo "📊 Verifying Netdata cloud connection..."
+          
+          TAILSCALE_IP="${{ needs.manage-ats.outputs.tailscale_ip }}"
+          
+          # Determine server connection method (same as before)
+          if timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@ats "echo 'Connected'" 2>/dev/null; then
+            SERVER_HOST="ats"
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@$TAILSCALE_IP "echo 'Connected'" 2>/dev/null; then
+            SERVER_HOST="$TAILSCALE_IP"
+          elif timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@ats.7gram.xyz "echo 'Connected'" 2>/dev/null; then
+            SERVER_HOST="ats.7gram.xyz"
+          else
+            echo "⚠️ Cannot connect to check Netdata status"
+            exit 0
+          fi
+          
+          echo "🔍 Checking Netdata status on $SERVER_HOST..."
+          
+          # Check if Netdata is running and accessible
+          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@$SERVER_HOST "
+            echo '📊 Netdata service status:'
+            sudo systemctl is-active netdata && echo '✅ Netdata service is active' || echo '⚠️ Netdata service is not active'
+            
+            echo ''
+            echo '🌐 Testing Netdata web interface:'
+            if curl -f http://localhost:19999/api/v1/info 2>/dev/null >/dev/null; then
+              echo '✅ Netdata web interface is accessible'
+            else
+              echo '⚠️ Netdata web interface is not accessible'
+            fi
+            
+            echo ''
+            echo '☁️ Checking Netdata cloud connection:'
+            if [[ -f /var/lib/netdata/cloud.d/token ]]; then
+              echo '✅ Netdata cloud token file exists'
+            else
+              echo '⚠️ Netdata cloud token file not found'
+            fi
+            
+            # Check if claiming is successful
+            if [[ -f /var/lib/netdata/registry/netdata.public.unique.id ]]; then
+              echo '✅ Netdata unique ID exists'
+              NETDATA_ID=\$(cat /var/lib/netdata/registry/netdata.public.unique.id 2>/dev/null || echo 'unknown')
+              echo 'Netdata ID: '\$NETDATA_ID
+            else
+              echo '⚠️ Netdata unique ID not found'
+            fi
+            
+            # Try to reclaim if needed
+            if [[ ! -f /var/lib/netdata/cloud.d/token ]]; then
+              echo ''
+              echo '🔄 Attempting to reclaim Netdata to cloud...'
+              
+              # Find the claim script
+              CLAIM_SCRIPT=''
+              for script_path in \"/usr/sbin/netdata-claim.sh\" \"/opt/netdata/bin/netdata-claim.sh\" \"/usr/libexec/netdata/netdata-claim.sh\" \"/usr/lib/netdata/netdata-claim.sh\"; do
+                if [[ -f \"\$script_path\" ]]; then
+                  CLAIM_SCRIPT=\$script_path
+                  break
+                fi
+              done
+              
+              if [[ -z \"\$CLAIM_SCRIPT\" ]]; then
+                CLAIM_SCRIPT=\$(find /usr /opt -name \"netdata-claim.sh\" 2>/dev/null | head -1)
+              fi
+              
+              if [[ -n \"\$CLAIM_SCRIPT\" && -f \"\$CLAIM_SCRIPT\" ]]; then
+                echo \"Found claim script: \$CLAIM_SCRIPT\"
+                sudo \"\$CLAIM_SCRIPT\" -token=\"${{ secrets.NETDATA_CLAIM_TOKEN }}\" \\
+                  -rooms=\"${{ secrets.NETDATA_CLAIM_ROOM }}\" \\
+                  -url=\"https://app.netdata.cloud\" && \\
+                  echo '✅ Netdata reclaim completed' || echo '⚠️ Netdata reclaim failed'
+                
+                # Restart Netdata after claiming
+                sudo systemctl restart netdata
+                sleep 5
+              else
+                echo '⚠️ Netdata claim script not found'
+              fi
+            fi
+          " || echo "⚠️ Failed to check Netdata status"
+          
+          echo ""
+          echo "📊 Netdata URLs:"
+          echo "  - Local: http://ats:19999 or http://$TAILSCALE_IP:19999"
+          echo "  - Cloud: https://app.netdata.cloud (if claimed successfully)"
