@@ -337,31 +337,131 @@ jobs:
             echo 'Current directory contents:'
             ls -la
             
-            # Stop any existing services
-            docker-compose down || true
+            # Fix Docker networking issues first
+            echo '🔧 Fixing Docker networking...'
+            
+            # Stop any existing services and clean up networks
+            docker-compose down --remove-orphans 2>/dev/null || true
+            docker network prune -f 2>/dev/null || true
+            
+            # Check for iptables issues and fix them
+            echo '🔍 Checking iptables configuration...'
+            if ! sudo iptables -t nat -L DOCKER >/dev/null 2>&1; then
+              echo '⚠️ Docker iptables chain missing, recreating...'
+              
+              # Stop Docker
+              sudo systemctl stop docker
+              
+              # Clean up any Docker-related iptables rules
+              sudo iptables -t nat -F DOCKER 2>/dev/null || true
+              sudo iptables -t filter -F DOCKER 2>/dev/null || true
+              sudo iptables -t filter -F DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              sudo iptables -t filter -F DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              
+              # Remove Docker chains if they exist
+              sudo iptables -t nat -X DOCKER 2>/dev/null || true
+              sudo iptables -t filter -X DOCKER 2>/dev/null || true
+              sudo iptables -t filter -X DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              sudo iptables -t filter -X DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              
+              # Remove any existing Docker network interfaces
+              for interface in \$(ip link show | grep br- | cut -d: -f2 | tr -d ' '); do
+                sudo ip link delete \"\$interface\" 2>/dev/null || true
+              done
+              
+              echo '✅ Cleaned up Docker networking components'
+            fi
+            
+            # Restart Docker to clear any iptables issues
+            echo '🔄 Restarting Docker service to clear network issues...'
+            sudo systemctl restart docker
+            sleep 10
+            
+            # Verify Docker is working
+            docker info >/dev/null 2>&1 || {
+              echo '❌ Docker service not ready after restart'
+              sudo systemctl status docker
+              exit 1
+            }
+            
+            echo '✅ Docker service restarted successfully'
             
             # Pull the latest images
             echo 'Pulling Docker images...'
             docker-compose pull || echo 'Failed to pull some images (may not exist yet)'
             
-            # Start the services
+            # Start the services with network fixes
             echo 'Starting ATS services...'
             docker-compose up -d || {
-              echo 'Docker compose failed, trying alternative methods...'
+              echo 'Docker compose failed, trying network reset and retry...'
               
-              # Try different startup methods
-              if [[ -f start.sh ]]; then
-                echo 'Found start.sh, running it...'
-                chmod +x start.sh && ./start.sh
-              elif [[ -f deploy.sh ]]; then
-                echo 'Found deploy.sh, running it...'
-                chmod +x deploy.sh && ./deploy.sh
-              elif [[ -f run.sh ]]; then
-                echo 'Found run.sh, running it...'
-                chmod +x run.sh && ./run.sh
-              else
-                echo 'No startup script found, manual intervention may be required'
-              fi
+              # Try to reset Docker networks completely
+              echo '🔧 Resetting Docker networks...'
+              docker network ls -q | xargs -r docker network rm 2>/dev/null || true
+              sudo systemctl restart docker
+              sleep 10
+              
+              # Try again with simplified approach
+              docker-compose up -d --force-recreate || {
+                echo 'Docker compose still failing, trying alternative startup methods...'
+                
+                # Try different startup methods
+                if [[ -f start.sh ]]; then
+                  echo 'Found start.sh, running it...'
+                  chmod +x start.sh && ./start.sh
+                elif [[ -f deploy.sh ]]; then
+                  echo 'Found deploy.sh, running it...'
+                  chmod +x deploy.sh && ./deploy.sh
+                elif [[ -f run.sh ]]; then
+                  echo 'Found run.sh, running it...'
+                  chmod +x run.sh && ./run.sh
+                else
+                  echo 'Trying manual Docker run as last resort...'
+                  
+                  # Check if we have any built images and try to run them manually
+                  IMAGES=\$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'ats|web|api' | head -3)
+                  if [[ -n \"\$IMAGES\" ]]; then
+                    echo 'Found ATS images, trying manual startup:'
+                    echo \"\$IMAGES\"
+                    
+                    # Stop any existing containers with the same names
+                    docker stop ats-web ats-api ats-server 2>/dev/null || true
+                    docker rm ats-web ats-api ats-server 2>/dev/null || true
+                    
+                    # Try to run the web interface at least
+                    WEB_IMAGE=\$(echo \"\$IMAGES\" | grep -E 'web|nginx' | head -1)
+                    if [[ -n \"\$WEB_IMAGE\" ]]; then
+                      echo \"Starting web interface: \$WEB_IMAGE\"
+                      docker run -d --name ats-web --restart unless-stopped -p 80:80 -p 8080:80 \"\$WEB_IMAGE\" && \\
+                        echo '✅ Web interface started successfully' || echo '❌ Manual web startup failed'
+                    fi
+                    
+                    # Try to run the API
+                    API_IMAGE=\$(echo \"\$IMAGES\" | grep -E 'api|server' | head -1)
+                    if [[ -n \"\$API_IMAGE\" ]]; then
+                      echo \"Starting API service: \$API_IMAGE\"
+                      docker run -d --name ats-api --restart unless-stopped -p 3000:3000 -p 27015:27015 \"\$API_IMAGE\" && \\
+                        echo '✅ API service started successfully' || echo '❌ Manual API startup failed'
+                    fi
+                    
+                    # Check if we have a game server image
+                    SERVER_IMAGE=\$(echo \"\$IMAGES\" | grep -E 'server|game' | head -1)
+                    if [[ -n \"\$SERVER_IMAGE\" && \"\$SERVER_IMAGE\" != \"\$API_IMAGE\" ]]; then
+                      echo \"Starting game server: \$SERVER_IMAGE\"
+                      docker run -d --name ats-server --restart unless-stopped -p 27015:27015/tcp -p 27015:27015/udp \"\$SERVER_IMAGE\" && \\
+                        echo '✅ Game server started successfully' || echo '❌ Manual game server startup failed'
+                    fi
+                    
+                    # Wait a bit for containers to start
+                    sleep 5
+                    
+                  else
+                    echo 'No ATS Docker images found to run manually'
+                    echo 'Available images:'
+                    docker images
+                  fi
+                fi
+              }
             }
             
             # Show final status
@@ -380,26 +480,42 @@ jobs:
             echo ''
             echo 'Docker compose services status:'
             if command -v docker-compose >/dev/null 2>&1; then
-              SERVICES_UP=$(docker-compose ps --services --filter "status=running" 2>/dev/null | wc -l || echo "0")
-              TOTAL_SERVICES=$(docker-compose ps --services 2>/dev/null | wc -l || echo "0")
+              # Use more robust commands that handle errors better
+              SERVICES_UP=\$(docker-compose ps -q 2>/dev/null | wc -l || echo \"0\")
+              TOTAL_SERVICES=\$(docker-compose config --services 2>/dev/null | wc -l || echo \"0\")
               
-              echo "📊 Services status: $SERVICES_UP/$TOTAL_SERVICES running"
+              echo \"📊 Services status: \$SERVICES_UP/\$TOTAL_SERVICES running\"
               
-              if [ "$SERVICES_UP" -gt 0 ]; then
-                echo "✅ Some Docker services are running"
-                docker-compose ps
+              if [[ \"\$SERVICES_UP\" -gt 0 ]]; then
+                echo \"✅ Some Docker services are running\"
+                docker-compose ps 2>/dev/null || echo 'Could not get compose status'
                 
                 # Check logs for any obvious errors
-                echo "📝 Quick log check for errors:"
-                docker-compose logs --tail 20 | grep -i "error\|fail\|exception" | head -5 || echo "No obvious errors in recent logs"
+                echo \"📝 Quick log check for errors:\"
+                docker-compose logs --tail 20 2>/dev/null | grep -i \"error\\|fail\\|exception\" | head -5 || echo \"No obvious errors in recent logs\"
                 
               else
-                echo "❌ No Docker services are running"
-                docker-compose ps
+                echo \"❌ No Docker services are running\"
+                docker-compose ps 2>/dev/null || echo 'Docker compose not responding'
+                
+                # Check if any ATS containers are running manually
+                MANUAL_CONTAINERS=\$(docker ps --filter \"name=ats\" --format \"{{.Names}}\" 2>/dev/null | wc -l || echo \"0\")
+                if [[ \"\$MANUAL_CONTAINERS\" -gt 0 ]]; then
+                  echo \"📋 Found \$MANUAL_CONTAINERS manually started ATS containers:\"
+                  docker ps --filter \"name=ats\" --format \"table {{.Names}}\\t{{.Status}}\\t{{.Ports}}\" 2>/dev/null || true
+                fi
               fi
             else
               echo 'Docker compose command not available, checking containers directly'
-              docker ps
+              
+              # Check for any running containers
+              RUNNING_CONTAINERS=\$(docker ps --format \"{{.Names}}\" 2>/dev/null | wc -l || echo \"0\")
+              if [[ \"\$RUNNING_CONTAINERS\" -gt 0 ]]; then
+                echo \"📋 Found \$RUNNING_CONTAINERS running containers:\"
+                docker ps --format \"table {{.Names}}\\t{{.Status}}\\t{{.Ports}}\" 2>/dev/null || true
+              else
+                echo \"❌ No containers running\"
+              fi
             fi
             
             # Show recent logs
