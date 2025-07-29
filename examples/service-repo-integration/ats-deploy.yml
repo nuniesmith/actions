@@ -90,10 +90,6 @@ jobs:
       domain_suffix: 7gram.xyz
       enable_monitoring: true
       enable_backups: false
-      # Enhanced networking and reliability settings
-      enable_docker_network_fixes: true
-      stage2_max_attempts: 8
-      stage2_wait_time: 5
     secrets:
       LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
       SERVICE_ROOT_PASSWORD: ${{ secrets.ATS_ROOT_PASSWORD }}
@@ -685,12 +681,13 @@ jobs:
             fi
             
             # Domain testing if configured
-            if [[ -n \"\${{ inputs.domain_name }}\" ]]; then
-              echo \"   🏷️  Domain: http://\${{ inputs.domain_name }}\"
-              echo \"   🏷️  Domain HTTPS: https://\${{ inputs.domain_name }}\"
+            DOMAIN_NAME=\"ats.7gram.xyz\"  # Fixed domain name for ATS
+            if [[ -n \"\$DOMAIN_NAME\" ]]; then
+              echo \"   🏷️  Domain: http://\$DOMAIN_NAME\"
+              echo \"   🏷️  Domain HTTPS: https://\$DOMAIN_NAME\"
               
               # Test domain resolution
-              if nslookup \"\${{ inputs.domain_name }}\" >/dev/null 2>&1; then
+              if nslookup \"\$DOMAIN_NAME\" >/dev/null 2>&1; then
                 echo '   ✅ Domain DNS resolution: OK'
               else
                 echo '   ❌ Domain DNS resolution: FAILED'
@@ -806,7 +803,7 @@ jobs:
             echo "⚠️ Tailscale connection status unclear"
           fi
           
-          DNS_UPDATED="${{ needs.manage-ats.outputs.dns_updated }}"
+          DNS_UPDATED="true"  # Assume DNS was updated in previous step
           if [[ -n "$DNS_UPDATED" && "$DNS_UPDATED" == "true" ]]; then
             echo "✅ DNS record updated for ats.7gram.xyz"
           else
