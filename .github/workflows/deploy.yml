@@ -682,12 +682,35 @@ jobs:
           
           # Wait for server to be running
           echo "⏳ Waiting for server to be ready..."
+          ATTEMPT=0
           while true; do
-            STATUS=$(linode-cli linodes view "$SERVER_ID" --text --no-headers | cut -f2)
-            if [[ "$STATUS" == "running" ]]; then
+            # Get server info and check status
+            SERVER_INFO=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
+            
+            # Debug: show the full output on first attempt
+            if [[ $ATTEMPT -eq 0 ]]; then
+              echo "🔍 Debug - Server info columns:"
+              echo "$SERVER_INFO"
+            fi
+            
+            # Try different columns to find status
+            STATUS_COL2=$(echo "$SERVER_INFO" | cut -f2)
+            STATUS_COL8=$(echo "$SERVER_INFO" | cut -f8)
+            
+            echo "Attempt $((++ATTEMPT)): Col2='$STATUS_COL2', Col8='$STATUS_COL8'"
+            
+            # Check if either column shows running
+            if [[ "$STATUS_COL2" == "running" ]] || [[ "$STATUS_COL8" == "running" ]]; then
+              echo "✅ Server is running!"
               break
             fi
-            echo "Status: $STATUS - waiting..."
+            
+            # Don't wait forever
+            if [[ $ATTEMPT -gt 30 ]]; then
+              echo "⚠️ Timeout waiting for server - proceeding anyway"
+              break
+            fi
+            
             sleep 10
           done
           
@@ -699,12 +722,25 @@ jobs:
 
       - name: ⏳ Wait for SSH Access
         run: |
-          echo "⏳ Waiting for SSH access..."
+          echo "⏳ Waiting for SSH access to ${{ steps.create-server.outputs.server_ip }}..."
           
-          for i in {1..30}; do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+          SSH_READY=false
+          for i in {1..20}; do
+            echo "Attempt $i/20: Testing SSH connection..."
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ConnectionAttempts=1 \
                root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready'" 2>/dev/null; then
-              echo "✅ SSH ready"
+              echo "✅ SSH ready after $i attempts"
+              SSH_READY=true
+              break
+            fi
+            echo "SSH not ready yet, waiting 15 seconds..."
+            sleep 15
+          done
+          
+          if [[ "$SSH_READY" != "true" ]]; then
+            echo "❌ SSH failed to become ready after 20 attempts (5 minutes)"
+            exit 1
+          fi
               break
             fi
             echo "Attempt $i/30..."
