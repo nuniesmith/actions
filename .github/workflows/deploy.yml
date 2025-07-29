@@ -664,11 +664,12 @@ jobs:
               SERVER_IP_COL4=$(echo "$EXISTING_SERVER" | cut -f4)
               SERVER_IP_COL5=$(echo "$EXISTING_SERVER" | cut -f5)
               SERVER_IP_COL6=$(echo "$EXISTING_SERVER" | cut -f6)
+              SERVER_IP_COL7=$(echo "$EXISTING_SERVER" | cut -f7)
               
-              echo "IP candidates: Col4='$SERVER_IP_COL4', Col5='$SERVER_IP_COL5', Col6='$SERVER_IP_COL6'"
+              echo "IP candidates: Col4='$SERVER_IP_COL4', Col5='$SERVER_IP_COL5', Col6='$SERVER_IP_COL6', Col7='$SERVER_IP_COL7'"
               
               # Use the first valid IP address we find
-              for IP in "$SERVER_IP_COL4" "$SERVER_IP_COL5" "$SERVER_IP_COL6"; do
+              for IP in "$SERVER_IP_COL4" "$SERVER_IP_COL5" "$SERVER_IP_COL6" "$SERVER_IP_COL7"; do
                 if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                   SERVER_IP="$IP"
                   break
@@ -745,11 +746,12 @@ jobs:
           SERVER_IP_COL4=$(echo "$SERVER_INFO" | cut -f4)
           SERVER_IP_COL5=$(echo "$SERVER_INFO" | cut -f5)
           SERVER_IP_COL6=$(echo "$SERVER_INFO" | cut -f6)
+          SERVER_IP_COL7=$(echo "$SERVER_INFO" | cut -f7)
           
-          echo "IP candidates: Col4='$SERVER_IP_COL4', Col5='$SERVER_IP_COL5', Col6='$SERVER_IP_COL6'"
+          echo "IP candidates: Col4='$SERVER_IP_COL4', Col5='$SERVER_IP_COL5', Col6='$SERVER_IP_COL6', Col7='$SERVER_IP_COL7'"
           
           # Use the first valid IP address we find
-          for IP in "$SERVER_IP_COL4" "$SERVER_IP_COL5" "$SERVER_IP_COL6"; do
+          for IP in "$SERVER_IP_COL4" "$SERVER_IP_COL5" "$SERVER_IP_COL6" "$SERVER_IP_COL7"; do
             if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               SERVER_IP="$IP"
               break
