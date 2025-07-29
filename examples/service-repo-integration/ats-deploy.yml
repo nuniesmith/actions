@@ -331,7 +331,7 @@ jobs:
           
           # Pull Docker images and start services
           echo "🐳 Starting ATS services from repository..."
-          sshpass -e ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
+          sshpass -e ssh -t -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
             cd /home/ats_user/ats || exit 1
             
             echo 'Current directory contents:'
@@ -365,42 +365,42 @@ jobs:
               echo '⚠️ Docker iptables chains missing, performing complete reset...'
               
               # Stop Docker completely
-              sudo systemctl stop docker
-              sudo systemctl stop docker.socket
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl stop docker
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl stop docker.socket
               
               # Clean up all Docker-related iptables rules and chains
               echo '🧹 Cleaning iptables...'
-              sudo iptables -t nat -F DOCKER 2>/dev/null || true
-              sudo iptables -t filter -F DOCKER 2>/dev/null || true
-              sudo iptables -t filter -F DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
-              sudo iptables -t filter -F DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
-              sudo iptables -t filter -F DOCKER-USER 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t nat -F DOCKER 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -F DOCKER 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -F DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -F DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -F DOCKER-USER 2>/dev/null || true
               
               # Remove Docker chains
-              sudo iptables -t nat -X DOCKER 2>/dev/null || true
-              sudo iptables -t filter -X DOCKER 2>/dev/null || true
-              sudo iptables -t filter -X DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
-              sudo iptables -t filter -X DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
-              sudo iptables -t filter -X DOCKER-USER 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t nat -X DOCKER 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -X DOCKER 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -X DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -X DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S iptables -t filter -X DOCKER-USER 2>/dev/null || true
               
               # Remove Docker network interfaces and data
               echo '🧹 Cleaning network interfaces...'
               for interface in \$(ip link show | grep br- | cut -d: -f2 | tr -d \" \"); do
                 echo \"  Removing bridge: \$interface\"
-                sudo ip link delete \"\$interface\" 2>/dev/null || true
+                echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S ip link delete \"\$interface\" 2>/dev/null || true
               done
               
               # Clean Docker network data
-              sudo rm -rf /var/lib/docker/network/* 2>/dev/null || true
-              sudo rm -rf /var/lib/docker/containers/*/network 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S rm -rf /var/lib/docker/network/* 2>/dev/null || true
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S rm -rf /var/lib/docker/containers/*/network 2>/dev/null || true
               
               echo '✅ Network cleanup completed'
             fi
             
             # Restart Docker with clean state
             echo '🔄 Restarting Docker with clean network state...'
-            sudo systemctl start docker.socket
-            sudo systemctl start docker
+            echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl start docker.socket
+            echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl start docker
             sleep 15
             
             # Verify Docker is working properly
@@ -416,7 +416,7 @@ jobs:
               fi
             else
               echo '❌ Docker restart failed'
-              sudo systemctl status docker
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl status docker
               exit 1
             fi
             
@@ -440,7 +440,7 @@ jobs:
               # Method 1: Network reset and retry
               echo '🔧 Attempting network reset and retry...'
               docker network ls -q | xargs -r docker network rm 2>/dev/null || true
-              sudo systemctl restart docker
+              echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl restart docker
               sleep 10
               
               if [[ -n \"\$COMPOSE_CMD\" ]] && \$COMPOSE_CMD up -d --force-recreate; then
@@ -861,9 +861,9 @@ jobs:
           echo "🔍 Checking Netdata status on $SERVER_HOST..."
           
           # Check if Netdata is running and accessible
-          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@$SERVER_HOST "
+          sshpass -e ssh -t -o StrictHostKeyChecking=no ats_user@$SERVER_HOST "
             echo '📊 Netdata service status:'
-            sudo systemctl is-active netdata && echo '✅ Netdata service is active' || echo '⚠️ Netdata service is not active'
+            echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl is-active netdata && echo '✅ Netdata service is active' || echo '⚠️ Netdata service is not active'
             
             echo ''
             echo '🌐 Testing Netdata web interface:'
@@ -910,13 +910,13 @@ jobs:
               
               if [[ -n \"\$CLAIM_SCRIPT\" && -f \"\$CLAIM_SCRIPT\" ]]; then
                 echo \"Found claim script: \$CLAIM_SCRIPT\"
-                sudo \"\$CLAIM_SCRIPT\" -token=\"${{ secrets.NETDATA_CLAIM_TOKEN }}\" \\
+                echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S \"\$CLAIM_SCRIPT\" -token=\"${{ secrets.NETDATA_CLAIM_TOKEN }}\" \\
                   -rooms=\"${{ secrets.NETDATA_CLAIM_ROOM }}\" \\
                   -url=\"https://app.netdata.cloud\" && \\
                   echo '✅ Netdata reclaim completed' || echo '⚠️ Netdata reclaim failed'
                 
                 # Restart Netdata after claiming
-                sudo systemctl restart netdata
+                echo '${{ secrets.ACTIONS_USER_PASSWORD }}' | sudo -S systemctl restart netdata
                 sleep 5
               else
                 echo '⚠️ Netdata claim script not found'
