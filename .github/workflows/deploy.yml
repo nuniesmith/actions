@@ -850,8 +850,23 @@ jobs:
           set -euo pipefail
           
           echo "🔄 Updating system..."
-          # Handle conflicting files by forcing overwrite
-          pacman -Syu --noconfirm --overwrite='*'
+          # Update package databases first
+          pacman -Sy --noconfirm
+          
+          # Handle NVIDIA firmware conflicts specifically
+          echo "🔧 Removing conflicting NVIDIA firmware files..."
+          rm -f /usr/lib/firmware/nvidia/ad103 || true
+          rm -f /usr/lib/firmware/nvidia/ad104 || true  
+          rm -f /usr/lib/firmware/nvidia/ad106 || true
+          rm -f /usr/lib/firmware/nvidia/ad107 || true
+          
+          # Force upgrade with multiple overwrite patterns
+          pacman -Su --noconfirm --overwrite='*' --overwrite='/usr/lib/firmware/nvidia/*' || {
+            echo "🔄 First upgrade failed, trying more aggressive approach..."
+            # Remove entire nvidia firmware directory and try again
+            rm -rf /usr/lib/firmware/nvidia || true
+            pacman -Su --noconfirm --overwrite='*'
+          }
           
           echo "📦 Installing all required packages..."
           pacman -S --noconfirm curl wget git docker docker-compose \
