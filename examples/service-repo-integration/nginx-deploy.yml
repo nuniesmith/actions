@@ -129,16 +129,21 @@ jobs:
           tags: tag:ci
       
       - name: ⚙️ Deploy NGINX Configurations
+        env:
+          SSHPASS: ${{ secrets.ACTIONS_USER_PASSWORD }}
         run: |
           echo "⚙️ Deploying NGINX configurations..."
           
+          # Install sshpass for password authentication
+          sudo apt-get update && sudo apt-get install -y sshpass
+          
           # Copy NGINX configs to server if they exist
           if [[ -d "config/" ]]; then
-            scp -r config/ nginx_user@nginx.7gram.xyz:/home/nginx_user/nginx/config/
+            sshpass -e scp -o StrictHostKeyChecking=no -r config/ nginx_user@nginx.7gram.xyz:/home/nginx_user/nginx/config/
           fi
           
           # Reload NGINX
-          ssh nginx_user@nginx.7gram.xyz "cd /home/nginx_user/nginx && docker-compose exec nginx nginx -s reload"
+          sshpass -e ssh -o StrictHostKeyChecking=no nginx_user@nginx.7gram.xyz "cd /home/nginx_user/nginx && docker-compose exec nginx nginx -s reload"
           
       - name: 🧪 Test NGINX Routes
         run: |

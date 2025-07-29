@@ -115,17 +115,33 @@ jobs:
       - name: 📥 Checkout ATS Repository
         uses: actions/checkout@v4
       
+      - name: 🔗 Setup Tailscale for Post-Deploy
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          tags: tag:ci
+
       - name: 🎮 Configure Game Server
+        env:
+          SSHPASS: ${{ secrets.ACTIONS_USER_PASSWORD }}
         run: |
           echo "🎮 Configuring ATS game server..."
           
+          # Install sshpass for password authentication
+          sudo apt-get update && sudo apt-get install -y sshpass
+          
           # Upload server configurations
           if [[ -f "config/server_config.sii" ]]; then
-            scp config/server_config.sii ats_user@ats.7gram.xyz:/home/ats_user/ats/config/
+            sshpass -e scp -o StrictHostKeyChecking=no config/server_config.sii ats_user@ats.7gram.xyz:/home/ats_user/ats/config/
           fi
           
           # Restart game server if needed
-          ssh ats_user@ats.7gram.xyz "cd /home/ats_user/ats && docker-compose restart"
+          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@ats.7gram.xyz "cd /home/ats_user/ats && docker-compose restart"
           
       - name: 🧪 Test Game Server
         run: |

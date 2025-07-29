@@ -637,7 +637,7 @@ jobs:
     outputs:
       server_ip: ${{ steps.create-server.outputs.server_ip }}
       server_id: ${{ steps.create-server.outputs.server_id }}
-      tailscale_ip: ${{ steps.setup-server.outputs.tailscale_ip }}
+      tailscale_ip: ${{ steps.stage2-setup.outputs.tailscale_ip }}
     
     steps:
       - name: 📥 Checkout repository
@@ -707,6 +707,10 @@ jobs:
           # Get the public key content for server authorization
           SSH_PUBLIC_KEY=$(cat ~/.ssh/linode_deployment_key.pub)
           echo "🔑 SSH Public Key: $SSH_PUBLIC_KEY"
+          
+          # Store the private key (base64 encoded for safe storage)
+          SSH_PRIVATE_KEY=$(base64 -w 0 ~/.ssh/linode_deployment_key)
+          echo "ssh_private_key=$SSH_PRIVATE_KEY" >> $GITHUB_OUTPUT
           
           echo "🚀 Creating server with SSH key authentication..."
           RESULT=$(linode-cli linodes create \
@@ -836,12 +840,12 @@ jobs:
             exit 1
           fi
 
-      - name: 🏗️ Setup Server Foundation
-        id: setup-server
+      - name: 🏗️ Stage 1 - Pre-Reboot Setup
+        id: stage1-setup
         run: |
-          echo "🏗️ Setting up server foundation..."
+          echo "🏗️ Stage 1: Pre-reboot foundation setup..."
           
-          cat > foundation-setup.sh << 'EOF'
+          cat > stage1-setup.sh << 'EOF'
           #!/bin/bash
           set -euo pipefail
           
@@ -849,9 +853,9 @@ jobs:
           # Handle conflicting files by forcing overwrite
           pacman -Syu --noconfirm --overwrite='*'
           
-          echo "📦 Installing packages..."
+          echo "📦 Installing all required packages..."
           pacman -S --noconfirm curl wget git docker docker-compose \
-            tailscale netdata ufw fail2ban sudo base-devel
+            tailscale netdata ufw fail2ban sudo base-devel iptables-nft
           
           echo "👥 Creating users..."
           useradd -m -s /bin/bash jordan || true
@@ -864,12 +868,45 @@ jobs:
           
           useradd -m -s /bin/bash ${{ env.SERVICE_NAME }}_user || true
           usermod -aG docker ${{ env.SERVICE_NAME }}_user
+          # Set a password for SSH access (temporary, will be secured via Tailscale)
+          echo "${{ env.SERVICE_NAME }}_user:${{ secrets.ACTIONS_USER_PASSWORD }}" | chpasswd
           
-          echo "🐳 Starting Docker..."
+          echo "⚙️ Enabling services for post-reboot..."
           systemctl enable docker
+          systemctl enable tailscaled
+          systemctl enable netdata
+          
+          echo "� Creating post-reboot script..."
+          cat > /usr/local/bin/stage2-post-reboot.sh << 'STAGE2EOF'
+          #!/bin/bash
+          set -euo pipefail
+          
+          echo "🚀 Stage 2: Post-reboot setup starting..."
+          
+          echo "�🐳 Starting Docker..."
           systemctl start docker
           
-          echo "🔥 Configuring firewall..."
+          echo "🔗 Starting and authenticating Tailscale..."
+          systemctl start tailscaled
+          sleep 5
+          tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --accept-routes --timeout=120s
+          
+          # Wait for Tailscale to be ready
+          echo "⏳ Waiting for Tailscale connection..."
+          for i in {1..30}; do
+            if tailscale status | grep -q "Logged in"; then
+              echo "✅ Tailscale connected successfully"
+              break
+            fi
+            echo "Attempt $i/30: Waiting for Tailscale..."
+            sleep 10
+          done
+          
+          TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+          echo "🔗 Tailscale IP: $TAILSCALE_IP"
+          echo "$TAILSCALE_IP" > /tmp/tailscale_ip
+          
+          echo "🔥 Configuring firewall after reboot..."
           ufw --force reset
           ufw default deny incoming
           ufw default allow outgoing
@@ -877,23 +914,98 @@ jobs:
           ufw allow in on tailscale0
           ufw --force enable
           
-          echo "🔗 Setting up Tailscale..."
-          systemctl enable tailscaled
-          systemctl start tailscaled
-          tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --accept-routes --timeout=60s
+          echo "🔐 Configuring SSH for service access..."
+          # Allow password authentication for Tailscale network only
+          sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          # Restart SSH service
+          systemctl restart sshd
           
-          sleep 10
-          TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
-          echo "$TAILSCALE_IP" > /tmp/tailscale_ip
+          echo "� Starting monitoring..."
+          systemctl start netdata
           
-          echo "✅ Foundation complete"
+          echo "✅ Stage 2 complete - server ready for service deployment"
+          STAGE2EOF
+          
+          chmod +x /usr/local/bin/stage2-post-reboot.sh
+          
+          echo "🔄 Creating systemd service for post-reboot setup..."
+          cat > /etc/systemd/system/stage2-setup.service << 'SERVICEEOF'
+          [Unit]
+          Description=Stage 2 Post-Reboot Setup
+          After=network-online.target
+          Wants=network-online.target
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/stage2-post-reboot.sh
+          RemainAfterExit=yes
+          StandardOutput=journal
+          StandardError=journal
+          
+          [Install]
+          WantedBy=multi-user.target
+          SERVICEEOF
+          
+          systemctl enable stage2-setup.service
+          
+          echo "✅ Stage 1 complete - system ready for reboot"
+          echo "NEEDS_REBOOT" > /tmp/stage1_status
           EOF
           
-          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no foundation-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/foundation-setup.sh && /tmp/foundation-setup.sh"
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/stage1-setup.sh && /tmp/stage1-setup.sh"
           
+          STAGE1_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/stage1_status" || echo "unknown")
+          echo "stage1_status=$STAGE1_STATUS" >> $GITHUB_OUTPUT
+
+      - name: 🔄 Reboot Server for Kernel Updates
+        if: steps.stage1-setup.outputs.stage1_status == 'NEEDS_REBOOT'
+        run: |
+          echo "🔄 Rebooting server for kernel updates and service initialization..."
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "reboot" || true
+          
+          echo "⏳ Waiting for server to come back online..."
+          sleep 30
+          
+          # Wait for SSH to be available again
+          for i in {1..20}; do
+            if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready after reboot'"; then
+              echo "✅ Server is back online after reboot"
+              break
+            fi
+            echo "Attempt $i/20: Waiting for server to come back online..."
+            sleep 15
+          done
+
+      - name: 🏗️ Stage 2 - Post-Reboot Verification
+        id: stage2-setup
+        run: |
+          echo "🏗️ Stage 2: Verifying post-reboot setup..."
+          
+          # Wait for and verify stage2 service completion
+          echo "⏳ Waiting for stage2-setup service to complete..."
+          for i in {1..30}; do
+            if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active --quiet stage2-setup.service"; then
+              echo "✅ Stage 2 setup service completed successfully"
+              break
+            fi
+            echo "Attempt $i/30: Waiting for stage2 setup to complete..."
+            sleep 10
+          done
+          
+          # Verify all services are running
+          echo "🔍 Verifying services..."
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active docker"
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active tailscaled"
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active netdata"
+          
+          # Get Tailscale IP
           TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/tailscale_ip" || echo "unknown")
+          echo "🔗 Tailscale IP: $TAILSCALE_IP"
           echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+          
+          echo "✅ Stage 2 verification complete - server ready for service deployment"
 
   # ============================================================================
   # Service Deployment

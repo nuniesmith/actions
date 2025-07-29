@@ -5,7 +5,22 @@ name: 🚀 Deploy FKS Service
 
 on:
   push:
-    branches: [main, develop]
+      - name: 🧠 Configure FKS AI Services
+        env:
+          SSHPASS: ${{ secrets.ACTIONS_USER_PASSWORD }}
+        run: |
+          echo "🧠 Configuring FKS AI services..."
+          
+          # Install sshpass for password authentication
+          sudo apt-get update && sudo apt-get install -y sshpass
+          
+          # Upload FKS-specific configurations
+          if [[ -f "config/main.yaml" ]]; then
+            sshpass -e scp -o StrictHostKeyChecking=no config/main.yaml fks_user@fks.7gram.xyz:/home/fks_user/fks/config/
+          fi
+          
+          # Restart FKS services if needed
+          sshpass -e ssh -o StrictHostKeyChecking=no fks_user@fks.7gram.xyz "cd /home/fks_user/fks && docker-compose restart"ain, develop]
   workflow_dispatch:
     inputs:
       action_type:
