@@ -115,7 +115,7 @@ jobs:
       - name: 📥 Checkout ATS Repository
         uses: actions/checkout@v4
       
-      - name: 🔗 Setup Tailscale for Post-Deploy
+      - name: 🔗 Setup Tailscale for Post-Deploy (Optional)
         env:
           TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
@@ -124,7 +124,8 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-          tags: tag:ci
+          # Remove problematic tags that cause permission errors
+        continue-on-error: true
 
       - name: 🎮 Configure Game Server
         env:

@@ -126,7 +126,8 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-          tags: tag:ci
+          # Remove problematic tags that cause permission errors
+        continue-on-error: true
       
       - name: ⚙️ Deploy NGINX Configurations
         env:

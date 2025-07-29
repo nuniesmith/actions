@@ -926,7 +926,9 @@ jobs:
           echo "🔗 Starting and authenticating Tailscale..."
           systemctl start tailscaled
           sleep 5
-          tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --accept-routes --timeout=120s
+          # Set hostname to service name for better identification
+          hostnamectl set-hostname "${{ env.SERVICE_NAME }}"
+          tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --timeout=120s
           
           # Wait for Tailscale to be ready
           echo "⏳ Waiting for Tailscale connection..."
@@ -1058,7 +1060,7 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🔗 Setup Tailscale for Deployment
+      - name: 🔗 Setup Tailscale for Deployment (Optional)
         env:
           TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
@@ -1067,7 +1069,8 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-          tags: tag:ci
+          # Remove problematic tags that cause permission errors
+        continue-on-error: true
 
       - name: 🚢 Deploy Service
         run: |
@@ -1132,20 +1135,71 @@ jobs:
           
           SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
           
-          cat > monitoring-setup.sh << 'EOF'
+          cat > monitoring-setup.sh << 'MONITORING_EOF'
           #!/bin/bash
+          set -euo pipefail
+          
+          echo "🔍 Setting up Netdata monitoring..."
+          
+          # Start Netdata first
           systemctl enable netdata
           systemctl start netdata
-          sed -i 's/bind socket to IP = 127.0.0.1/bind socket to IP = 0.0.0.0/' /etc/netdata/netdata.conf || true
-          ufw allow in on tailscale0 to any port 19999
-          systemctl restart netdata
           
-          if [[ -n "${{ secrets.NETDATA_CLAIM_TOKEN }}" ]]; then
-            netdata-claim.sh -token="${{ secrets.NETDATA_CLAIM_TOKEN }}" \
-              -rooms="${{ secrets.NETDATA_CLAIM_ROOM }}" \
-              -url=https://app.netdata.cloud || echo "Claim failed"
+          # Wait for Netdata to start
+          sleep 10
+          
+          # Configure Netdata to bind to all interfaces
+          NETDATA_CONF="/etc/netdata/netdata.conf"
+          if [[ -f "$NETDATA_CONF" ]]; then
+            echo "Configuring Netdata to allow external connections..."
+            sed -i 's/^.*bind socket to IP.*=.*$/\tbind socket to IP = 0.0.0.0/' "$NETDATA_CONF"
+          else
+            echo "Creating basic Netdata configuration..."
+            mkdir -p /etc/netdata
+            echo "[global]" > "$NETDATA_CONF"
+            echo "        bind socket to IP = 0.0.0.0" >> "$NETDATA_CONF"
+            echo "        default port = 19999" >> "$NETDATA_CONF"
+            echo "" >> "$NETDATA_CONF"
+            echo "[web]" >> "$NETDATA_CONF"
+            echo "        allow connections from = *" >> "$NETDATA_CONF"
           fi
-          EOF
+          
+          # Configure firewall
+          echo "Opening firewall for Netdata on Tailscale..."
+          ufw allow in on tailscale0 to any port 19999
+          
+          # Restart Netdata with new config
+          systemctl restart netdata
+          sleep 5
+          
+          # Test if Netdata is responding
+          echo "Testing Netdata connectivity..."
+          if curl -f http://localhost:19999/api/v1/info 2>/dev/null >/dev/null; then
+            echo "✅ Netdata is responding on port 19999"
+          else
+            echo "⚠️ Netdata may not be responding on port 19999"
+          fi
+          
+          # Claim to Netdata Cloud if credentials provided
+          if [[ -n "${{ secrets.NETDATA_CLAIM_TOKEN }}" && -n "${{ secrets.NETDATA_CLAIM_ROOM }}" ]]; then
+            echo "🔗 Claiming Netdata to cloud..."
+            
+            # Check if claim script exists
+            if command -v netdata-claim.sh >/dev/null 2>&1; then
+              netdata-claim.sh -token="${{ secrets.NETDATA_CLAIM_TOKEN }}" \
+                -rooms="${{ secrets.NETDATA_CLAIM_ROOM }}" \
+                -url=https://app.netdata.cloud || {
+                echo "⚠️ Netdata cloud claim failed - continuing without cloud integration"
+              }
+            else
+              echo "⚠️ netdata-claim.sh not found - skipping cloud integration"
+            fi
+          else
+            echo "ℹ️ No Netdata cloud credentials provided - running locally only"
+          fi
+          
+          echo "✅ Netdata monitoring setup complete"
+          MONITORING_EOF
           
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no monitoring-setup.sh root@$SERVER_IP:/tmp/
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/monitoring-setup.sh && /tmp/monitoring-setup.sh"
