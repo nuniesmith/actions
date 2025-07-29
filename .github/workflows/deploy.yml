@@ -520,11 +520,11 @@ jobs:
           # Build using docker-compose if available
           if [[ -f "docker-compose.yml" ]]; then
             echo "📋 Found docker-compose.yml - building services"
-            docker-compose build
+            docker compose build
             
             if [[ -n "${{ secrets.DOCKER_USERNAME }}" ]]; then
               echo "📤 Pushing compose images..."
-              docker-compose push || echo "⚠️ Some images may not have push configured"
+              docker compose push || echo "⚠️ Some images may not have push configured"
             fi
           fi
           
@@ -1318,9 +1318,9 @@ jobs:
           # Deploy based on what's available
           if [[ -f "docker-compose.yml" ]]; then
             echo "🐳 Starting Docker Compose services..."
-            sudo -u ${{ env.SERVICE_NAME }}_user docker-compose down || true
-            sudo -u ${{ env.SERVICE_NAME }}_user docker-compose pull || echo "Pull failed, using local images"
-            sudo -u ${{ env.SERVICE_NAME }}_user docker-compose up -d
+            sudo -u ${{ env.SERVICE_NAME }}_user docker compose down || true
+            sudo -u ${{ env.SERVICE_NAME }}_user docker compose pull || echo "Pull failed, using local images"
+            sudo -u ${{ env.SERVICE_NAME }}_user docker compose up -d
           elif [[ -f "start.sh" ]]; then
             echo "🚀 Running start script..."
             chmod +x start.sh
