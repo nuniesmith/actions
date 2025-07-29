@@ -666,7 +666,7 @@ jobs:
           fi
           
           # Create new server
-          SERVER_LABEL="${{ env.SERVICE_NAME }}-$(date +%Y%m%d-%H%M)"
+          SERVER_LABEL="${{ env.SERVICE_NAME }}"
           echo "🆕 Creating new server: $SERVER_LABEL"
           
           RESULT=$(linode-cli linodes create \
