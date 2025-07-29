@@ -700,12 +700,25 @@ jobs:
           SERVER_LABEL="${{ env.SERVICE_NAME }}"
           echo "🆕 Creating new server: $SERVER_LABEL"
           
+          # Generate SSH key for this deployment
+          echo "🔑 Generating SSH key for server access..."
+          ssh-keygen -t rsa -b 4096 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-${{ env.SERVICE_NAME }}"
+          
+          # Upload SSH key to Linode (if it doesn't exist)
+          SSH_KEY_LABEL="github-actions-${{ env.SERVICE_NAME }}-$(date +%Y%m%d)"
+          linode-cli sshkeys create --label "$SSH_KEY_LABEL" --ssh_key "$(cat ~/.ssh/linode_deployment_key.pub)" || echo "Key might already exist"
+          
+          # Get the SSH key ID
+          SSH_KEY_ID=$(linode-cli sshkeys list --text --no-headers | grep "$SSH_KEY_LABEL" | cut -f1 | head -1)
+          
+          echo "🚀 Creating server with SSH key authentication..."
           RESULT=$(linode-cli linodes create \
             --type "${{ env.SERVER_TYPE }}" \
             --region "${{ env.TARGET_REGION }}" \
             --image "linode/arch" \
             --label "$SERVER_LABEL" \
             --root_pass "${{ secrets.SERVICE_ROOT_PASSWORD }}" \
+            --authorized_keys "$SSH_KEY_ID" \
             --backups_enabled=${{ inputs.enable_backups || 'false' }} \
             --text --no-headers)
           
@@ -781,23 +794,38 @@ jobs:
           
           SSH_READY=false
           
-          # Start testing SSH immediately, don't wait for "running" status
-          echo "🔑 Testing SSH with root password authentication..."
+          # First, test basic connectivity
+          echo "🔍 Testing basic connectivity to port 22..."
+          for i in {1..10}; do
+            if timeout 5 nc -zv ${{ steps.create-server.outputs.server_ip }} 22 2>/dev/null; then
+              echo "✅ Port 22 is reachable on attempt $i"
+              break
+            fi
+            echo "Port 22 not ready, waiting 10 seconds..."
+            sleep 10
+          done
           
-          for i in {1..30}; do
-            echo "Attempt $i/30: Testing SSH connection..."
+          # Test SSH with detailed error output
+          echo "🔑 Testing SSH connection with private key..."
+          
+          for i in {1..15}; do
+            echo "Attempt $i/15: Testing SSH connection..."
             
-            # Test SSH connection with shorter timeout
-            if timeout 8 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o ConnectionAttempts=1 \
-               root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready'" 2>/dev/null; then
+            # Use the generated private key for authentication
+            SSH_OUTPUT=$(timeout 10 ssh -i ~/.ssh/linode_deployment_key -v -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ConnectionAttempts=1 \
+               root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready'" 2>&1 || echo "SSH_FAILED")
+            
+            if echo "$SSH_OUTPUT" | grep -q "SSH ready"; then
               echo "✅ SSH ready after $i attempts"
               SSH_READY=true
               break
+            else
+              echo "SSH failed. Last few lines of output:"
+              echo "$SSH_OUTPUT" | tail -3
             fi
             
-            # Shorter wait between attempts for faster deployment
-            echo "SSH not ready yet, waiting 10 seconds..."
-            sleep 10
+            echo "Waiting 15 seconds before next attempt..."
+            sleep 15
           done
           
           if [[ "$SSH_READY" != "true" ]]; then
@@ -863,10 +891,10 @@ jobs:
           echo "✅ Foundation complete"
           EOF
           
-          scp foundation-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
-          ssh root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/foundation-setup.sh && /tmp/foundation-setup.sh"
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no foundation-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/foundation-setup.sh && /tmp/foundation-setup.sh"
           
-          TAILSCALE_IP=$(ssh root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/tailscale_ip" || echo "unknown")
+          TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/tailscale_ip" || echo "unknown")
           echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
 
   # ============================================================================
@@ -946,8 +974,8 @@ jobs:
           fi
           
           # Run deployment
-          scp deploy-script.sh root@$SERVER_IP:/tmp/
-          ssh root@$SERVER_IP "chmod +x /tmp/deploy-script.sh && /tmp/deploy-script.sh"
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no deploy-script.sh root@$SERVER_IP:/tmp/
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/deploy-script.sh && /tmp/deploy-script.sh"
 
       - name: 🔍 Setup Monitoring
         if: inputs.enable_monitoring
@@ -971,8 +999,8 @@ jobs:
           fi
           EOF
           
-          scp monitoring-setup.sh root@$SERVER_IP:/tmp/
-          ssh root@$SERVER_IP "chmod +x /tmp/monitoring-setup.sh && /tmp/monitoring-setup.sh"
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no monitoring-setup.sh root@$SERVER_IP:/tmp/
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/monitoring-setup.sh && /tmp/monitoring-setup.sh"
 
   # ============================================================================
   # Health Checks
@@ -992,12 +1020,12 @@ jobs:
           
           if [[ -n "$SERVER_IP" ]]; then
             echo "Testing SSH connectivity..."
-            ssh -o ConnectTimeout=10 root@$SERVER_IP "echo 'SSH OK'"
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$SERVER_IP "echo 'SSH OK'"
             
             echo "Checking services..."
-            ssh root@$SERVER_IP "systemctl is-active docker"
-            ssh root@$SERVER_IP "tailscale status --peers=false"
-            ssh root@$SERVER_IP "docker ps"
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "systemctl is-active docker"
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "tailscale status --peers=false"
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "docker ps"
             
             echo "✅ Health checks passed"
           else
