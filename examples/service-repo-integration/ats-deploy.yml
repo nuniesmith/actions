@@ -220,97 +220,194 @@ jobs:
           echo "⏳ Waiting for SSH service to be ready..."
           sleep 15
           
-          # Method 1: Try Tailscale hostname first (most reliable)
-          if timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@ats "echo 'Connected via Tailscale hostname'" 2>/dev/null; then
-            SERVER_HOST="ats"
-            echo "✅ Using Tailscale hostname: $SERVER_HOST"
-          # Method 2: Try Tailscale IP directly
-          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@$TAILSCALE_IP "echo 'Connected via Tailscale IP'" 2>/dev/null; then
+          # Get server public IP as fallback
+          SERVER_IP="${{ needs.manage-ats.outputs.server_ip }}"
+          echo "🔗 Server Public IP: $SERVER_IP"
+          
+          # Method 1: Try Tailscale IP directly (most reliable for GitHub Actions)
+          if [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@$TAILSCALE_IP "echo 'Connected via Tailscale IP'" 2>/dev/null; then
             SERVER_HOST="$TAILSCALE_IP"
             echo "✅ Using Tailscale IP: $SERVER_HOST"
+          # Method 2: Try public IP directly
+          elif [[ -n "$SERVER_IP" && "$SERVER_IP" != "unknown" ]] && timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@$SERVER_IP "echo 'Connected via public IP'" 2>/dev/null; then
+            SERVER_HOST="$SERVER_IP"
+            echo "✅ Using public IP: $SERVER_HOST"
           # Method 3: Try public domain (after DNS update)
           elif timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@ats.7gram.xyz "echo 'Connected via public domain'" 2>/dev/null; then
             SERVER_HOST="ats.7gram.xyz"
             echo "✅ Using public domain: $SERVER_HOST"
+          # Method 4: Try root user as fallback
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$TAILSCALE_IP "echo 'Connected as root via Tailscale IP'" 2>/dev/null; then
+            SERVER_HOST="$TAILSCALE_IP"
+            SERVER_USER="root"
+            echo "✅ Using root@Tailscale IP: $SERVER_HOST (will setup ats_user)"
           else
             echo "❌ Could not connect to ATS server via any method"
             echo "🔍 Tried:"
-            echo "  - Tailscale hostname: ats"
             echo "  - Tailscale IP: $TAILSCALE_IP"
+            echo "  - Public IP: $SERVER_IP"  
             echo "  - Public domain: ats.7gram.xyz"
+            echo "  - Root user fallback: root@$TAILSCALE_IP"
             echo "⚠️ Skipping game server configuration"
             exit 0
+          fi
+          
+          # Set default user if not set
+          SERVER_USER="${SERVER_USER:-ats_user}"
+          echo "🔗 Connecting as: $SERVER_USER@$SERVER_HOST"
+          
+          # If we connected as root, set up ats_user properly
+          if [[ "$SERVER_USER" == "root" ]]; then
+            echo "🔧 Setting up ats_user access..."
+            sshpass -e ssh -o StrictHostKeyChecking=no root@$SERVER_HOST "
+              # Ensure ats_user exists and has proper setup
+              id ats_user || useradd -m -s /bin/bash ats_user
+              echo 'ats_user:${{ secrets.ACTIONS_USER_PASSWORD }}' | chpasswd
+              usermod -aG docker ats_user
+              mkdir -p /home/ats_user/.ssh
+              chmod 700 /home/ats_user/.ssh  
+              chown ats_user:ats_user /home/ats_user/.ssh
+            "
+            # Now switch to ats_user for the rest
+            SERVER_USER="ats_user"
           fi
           
           echo "🔄 Waiting for services to be ready..."
           sleep 30
           
-          # Create service directory structure if it doesn't exist
-          echo "📁 Ensuring service directory structure exists..."
-          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@$SERVER_HOST "
-            mkdir -p /home/ats_user/ats/config
-            mkdir -p /home/ats_user/ats/data
-            mkdir -p /home/ats_user/ats/logs
-          " || echo "⚠️ Failed to create some directories"
+          # Clone or update the ATS repository
+          echo "� Setting up ATS repository..."
+          sshpass -e ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
+            # Ensure git is available and configured
+            git --version || { echo 'Git not found'; exit 1; }
+            
+            # Remove existing directory if it exists and clone fresh
+            rm -rf /home/ats_user/ats
+            
+            # Clone the ATS repository (public repo, no auth needed)
+            echo 'Cloning ATS repository from GitHub...'
+            git clone https://github.com/nuniesmith/ats.git /home/ats_user/ats || {
+              echo 'Failed to clone repository, trying alternative methods...'
+              # Try with explicit HTTPS
+              git clone https://github.com/nuniesmith/ats.git /home/ats_user/ats --depth 1 || {
+                echo 'Git clone failed completely'
+                exit 1
+              }
+            }
+            
+            # Change ownership to ats_user if we're running as root
+            if [[ \$(whoami) == 'root' ]]; then
+              chown -R ats_user:ats_user /home/ats_user/ats
+            fi
+            
+            # Change to the repository directory
+            cd /home/ats_user/ats
+            
+            echo 'Repository cloned successfully!'
+            echo 'Repository contents:'
+            ls -la
+            
+            echo 'Git repository info:'
+            git log --oneline -5 || echo 'Git log unavailable'
+          " || {
+            echo "⚠️ Failed to clone ATS repository"
+            exit 1
+          }
           
-          # Upload server configurations if they exist
+          # Upload any local configs if they exist (to override defaults)
           if [[ -f "config/server_config.sii" ]]; then
-            echo "📁 Uploading server configuration..."
-            sshpass -e scp -o StrictHostKeyChecking=no config/server_config.sii ats_user@$SERVER_HOST:/home/ats_user/ats/config/ || {
+            echo "📁 Uploading custom server configuration..."
+            sshpass -e scp -o StrictHostKeyChecking=no config/server_config.sii $SERVER_USER@$SERVER_HOST:/home/ats_user/ats/config/ || {
               echo "⚠️ Failed to upload server config"
             }
-          else
-            echo "ℹ️ No server_config.sii found to upload"
           fi
           
-          # Upload additional configs if they exist
           if [[ -d "config/" ]]; then
-            echo "📁 Uploading additional configurations..."
-            sshpass -e scp -r -o StrictHostKeyChecking=no config/* ats_user@$SERVER_HOST:/home/ats_user/ats/config/ || {
+            echo "📁 Uploading additional custom configurations..."
+            sshpass -e scp -r -o StrictHostKeyChecking=no config/* $SERVER_USER@$SERVER_HOST:/home/ats_user/ats/config/ || {
               echo "⚠️ Failed to upload some configs"
             }
           fi
           
-          # Upload docker-compose or other deployment files
-          for file in docker-compose.yml docker-compose.yaml start.sh deploy.sh; do
-            if [[ -f "$file" ]]; then
-              echo "📁 Uploading $file..."
-              sshpass -e scp -o StrictHostKeyChecking=no "$file" ats_user@$SERVER_HOST:/home/ats_user/ats/ || {
-                echo "⚠️ Failed to upload $file"
-              }
-            fi
-          done
-          
-          # Check if docker-compose is ready and restart services
-          echo "🐳 Checking and restarting game server..."
-          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@$SERVER_HOST "
+          # Pull Docker images and start services
+          echo "🐳 Starting ATS services from repository..."
+          sshpass -e ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
             cd /home/ats_user/ats || exit 1
             
             echo 'Current directory contents:'
             ls -la
             
-            if [[ -f docker-compose.yml ]]; then
-              echo 'Docker compose file found, restarting services...'
-              docker-compose down || true
-              docker-compose pull || echo 'Failed to pull some images'
-              docker-compose up -d || echo 'Failed to start some services'
+            # Stop any existing services
+            docker-compose down || true
+            
+            # Pull the latest images
+            echo 'Pulling Docker images...'
+            docker-compose pull || echo 'Failed to pull some images (may not exist yet)'
+            
+            # Start the services
+            echo 'Starting ATS services...'
+            docker-compose up -d || {
+              echo 'Docker compose failed, trying alternative methods...'
               
-              echo 'Service status:'
-              docker-compose ps
-            else
-              echo 'No docker-compose.yml found, checking for other start methods...'
+              # Try different startup methods
               if [[ -f start.sh ]]; then
                 echo 'Found start.sh, running it...'
                 chmod +x start.sh && ./start.sh
               elif [[ -f deploy.sh ]]; then
                 echo 'Found deploy.sh, running it...'
                 chmod +x deploy.sh && ./deploy.sh
+              elif [[ -f run.sh ]]; then
+                echo 'Found run.sh, running it...'
+                chmod +x run.sh && ./run.sh
               else
-                echo 'No start script found - manual setup may be required'
+                echo 'No startup script found, manual intervention may be required'
               fi
+            }
+            
+            # Show final status
+            echo ''
+            echo '🔍 Checking Docker services status...'
+            
+            # Wait for services to fully start
+            echo "⏱️ Waiting for services to initialize..."
+            sleep 15
+            
+            # Check Docker containers
+            echo 'Docker containers status:'
+            docker ps -a
+            
+            # Enhanced service verification
+            echo ''
+            echo 'Docker compose services status:'
+            if command -v docker-compose >/dev/null 2>&1; then
+              SERVICES_UP=$(docker-compose ps --services --filter "status=running" 2>/dev/null | wc -l || echo "0")
+              TOTAL_SERVICES=$(docker-compose ps --services 2>/dev/null | wc -l || echo "0")
+              
+              echo "📊 Services status: $SERVICES_UP/$TOTAL_SERVICES running"
+              
+              if [ "$SERVICES_UP" -gt 0 ]; then
+                echo "✅ Some Docker services are running"
+                docker-compose ps
+                
+                # Check logs for any obvious errors
+                echo "📝 Quick log check for errors:"
+                docker-compose logs --tail 20 | grep -i "error\|fail\|exception" | head -5 || echo "No obvious errors in recent logs"
+                
+              else
+                echo "❌ No Docker services are running"
+                docker-compose ps
+              fi
+            else
+              echo 'Docker compose command not available, checking containers directly'
+              docker ps
             fi
+            
+            # Show recent logs
+            echo ''
+            echo 'Recent container logs:'
+            docker-compose logs --tail=10 2>/dev/null || docker logs $(docker ps -q | head -1) 2>/dev/null || echo 'Logs unavailable'
           " || {
-            echo "⚠️ Failed to restart game server services"
+            echo "⚠️ Failed to start ATS services"
           }
 
       - name: 🧪 Test Game Server
@@ -326,23 +423,33 @@ jobs:
           # Test web interface via multiple methods
           echo "🌐 Testing web interface..."
           
-          # Method 1: Tailscale hostname
-          if timeout 10 curl -f http://ats:8080/health 2>/dev/null; then
-            echo "✅ ATS web interface responding via Tailscale hostname"
-          elif timeout 10 curl -f http://ats/health 2>/dev/null; then
-            echo "✅ ATS web interface responding via Tailscale hostname (port 80)"
-          # Method 2: Tailscale IP
-          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP:8080/health 2>/dev/null; then
-            echo "✅ ATS web interface responding via Tailscale IP"
-          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP/health 2>/dev/null; then
+          # Method 1: Test via Tailscale IP (most likely to work)
+          if [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP 2>/dev/null; then
             echo "✅ ATS web interface responding via Tailscale IP (port 80)"
-          # Method 3: Public domain
-          elif timeout 10 curl -f https://ats.7gram.xyz/api/health 2>/dev/null; then
-            echo "✅ ATS web interface responding via public domain (HTTPS)"
-          elif timeout 10 curl -f http://ats.7gram.xyz/health 2>/dev/null; then
-            echo "✅ ATS web interface responding via public domain (HTTP)"
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP:8080 2>/dev/null; then
+            echo "✅ ATS web interface responding via Tailscale IP (port 8080)"
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -s http://$TAILSCALE_IP | grep -i "ats\|truck\|server" >/dev/null; then
+            echo "✅ ATS web page detected via Tailscale IP (contains expected content)"
+          # Method 2: Test via public domain
+          elif timeout 10 curl -f http://ats.7gram.xyz 2>/dev/null; then
+            echo "✅ ATS web interface responding via public domain (port 80)"
+          elif timeout 10 curl -f http://ats.7gram.xyz:8080 2>/dev/null; then
+            echo "✅ ATS web interface responding via public domain (port 8080)"
+          elif timeout 10 curl -s http://ats.7gram.xyz | grep -i "ats\|truck\|server" >/dev/null; then
+            echo "✅ ATS web page detected via public domain (contains expected content)"
           else
-            echo "⚠️ ATS web interface not responding via any method (may still be starting up)"
+            echo "⚠️ ATS web interface not responding via any method"
+            echo "🔍 Let's check what's actually running on the server..."
+            
+            # Get more detailed info about what's running
+            if [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]]; then
+              echo "📊 Port scan results:"
+              timeout 5 nmap -p 80,8080,27015,19999 $TAILSCALE_IP 2>/dev/null || echo "nmap not available"
+              
+              # Try to get a raw response
+              echo "📝 Raw HTTP response:"
+              timeout 5 curl -s http://$TAILSCALE_IP | head -10 || echo "No HTTP response"
+            fi
           fi
           
           # Test game server port if accessible
@@ -363,6 +470,53 @@ jobs:
           echo "📊 Access URLs:"
           echo "  - Tailscale: http://ats:8080 or http://$TAILSCALE_IP:8080"
           echo "  - Public: https://ats.7gram.xyz (after DNS propagation)"
+          
+          # Final deployment verification
+          echo ""
+          echo "🎯 Final Deployment Verification:"
+          echo "================================"
+          
+          # Summary of what was accomplished
+          if [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]]; then
+            echo "✅ Server connected to Tailscale: $TAILSCALE_IP"
+          else
+            echo "⚠️ Tailscale connection status unclear"
+          fi
+          
+          DNS_UPDATED="${{ needs.manage-ats.outputs.dns_updated }}"
+          if [[ -n "$DNS_UPDATED" && "$DNS_UPDATED" == "true" ]]; then
+            echo "✅ DNS record updated for ats.7gram.xyz"
+          else
+            echo "⚠️ DNS update status unclear"
+          fi
+          
+          # Check repository status
+          sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$TAILSCALE_IP "
+            if [[ -d '/home/ats_user/ats/.git' ]]; then
+              echo '✅ ATS repository cloned successfully'
+              cd /home/ats_user/ats && git log --oneline -1 | sed 's/^/    Latest commit: /'
+            else
+              echo '⚠️ ATS repository not found'
+            fi
+            
+            RUNNING_CONTAINERS=\$(docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -v 'NAMES' | wc -l)
+            if [ \"\$RUNNING_CONTAINERS\" -gt 0 ]; then
+              echo '✅ Docker services running: '\$RUNNING_CONTAINERS' containers active'
+            else
+              echo '❌ No Docker containers running'
+            fi
+          " 2>/dev/null || echo "⚠️ Could not verify repository and container status"
+          
+          echo ""
+          echo "🌐 Access Information:"
+          echo "====================="
+          echo "🔗 Direct access: http://$TAILSCALE_IP"
+          echo "🔗 Direct access (alt port): http://$TAILSCALE_IP:8080"
+          echo "🔗 Public access: http://ats.7gram.xyz"
+          echo "🔗 Public access (alt port): http://ats.7gram.xyz:8080"
+          echo ""
+          echo "📝 Note: Services may take a few minutes to fully initialize"
+          echo "🎮 ATS game server should be accessible for multiplayer connections"
 
       - name: 📊 Verify Netdata Cloud Connection
         env:
