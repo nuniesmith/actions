@@ -1,0 +1,44 @@
+service:
+  name: fks
+  type: container
+  description: "FKS Trading Systems - Multi-container trading platform"
+  domain: fks.7gram.xyz
+  user: fks_user
+  ports:
+    - "3000:3000"  # Web interface
+    - "8080:8080"  # API server
+
+infrastructure:
+  server_type: g6-standard-4  # 8GB RAM for multiple containers
+  region: ca-central
+  backup_enabled: true
+  
+deployment:
+  compose_file: docker-compose.yml
+  env_template: .env.template
+  health_check: /api/health
+  startup_script: start.sh
+  
+monitoring:
+  netdata_enabled: true
+  custom_dashboards:
+    - "trading-dashboard.json"
+  
+networking:
+  tailscale_required: true
+  public_access: false
+  ssl_required: true
+  
+users:
+  service_user: fks_user
+  additional_groups:
+    - docker
+  
+environment:
+  required_secrets:
+    - DOCKER_USERNAME
+    - DOCKER_TOKEN
+    - JWT_SECRET
+  optional_secrets:
+    - DATABASE_URL
+    - REDIS_URL

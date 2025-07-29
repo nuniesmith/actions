@@ -1,0 +1,40 @@
+service:
+  name: ats
+  type: game-server
+  description: "American Truck Simulator Dedicated Server"
+  domain: ats.7gram.xyz
+  user: ats_user
+  ports:
+    - "3000:3000"  # Web interface
+    - "27015:27015/udp" # Game server port
+
+infrastructure:
+  server_type: g6-standard-2  # 4GB RAM for game server
+  region: ca-central
+  backup_enabled: true
+  
+deployment:
+  compose_file: docker-compose.yml
+  env_template: .env.template
+  health_check: /api/health
+  startup_script: start.sh
+  
+monitoring:
+  netdata_enabled: true
+  game_server_monitoring: true
+  
+networking:
+  tailscale_required: true
+  public_access: false  # Game access via Tailscale only
+  ssl_required: true
+  
+users:
+  service_user: ats_user
+  additional_groups:
+    - docker
+  
+environment:
+  required_secrets:
+    - JWT_SECRET
+  optional_secrets:
+    - STEAM_API_KEY
