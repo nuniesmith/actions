@@ -134,6 +134,18 @@ on:
       DISCORD_WEBHOOK:
         required: false
 
+    outputs:
+      # Infrastructure outputs
+      server_ip:
+        description: 'Public IP address of the deployed server'
+        value: ${{ jobs.setup-infrastructure.outputs.server_ip }}
+      server_id:
+        description: 'Linode server ID'
+        value: ${{ jobs.setup-infrastructure.outputs.server_id }}
+      tailscale_ip:
+        description: 'Tailscale IP address of the server'
+        value: ${{ jobs.setup-infrastructure.outputs.tailscale_ip }}
+
   workflow_dispatch:
     inputs:
       service_name:

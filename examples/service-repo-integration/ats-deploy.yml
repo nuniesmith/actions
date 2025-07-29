@@ -115,6 +115,100 @@ jobs:
       - name: 📥 Checkout ATS Repository
         uses: actions/checkout@v4
 
+      - name: 🌐 Update Cloudflare DNS Records
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ZONE_ID != ''
+        run: |
+          echo "🌐 Updating Cloudflare DNS records for ATS server..."
+          
+          # Install jq for JSON processing
+          sudo apt-get update && sudo apt-get install -y jq >/dev/null 2>&1
+          
+          # Get the Tailscale IP from the infrastructure job output
+          TAILSCALE_IP="${{ needs.manage-ats.outputs.tailscale_ip }}"
+          
+          if [[ -z "$TAILSCALE_IP" || "$TAILSCALE_IP" == "unknown" || "$TAILSCALE_IP" == "pending" ]]; then
+            echo "⚠️ No valid Tailscale IP available: '$TAILSCALE_IP'"
+            echo "Skipping DNS update"
+            exit 0
+          fi
+          
+          echo "🔗 Using Tailscale IP: $TAILSCALE_IP"
+          
+          # Update A record for ats.7gram.xyz
+          echo "📝 Updating A record for ats.7gram.xyz..."
+          
+          # Get existing record ID first
+          RECORD_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=A&name=ats.7gram.xyz" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json")
+          
+          if ! echo "$RECORD_RESPONSE" | jq . >/dev/null 2>&1; then
+            echo "❌ Failed to parse Cloudflare API response"
+            echo "Response: $RECORD_RESPONSE"
+            exit 1
+          fi
+          
+          RECORD_ID=$(echo "$RECORD_RESPONSE" | jq -r '.result[0].id // empty')
+          
+          if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+            echo "📝 Updating existing A record (ID: $RECORD_ID)..."
+            UPDATE_RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"A\",
+                \"name\": \"ats\",
+                \"content\": \"$TAILSCALE_IP\",
+                \"ttl\": 300,
+                \"comment\": \"ATS Game Server - Updated by GitHub Actions\"
+              }")
+            
+            SUCCESS=$(echo "$UPDATE_RESPONSE" | jq -r '.success // false')
+            if [[ "$SUCCESS" == "true" ]]; then
+              echo "✅ A record updated successfully"
+            else
+              echo "❌ Failed to update A record"
+              echo "Response: $UPDATE_RESPONSE"
+            fi
+          else
+            echo "📝 Creating new A record..."
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"A\",
+                \"name\": \"ats\",
+                \"content\": \"$TAILSCALE_IP\",
+                \"ttl\": 300,
+                \"comment\": \"ATS Game Server - Created by GitHub Actions\"
+              }")
+            
+            SUCCESS=$(echo "$CREATE_RESPONSE" | jq -r '.success // false')
+            if [[ "$SUCCESS" == "true" ]]; then
+              echo "✅ A record created successfully"
+            else
+              echo "❌ Failed to create A record"
+              echo "Response: $CREATE_RESPONSE"
+            fi
+          fi
+          
+          echo "✅ DNS update completed - ats.7gram.xyz now points to $TAILSCALE_IP"
+          echo "⏳ DNS propagation may take a few minutes..."
+
+      - name: 🔗 Setup Tailscale for Post-Deploy Access
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        continue-on-error: true
+
       - name: 🎮 Configure Game Server
         env:
           SSHPASS: ${{ secrets.ACTIONS_USER_PASSWORD }}
@@ -122,22 +216,155 @@ jobs:
           echo "🎮 Configuring ATS game server..."
           
           # Install sshpass for password authentication
-          sudo apt-get update && sudo apt-get install -y sshpass
+          sudo apt-get update && sudo apt-get install -y sshpass >/dev/null 2>&1
           
-          # Upload server configurations
-          if [[ -f "config/server_config.sii" ]]; then
-            sshpass -e scp -o StrictHostKeyChecking=no config/server_config.sii ats_user@ats.7gram.xyz:/home/ats_user/ats/config/
+          # Get the server IP information
+          TAILSCALE_IP="${{ needs.manage-ats.outputs.tailscale_ip }}"
+          echo "🔗 Server Tailscale IP: $TAILSCALE_IP"
+          
+          # Try to determine server connection method
+          echo "🔍 Determining server connection method..."
+          
+          # Method 1: Try Tailscale hostname first (most reliable)
+          if timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@ats "echo 'Connected via Tailscale hostname'" 2>/dev/null; then
+            SERVER_HOST="ats"
+            echo "✅ Using Tailscale hostname: $SERVER_HOST"
+          # Method 2: Try Tailscale IP directly
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@$TAILSCALE_IP "echo 'Connected via Tailscale IP'" 2>/dev/null; then
+            SERVER_HOST="$TAILSCALE_IP"
+            echo "✅ Using Tailscale IP: $SERVER_HOST"
+          # Method 3: Try public domain (after DNS update)
+          elif timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@ats.7gram.xyz "echo 'Connected via public domain'" 2>/dev/null; then
+            SERVER_HOST="ats.7gram.xyz"
+            echo "✅ Using public domain: $SERVER_HOST"
+          else
+            echo "❌ Could not connect to ATS server via any method"
+            echo "🔍 Tried:"
+            echo "  - Tailscale hostname: ats"
+            echo "  - Tailscale IP: $TAILSCALE_IP"
+            echo "  - Public domain: ats.7gram.xyz"
+            echo "⚠️ Skipping game server configuration"
+            exit 0
           fi
           
-          # Restart game server if needed
-          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@ats.7gram.xyz "cd /home/ats_user/ats && docker-compose restart"
+          echo "🔄 Waiting for services to be ready..."
+          sleep 30
           
+          # Create service directory structure if it doesn't exist
+          echo "📁 Ensuring service directory structure exists..."
+          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@$SERVER_HOST "
+            mkdir -p /home/ats_user/ats/config
+            mkdir -p /home/ats_user/ats/data
+            mkdir -p /home/ats_user/ats/logs
+          " || echo "⚠️ Failed to create some directories"
+          
+          # Upload server configurations if they exist
+          if [[ -f "config/server_config.sii" ]]; then
+            echo "📁 Uploading server configuration..."
+            sshpass -e scp -o StrictHostKeyChecking=no config/server_config.sii ats_user@$SERVER_HOST:/home/ats_user/ats/config/ || {
+              echo "⚠️ Failed to upload server config"
+            }
+          else
+            echo "ℹ️ No server_config.sii found to upload"
+          fi
+          
+          # Upload additional configs if they exist
+          if [[ -d "config/" ]]; then
+            echo "📁 Uploading additional configurations..."
+            sshpass -e scp -r -o StrictHostKeyChecking=no config/* ats_user@$SERVER_HOST:/home/ats_user/ats/config/ || {
+              echo "⚠️ Failed to upload some configs"
+            }
+          fi
+          
+          # Upload docker-compose or other deployment files
+          for file in docker-compose.yml docker-compose.yaml start.sh deploy.sh; do
+            if [[ -f "$file" ]]; then
+              echo "📁 Uploading $file..."
+              sshpass -e scp -o StrictHostKeyChecking=no "$file" ats_user@$SERVER_HOST:/home/ats_user/ats/ || {
+                echo "⚠️ Failed to upload $file"
+              }
+            fi
+          done
+          
+          # Check if docker-compose is ready and restart services
+          echo "🐳 Checking and restarting game server..."
+          sshpass -e ssh -o StrictHostKeyChecking=no ats_user@$SERVER_HOST "
+            cd /home/ats_user/ats || exit 1
+            
+            echo 'Current directory contents:'
+            ls -la
+            
+            if [[ -f docker-compose.yml ]]; then
+              echo 'Docker compose file found, restarting services...'
+              docker-compose down || true
+              docker-compose pull || echo 'Failed to pull some images'
+              docker-compose up -d || echo 'Failed to start some services'
+              
+              echo 'Service status:'
+              docker-compose ps
+            else
+              echo 'No docker-compose.yml found, checking for other start methods...'
+              if [[ -f start.sh ]]; then
+                echo 'Found start.sh, running it...'
+                chmod +x start.sh && ./start.sh
+              elif [[ -f deploy.sh ]]; then
+                echo 'Found deploy.sh, running it...'
+                chmod +x deploy.sh && ./deploy.sh
+              else
+                echo 'No start script found - manual setup may be required'
+              fi
+            fi
+          " || {
+            echo "⚠️ Failed to restart game server services"
+          }
+
       - name: 🧪 Test Game Server
         run: |
           echo "🧪 Testing ATS game server..."
           
-          # Test web interface
-          curl -f https://ats.7gram.xyz/api/health || echo "❌ ATS web interface not responding"
+          # Wait a bit for services to start and DNS to propagate
+          echo "⏳ Waiting for services to start and DNS to propagate..."
+          sleep 30
           
-          # Test game server port (if accessible)
-          timeout 5 bash -c "</dev/tcp/ats.7gram.xyz/27015" && echo "✅ Game server port accessible" || echo "⚠️ Game server port not accessible (may be normal)"
+          TAILSCALE_IP="${{ needs.manage-ats.outputs.tailscale_ip }}"
+          
+          # Test web interface via multiple methods
+          echo "🌐 Testing web interface..."
+          
+          # Method 1: Tailscale hostname
+          if timeout 10 curl -f http://ats:8080/health 2>/dev/null; then
+            echo "✅ ATS web interface responding via Tailscale hostname"
+          elif timeout 10 curl -f http://ats/health 2>/dev/null; then
+            echo "✅ ATS web interface responding via Tailscale hostname (port 80)"
+          # Method 2: Tailscale IP
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP:8080/health 2>/dev/null; then
+            echo "✅ ATS web interface responding via Tailscale IP"
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 10 curl -f http://$TAILSCALE_IP/health 2>/dev/null; then
+            echo "✅ ATS web interface responding via Tailscale IP (port 80)"
+          # Method 3: Public domain
+          elif timeout 10 curl -f https://ats.7gram.xyz/api/health 2>/dev/null; then
+            echo "✅ ATS web interface responding via public domain (HTTPS)"
+          elif timeout 10 curl -f http://ats.7gram.xyz/health 2>/dev/null; then
+            echo "✅ ATS web interface responding via public domain (HTTP)"
+          else
+            echo "⚠️ ATS web interface not responding via any method (may still be starting up)"
+          fi
+          
+          # Test game server port if accessible
+          echo "🎮 Testing game server port..."
+          
+          if timeout 5 bash -c "</dev/tcp/ats/27015" 2>/dev/null; then
+            echo "✅ Game server port accessible via Tailscale hostname"
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" ]] && timeout 5 bash -c "</dev/tcp/$TAILSCALE_IP/27015" 2>/dev/null; then
+            echo "✅ Game server port accessible via Tailscale IP"
+          elif timeout 5 bash -c "</dev/tcp/ats.7gram.xyz/27015" 2>/dev/null; then
+            echo "✅ Game server port accessible via public domain"
+          else
+            echo "ℹ️ Game server port not accessible externally (may be behind firewall or still starting)"
+            echo "   This is normal if the game server only accepts connections from Tailscale network"
+          fi
+          
+          echo "🎮 ATS game server setup complete!"
+          echo "📊 Access URLs:"
+          echo "  - Tailscale: http://ats:8080 or http://$TAILSCALE_IP:8080"
+          echo "  - Public: https://ats.7gram.xyz (after DNS propagation)"
