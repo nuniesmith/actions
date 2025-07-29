@@ -114,18 +114,6 @@ jobs:
     steps:
       - name: 📥 Checkout ATS Repository
         uses: actions/checkout@v4
-      
-      - name: 🔗 Setup Tailscale for Post-Deploy (Optional)
-        env:
-          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
-        uses: tailscale/github-action@v2
-        with:
-          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-          # Remove problematic tags that cause permission errors
-        continue-on-error: true
 
       - name: 🎮 Configure Game Server
         env:

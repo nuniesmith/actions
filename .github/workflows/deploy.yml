@@ -587,24 +587,37 @@ jobs:
             if [[ -n "$SERVER_IP" ]]; then
               echo "🔍 Found server to cleanup: $SERVER_LABEL ($SERVER_IP)"
               
-              # Generate SSH key for cleanup access
-              ssh-keygen -t rsa -b 4096 -f ~/.ssh/cleanup_key -N "" -C "cleanup-${{ env.SERVICE_NAME }}" || true
+              # Try to connect using password authentication for cleanup
+              echo "🔗 Attempting cleanup connection via password auth..."
               
-              # Try to connect and cleanup (with error handling)
-              if timeout 30 ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$SERVER_IP "echo 'Cleanup connection successful'" 2>/dev/null; then
+              # Install sshpass for password authentication
+              sudo apt-get update && sudo apt-get install -y sshpass >/dev/null 2>&1 || true
+              
+              # Try to connect and cleanup using root password
+              if timeout 30 sshpass -p "${{ secrets.SERVICE_ROOT_PASSWORD }}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$SERVER_IP "echo 'Cleanup connection successful'" 2>/dev/null; then
                 echo "🔗 Connected to server for cleanup..."
                 
-                # Cleanup Tailscale
-                echo "🧹 Removing Tailscale device..."
-                ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "tailscale logout || true" || true
+                # Cleanup Tailscale device
+                echo "🧹 Removing Tailscale device from network..."
+                sshpass -p "${{ secrets.SERVICE_ROOT_PASSWORD }}" ssh -o StrictHostKeyChecking=no root@$SERVER_IP "tailscale logout 2>/dev/null || true" || true
+                
+                # Get device info before cleanup
+                DEVICE_NAME=$(sshpass -p "${{ secrets.SERVICE_ROOT_PASSWORD }}" ssh -o StrictHostKeyChecking=no root@$SERVER_IP "hostname 2>/dev/null || echo '${{ env.SERVICE_NAME }}'" || echo "${{ env.SERVICE_NAME }}")
+                echo "Device name for cleanup: $DEVICE_NAME"
                 
                 # Cleanup Netdata cloud connection
                 echo "🧹 Cleaning up Netdata cloud connection..."
-                ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "systemctl stop netdata || true; rm -rf /var/lib/netdata/cloud.d/ || true; rm -rf /var/lib/netdata/registry/ || true" || true
+                sshpass -p "${{ secrets.SERVICE_ROOT_PASSWORD }}" ssh -o StrictHostKeyChecking=no root@$SERVER_IP "
+                  systemctl stop netdata 2>/dev/null || true
+                  rm -rf /var/lib/netdata/cloud.d/ 2>/dev/null || true
+                  rm -rf /var/lib/netdata/registry/ 2>/dev/null || true
+                  echo 'Netdata cleanup completed'
+                " || true
                 
                 echo "✅ Service cleanup completed"
               else
-                echo "⚠️ Could not connect to server for cleanup (server may be down or SSH not configured)"
+                echo "⚠️ Could not connect to server for cleanup (server may be down, password changed, or SSH not configured)"
+                echo "ℹ️ This is normal if the server was already destroyed or is not responding"
               fi
             else
               echo "⚠️ Could not determine server IP for cleanup"
@@ -1163,75 +1176,70 @@ jobs:
         run: |
           echo "🏗️ Stage 2: Verifying post-reboot setup..."
           
-          # Debug: Check service status first
-          echo "🔍 Checking stage2-setup service status..."
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl status stage2-setup.service" || true
-          
-          # Wait for and verify stage2 service completion (check for success/completed status)
-          echo "⏳ Waiting for stage2-setup service to complete..."
+          # Wait for stage2 service to complete - should be fast (30-60 seconds)
+          echo "⏳ Waiting for stage2-setup service to complete (optimized timing)..."
           STAGE2_COMPLETED=false
-          for i in {1..15}; do
-            SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active stage2-setup.service" || echo "inactive")
-            SERVICE_EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl show stage2-setup.service --property=ExecMainStatus --value" || echo "unknown")
+          
+          # Check more frequently and for less time since stage2 is fast
+          for i in {1..8}; do
+            SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active stage2-setup.service 2>/dev/null || echo 'inactive'")
+            SERVICE_EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl show stage2-setup.service --property=ExecMainStatus --value 2>/dev/null || echo 'unknown'")
             
-            echo "Attempt $i/15: Service status='$SERVICE_STATUS', Exit status='$SERVICE_EXIT_STATUS'"
+            echo "Attempt $i/8: Service status='$SERVICE_STATUS', Exit status='$SERVICE_EXIT_STATUS'"
             
-            # For oneshot services, we want to check if it exited successfully (inactive but with successful exit)
-            if [[ "$SERVICE_STATUS" == "inactive" && "$SERVICE_EXIT_STATUS" == "0" ]] || [[ "$SERVICE_STATUS" == "active" ]]; then
+            # For oneshot services: inactive + exit status 0 = completed successfully
+            if [[ "$SERVICE_STATUS" == "inactive" && "$SERVICE_EXIT_STATUS" == "0" ]]; then
               echo "✅ Stage 2 setup service completed successfully"
               STAGE2_COMPLETED=true
               break
             fi
             
-            # If it failed, show logs and continue anyway
+            # Still running/activating - wait a bit
+            if [[ "$SERVICE_STATUS" == "activating" || "$SERVICE_STATUS" == "active" ]]; then
+              echo "Service still running, waiting..."
+              sleep 5
+              continue
+            fi
+            
+            # If it failed, show logs and break
             if [[ "$SERVICE_EXIT_STATUS" != "0" && "$SERVICE_EXIT_STATUS" != "unknown" && "$SERVICE_EXIT_STATUS" != "" ]]; then
-              echo "⚠️ Stage 2 service may have failed (exit status: $SERVICE_EXIT_STATUS), checking logs..."
-              ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "journalctl -u stage2-setup.service --no-pager -l" || true
+              echo "⚠️ Stage 2 service failed (exit status: $SERVICE_EXIT_STATUS), checking logs..."
+              ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "journalctl -u stage2-setup.service --no-pager -l --since='1 minute ago'" || true
               break
             fi
             
-            sleep 10
+            sleep 5
           done
           
-          # Even if service check failed, verify individual services are running
-          echo "🔍 Verifying individual services..."
+          # Quick verification that essential services are working
+          echo "🔍 Quick verification of essential services..."
           
-          # Check Docker
+          # Check Docker (most important for deployment)
           if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active docker" >/dev/null 2>&1; then
             echo "✅ Docker is active"
           else
-            echo "⚠️ Docker is not active, trying to start it..."
-            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl start docker"
+            echo "⚠️ Docker is not active, attempting to start..."
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl start docker && sleep 3"
           fi
           
-          # Check Tailscale
-          if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active tailscaled" >/dev/null 2>&1; then
-            echo "✅ Tailscale is active"
+          # Check Tailscale (important for VPN access)
+          if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "tailscale status --peers=false" >/dev/null 2>&1; then
+            echo "✅ Tailscale is connected"
           else
-            echo "⚠️ Tailscale is not active, checking status..."
-            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl status tailscaled" || true
+            echo "⚠️ Tailscale may still be connecting..."
           fi
           
-          # Check Netdata
-          if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active netdata" >/dev/null 2>&1; then
-            echo "✅ Netdata is active"
-          else
-            echo "⚠️ Netdata is not active, checking status..."
-            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl status netdata" || true
-          fi
-          
-          # Get Tailscale IP
-          TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/tailscale_ip 2>/dev/null || tailscale ip -4 2>/dev/null || echo 'unknown'")
+          # Get Tailscale IP (multiple methods)
+          TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "tailscale ip -4 2>/dev/null || cat /tmp/tailscale_ip 2>/dev/null || echo 'pending'")
           echo "🔗 Tailscale IP: $TAILSCALE_IP"
           echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
           
+          # Final status
           if [[ "$STAGE2_COMPLETED" == "true" ]]; then
             echo "✅ Stage 2 verification complete - server ready for service deployment"
           else
-            echo "⚠️ Stage 2 service check incomplete, but proceeding with deployment (services may still be working)"
+            echo "⚠️ Stage 2 service may still be running, but proceeding with deployment"
           fi
-          
-          echo "✅ Stage 2 verification complete - server ready for service deployment"
 
   # ============================================================================
   # Service Deployment
