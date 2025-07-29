@@ -306,6 +306,14 @@ jobs:
         id: validate-destroy
         if: steps.validate-action.outputs.should_destroy == 'true' || steps.validate-action.outputs.should_overwrite_server == 'true'
         run: |
+          # For server overwrite during deployment, skip confirmation requirement
+          if [[ "${{ steps.validate-action.outputs.should_overwrite_server }}" == "true" && "${{ env.ACTION_TYPE }}" == "deploy" ]]; then
+            echo "✅ Server overwrite confirmed (deploy mode)"
+            echo "confirmed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # For explicit destroy actions, require confirmation
           if [[ "${{ inputs.confirm_destruction }}" != "DESTROY" ]]; then
             echo "❌ Destruction not confirmed. You must type 'DESTROY' exactly."
             echo "confirmed=false" >> $GITHUB_OUTPUT

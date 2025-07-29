@@ -82,7 +82,7 @@ jobs:
       skip_tests: ${{ github.event.inputs.skip_tests || false }}
       skip_docker_build: ${{ github.event.inputs.skip_docker_build || false }}
       build_docker_on_changes: ${{ github.event.inputs.build_docker_on_changes || true }}
-      overwrite_server: ${{ github.event.inputs.overwrite_server || false }}
+      overwrite_server: ${{ github.event.inputs.overwrite_server || true }}
       destroy_scope: ${{ github.event.inputs.destroy_scope || 'service-only' }}
       confirm_destruction: ${{ github.event.inputs.confirm_destruction || '' }}
       server_type: g6-standard-2  # 4GB RAM for game server
