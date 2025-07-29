@@ -846,7 +846,8 @@ jobs:
           set -euo pipefail
           
           echo "🔄 Updating system..."
-          pacman -Syu --noconfirm
+          # Handle conflicting files by forcing overwrite
+          pacman -Syu --noconfirm --overwrite='*'
           
           echo "📦 Installing packages..."
           pacman -S --noconfirm curl wget git docker docker-compose \
