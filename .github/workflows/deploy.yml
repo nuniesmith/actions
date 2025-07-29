@@ -525,17 +525,18 @@ jobs:
     
     steps:
       - name: 🔧 Setup Linode CLI
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           pip install linode-cli
-          mkdir -p ~/.config/linode-cli
-          cat > ~/.config/linode-cli/config << EOF
-          [DEFAULT]
-          default-user = DEFAULT
-          token = ${{ secrets.LINODE_TOKEN }}
-          EOF
-          chmod 600 ~/.config/linode-cli/config
+          # Configure via environment variable to avoid config file issues
+          export LINODE_CLI_TOKEN="${{ secrets.LINODE_TOKEN }}"
+          # Test CLI access
+          linode-cli --version
 
       - name: 💥 Destroy Existing Server
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           echo "💥 Looking for existing ${{ env.SERVICE_NAME }} server to destroy..."
           
@@ -572,17 +573,18 @@ jobs:
 
       - name: 🔧 Setup Linode CLI
         if: inputs.destroy_scope == 'full-server'
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           pip install linode-cli
-          mkdir -p ~/.config/linode-cli
-          cat > ~/.config/linode-cli/config << EOF
-          [DEFAULT]
-          default-user = DEFAULT
-          token = ${{ secrets.LINODE_TOKEN }}
-          EOF
-          chmod 600 ~/.config/linode-cli/config
+          # Configure via environment variable to avoid config file issues
+          export LINODE_CLI_TOKEN="${{ secrets.LINODE_TOKEN }}"
+          # Test CLI access
+          linode-cli --version
 
       - name: 🗑️ Execute Destruction
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           echo "🗑️ Destroying ${{ env.SERVICE_NAME }}..."
           echo "Scope: ${{ inputs.destroy_scope }}"
@@ -634,21 +636,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 🔧 Setup Linode CLI
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           pip install linode-cli
-          mkdir -p ~/.config/linode-cli
-          cat > ~/.config/linode-cli/config << EOF
-          [DEFAULT]
-          default-user = DEFAULT
-          region = ${{ env.TARGET_REGION }}
-          type = ${{ env.SERVER_TYPE }}
-          image = linode/arch
-          token = ${{ secrets.LINODE_TOKEN }}
-          EOF
-          chmod 600 ~/.config/linode-cli/config
+          # Configure via environment variable to avoid config file issues
+          export LINODE_CLI_TOKEN="${{ secrets.LINODE_TOKEN }}"
+          # Test CLI access
+          linode-cli --version
 
       - name: 🚀 Create or Find Server
         id: create-server
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           echo "🚀 Managing Linode server for ${{ env.SERVICE_NAME }}..."
           
