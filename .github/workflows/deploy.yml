@@ -1063,6 +1063,15 @@ jobs:
           # Set a password for SSH access (temporary, will be secured via Tailscale)
           echo "${{ env.SERVICE_NAME }}_user:${{ secrets.ACTIONS_USER_PASSWORD }}" | chpasswd
           
+          # Enable SSH access for service user
+          mkdir -p /home/${{ env.SERVICE_NAME }}_user/.ssh
+          chmod 700 /home/${{ env.SERVICE_NAME }}_user/.ssh
+          chown ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/.ssh
+          
+          # Enable password authentication for post-deployment access
+          sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          
           echo "⚙️ Enabling services for post-reboot..."
           systemctl enable docker
           systemctl enable tailscaled
@@ -1123,10 +1132,15 @@ jobs:
           # Allow password authentication for Tailscale network only
           sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          # Restart SSH service
+          # Restart SSH service to apply changes
           systemctl restart sshd
           
-          echo "� Starting monitoring..."
+          # Verify service user can be accessed
+          echo "🔍 Verifying service user configuration..."
+          id ${{ env.SERVICE_NAME }}_user || echo "⚠️ Service user not found"
+          ls -la /home/${{ env.SERVICE_NAME }}_user/.ssh 2>/dev/null || echo "ℹ️ SSH directory not found for service user"
+          
+          echo "📊 Starting monitoring..."
           systemctl start netdata
           
           echo "✅ Stage 2 complete - server ready for service deployment"

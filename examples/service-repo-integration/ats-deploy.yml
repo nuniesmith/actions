@@ -225,16 +225,20 @@ jobs:
           # Try to determine server connection method
           echo "🔍 Determining server connection method..."
           
+          # Give SSH service time to be ready after Stage 2
+          echo "⏳ Waiting for SSH service to be ready..."
+          sleep 15
+          
           # Method 1: Try Tailscale hostname first (most reliable)
-          if timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@ats "echo 'Connected via Tailscale hostname'" 2>/dev/null; then
+          if timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@ats "echo 'Connected via Tailscale hostname'" 2>/dev/null; then
             SERVER_HOST="ats"
             echo "✅ Using Tailscale hostname: $SERVER_HOST"
           # Method 2: Try Tailscale IP directly
-          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@$TAILSCALE_IP "echo 'Connected via Tailscale IP'" 2>/dev/null; then
+          elif [[ -n "$TAILSCALE_IP" && "$TAILSCALE_IP" != "unknown" && "$TAILSCALE_IP" != "pending" ]] && timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@$TAILSCALE_IP "echo 'Connected via Tailscale IP'" 2>/dev/null; then
             SERVER_HOST="$TAILSCALE_IP"
             echo "✅ Using Tailscale IP: $SERVER_HOST"
           # Method 3: Try public domain (after DNS update)
-          elif timeout 10 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ats_user@ats.7gram.xyz "echo 'Connected via public domain'" 2>/dev/null; then
+          elif timeout 15 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ats_user@ats.7gram.xyz "echo 'Connected via public domain'" 2>/dev/null; then
             SERVER_HOST="ats.7gram.xyz"
             echo "✅ Using public domain: $SERVER_HOST"
           else
