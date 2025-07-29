@@ -628,6 +628,7 @@ jobs:
   setup-infrastructure:
     name: 🏗️ Setup Infrastructure
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [preflight-checks, destroy-existing-server, build-docker]
     if: |
       always() && 
@@ -853,24 +854,34 @@ jobs:
           # Update package databases first
           pacman -Sy --noconfirm
           
-          # Handle NVIDIA firmware conflicts specifically
+          # Handle NVIDIA firmware conflicts with comprehensive approach
           echo "🔧 Removing conflicting NVIDIA firmware files..."
-          rm -f /usr/lib/firmware/nvidia/ad103 || true
-          rm -f /usr/lib/firmware/nvidia/ad104 || true  
-          rm -f /usr/lib/firmware/nvidia/ad106 || true
-          rm -f /usr/lib/firmware/nvidia/ad107 || true
+          rm -rf /usr/lib/firmware/nvidia/ad103* 2>/dev/null || true
+          rm -rf /usr/lib/firmware/nvidia/ad104* 2>/dev/null || true  
+          rm -rf /usr/lib/firmware/nvidia/ad106* 2>/dev/null || true
+          rm -rf /usr/lib/firmware/nvidia/ad107* 2>/dev/null || true
+          
+          # Remove symlinks and directories that cause conflicts
+          find /usr/lib/firmware/nvidia -type l -delete 2>/dev/null || true
+          find /usr/lib/firmware/nvidia -name "*.zst" -delete 2>/dev/null || true
           
           # Force upgrade with multiple overwrite patterns
           pacman -Su --noconfirm --overwrite='*' --overwrite='/usr/lib/firmware/nvidia/*' || {
             echo "🔄 First upgrade failed, trying more aggressive approach..."
             # Remove entire nvidia firmware directory and try again
             rm -rf /usr/lib/firmware/nvidia || true
-            pacman -Su --noconfirm --overwrite='*'
+            # Also handle pacman database conflicts
+            rm -f /var/lib/pacman/db.lck || true
+            pacman -Su --noconfirm --overwrite='*' || {
+              echo "🔄 Still failing, trying with force overwrite..."
+              pacman -Su --noconfirm --overwrite='*' --force || true
+            }
           }
           
-          echo "📦 Installing all required packages..."
+          echo "📦 Installing core packages (excluding iptables for now)..."
+          # Install everything except iptables-related packages to avoid conflicts
           pacman -S --noconfirm curl wget git docker docker-compose \
-            tailscale netdata ufw fail2ban sudo base-devel iptables-nft
+            tailscale netdata fail2ban sudo base-devel
           
           echo "👥 Creating users..."
           useradd -m -s /bin/bash jordan || true
@@ -898,7 +909,18 @@ jobs:
           
           echo "🚀 Stage 2: Post-reboot setup starting..."
           
-          echo "�🐳 Starting Docker..."
+          echo "🐳 Starting Docker..."
+          
+          echo "📦 Installing firewall packages after reboot..."
+          # Install iptables and ufw after kernel update and reboot to avoid conflicts
+          pacman -S --noconfirm ufw iptables-nft || {
+            echo "🔄 Resolving iptables conflicts..."
+            # Remove conflicting iptables package first
+            pacman -Rdd --noconfirm iptables 2>/dev/null || true
+            pacman -S --noconfirm iptables-nft ufw
+          }
+          
+          echo "🐳 Starting Docker service..."
           systemctl start docker
           
           echo "🔗 Starting and authenticating Tailscale..."
@@ -1028,6 +1050,7 @@ jobs:
   deploy-service:
     name: 🚢 Deploy Service
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [preflight-checks, setup-infrastructure]
     if: needs.preflight-checks.outputs.should_deploy == 'true'
     
