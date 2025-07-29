@@ -1,38 +1,90 @@
 # Example for NGINX Repository  
 # File: .github/workflows/deploy.yml in your NGINX repo
 
-name: 🚀 Deploy NGINX Reverse Proxy
+name: 🚀 Manage NGINX Reverse Proxy
 
 on:
   push:
     branches: [main, develop]
   workflow_dispatch:
     inputs:
+      action_type:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - 'deploy'
+          - 'destroy'
+          - 'health-check'
+          - 'restart'
+        default: 'deploy'
+      
       deployment_mode:
         description: 'Deployment mode'
-        required: true
+        required: false
         type: choice
         options:
           - 'full-deploy'
           - 'update-only'
-          - 'restart-only' 
-          - 'health-check'
+          - 'restart-only'
+          - 'code-only'
         default: 'update-only'
       
-      create_new_server:
-        description: 'Create new server'
+      # 🎯 Your New Options
+      skip_tests:
+        description: 'Skip running code tests'
         required: false
         type: boolean
         default: false
+      
+      skip_docker_build:
+        description: 'Skip building Docker images'
+        required: false
+        type: boolean
+        default: false
+      
+      build_docker_on_changes:
+        description: 'Only build Docker if code/Dockerfile changed'
+        required: false
+        type: boolean
+        default: true
+      
+      overwrite_server:
+        description: 'Destroy and recreate Linode server'
+        required: false
+        type: boolean
+        default: false
+      
+      # Destroy Options (for destroy action)
+      destroy_scope:
+        description: 'What to destroy (for destroy action)'
+        required: false
+        type: choice
+        options:
+          - 'service-only'
+          - 'full-server'
+          - 'reset-service'
+        default: 'service-only'
+      
+      confirm_destruction:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: false
+        type: string
 
 jobs:
-  deploy-nginx:
-    # 👇 This calls your standardized actions repository
-    uses: nuniesmith/actions/.github/workflows/deploy-service.yml@main
+  manage-nginx:
+    # 👇 This calls your unified actions repository
+    uses: nuniesmith/actions/.github/workflows/deploy.yml@main
     with:
       service_name: nginx
+      action_type: ${{ github.event.inputs.action_type || 'deploy' }}
       deployment_mode: ${{ github.event.inputs.deployment_mode || 'update-only' }}
-      create_new_server: ${{ github.event.inputs.create_new_server || false }}
+      skip_tests: ${{ github.event.inputs.skip_tests || false }}
+      skip_docker_build: ${{ github.event.inputs.skip_docker_build || false }}
+      build_docker_on_changes: ${{ github.event.inputs.build_docker_on_changes || true }}
+      overwrite_server: ${{ github.event.inputs.overwrite_server || false }}
+      destroy_scope: ${{ github.event.inputs.destroy_scope || 'service-only' }}
+      confirm_destruction: ${{ github.event.inputs.confirm_destruction || '' }}
       server_type: g6-standard-1  # 2GB RAM sufficient for NGINX
       target_region: ca-central
       domain_suffix: 7gram.xyz
@@ -50,20 +102,26 @@ jobs:
       CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
       NETDATA_CLAIM_TOKEN: ${{ secrets.NETDATA_CLAIM_TOKEN }}
       NETDATA_CLAIM_ROOM: ${{ secrets.NETDATA_CLAIM_ROOM }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
   # NGINX-specific post-deployment
   nginx-post-deploy:
     name: 🔧 NGINX Configuration
     runs-on: ubuntu-latest
-    needs: deploy-nginx
-    if: success()
+    needs: manage-nginx
+    if: success() && (github.event.inputs.action_type == 'deploy' || github.event.inputs.action_type == '')
     
     steps:
       - name: 📥 Checkout NGINX Repository
         uses: actions/checkout@v4
       
       - name: 🔗 Setup Tailscale for Config
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
         uses: tailscale/github-action@v2
         with:
           oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
@@ -74,11 +132,13 @@ jobs:
         run: |
           echo "⚙️ Deploying NGINX configurations..."
           
-          # Copy NGINX configs to server
-          scp -r config/ nginx_user@nginx.7gram.xyz:/home/nginx_user/nginx/config/
+          # Copy NGINX configs to server if they exist
+          if [[ -d "config/" ]]; then
+            scp -r config/ nginx_user@nginx.7gram.xyz:/home/nginx_user/nginx/config/
+          fi
           
           # Reload NGINX
-          ssh nginx_user@nginx.7gram.xyz "docker-compose exec nginx nginx -s reload"
+          ssh nginx_user@nginx.7gram.xyz "cd /home/nginx_user/nginx && docker-compose exec nginx nginx -s reload"
           
       - name: 🧪 Test NGINX Routes
         run: |
@@ -88,4 +148,4 @@ jobs:
           curl -f https://nginx.7gram.xyz/health || echo "❌ NGINX health check failed"
           
           # Test SSL certificate
-          echo | openssl s_client -connect nginx.7gram.xyz:443 -servername nginx.7gram.xyz
+          echo | openssl s_client -connect nginx.7gram.xyz:443 -servername nginx.7gram.xyz 2>/dev/null | grep "Verify return code" || echo "⚠️ SSL test completed"

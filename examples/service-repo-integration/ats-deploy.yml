@@ -1,38 +1,90 @@
 # Example for ATS Repository
 # File: .github/workflows/deploy.yml in your ATS repo
 
-name: 🚀 Deploy ATS Game Server
+name: 🚀 Manage ATS Game Server
 
 on:
   push:
     branches: [main, develop]
   workflow_dispatch:
     inputs:
+      action_type:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - 'deploy'
+          - 'destroy'
+          - 'health-check'
+          - 'restart'
+        default: 'deploy'
+      
       deployment_mode:
         description: 'Deployment mode'
-        required: true
+        required: false
         type: choice
         options:
           - 'full-deploy'
           - 'update-only'
           - 'restart-only'
-          - 'health-check'
+          - 'code-only'
         default: 'update-only'
       
-      create_new_server:
-        description: 'Create new server'
+      # 🎯 Your New Options
+      skip_tests:
+        description: 'Skip running code tests'
         required: false
         type: boolean
         default: false
+      
+      skip_docker_build:
+        description: 'Skip building Docker images'
+        required: false
+        type: boolean
+        default: false
+      
+      build_docker_on_changes:
+        description: 'Only build Docker if code/Dockerfile changed'
+        required: false
+        type: boolean
+        default: true
+      
+      overwrite_server:
+        description: 'Destroy and recreate Linode server'
+        required: false
+        type: boolean
+        default: false
+      
+      # Destroy Options (for destroy action)
+      destroy_scope:
+        description: 'What to destroy (for destroy action)'
+        required: false
+        type: choice
+        options:
+          - 'service-only'
+          - 'full-server'
+          - 'reset-service'
+        default: 'service-only'
+      
+      confirm_destruction:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: false
+        type: string
 
 jobs:
-  deploy-ats:
-    # 👇 This calls your standardized actions repository
-    uses: nuniesmith/actions/.github/workflows/deploy-service.yml@main
+  manage-ats:
+    # 👇 This calls your unified actions repository
+    uses: nuniesmith/actions/.github/workflows/deploy.yml@main
     with:
       service_name: ats
+      action_type: ${{ github.event.inputs.action_type || 'deploy' }}
       deployment_mode: ${{ github.event.inputs.deployment_mode || 'update-only' }}
-      create_new_server: ${{ github.event.inputs.create_new_server || false }}
+      skip_tests: ${{ github.event.inputs.skip_tests || false }}
+      skip_docker_build: ${{ github.event.inputs.skip_docker_build || false }}
+      build_docker_on_changes: ${{ github.event.inputs.build_docker_on_changes || true }}
+      overwrite_server: ${{ github.event.inputs.overwrite_server || false }}
+      destroy_scope: ${{ github.event.inputs.destroy_scope || 'service-only' }}
+      confirm_destruction: ${{ github.event.inputs.confirm_destruction || '' }}
       server_type: g6-standard-2  # 4GB RAM for game server
       target_region: ca-central
       domain_suffix: 7gram.xyz
@@ -44,42 +96,36 @@ jobs:
       JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
       ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-      TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-      JWT_SECRET: ${{ secrets.JWT_SECRET }}
       NETDATA_CLAIM_TOKEN: ${{ secrets.NETDATA_CLAIM_TOKEN }}
       NETDATA_CLAIM_ROOM: ${{ secrets.NETDATA_CLAIM_ROOM }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
   # ATS-specific post-deployment
   ats-post-deploy:
     name: 🎮 ATS Game Server Setup
     runs-on: ubuntu-latest
-    needs: deploy-ats
-    if: success()
+    needs: manage-ats
+    if: success() && (github.event.inputs.action_type == 'deploy' || github.event.inputs.action_type == '')
     
     steps:
       - name: 📥 Checkout ATS Repository
         uses: actions/checkout@v4
-      
-      - name: 🔗 Setup Tailscale for Game Server
-        uses: tailscale/github-action@v2
-        with:
-          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-          tags: tag:ci
       
       - name: 🎮 Configure Game Server
         run: |
           echo "🎮 Configuring ATS game server..."
           
           # Upload server configurations
-          scp config/server_config.sii ats_user@ats.7gram.xyz:/home/ats_user/ats/config/
+          if [[ -f "config/server_config.sii" ]]; then
+            scp config/server_config.sii ats_user@ats.7gram.xyz:/home/ats_user/ats/config/
+          fi
           
           # Restart game server if needed
-          ssh ats_user@ats.7gram.xyz "cd /home/ats_user/ats && docker-compose restart ats-server"
+          ssh ats_user@ats.7gram.xyz "cd /home/ats_user/ats && docker-compose restart"
           
       - name: 🧪 Test Game Server
         run: |

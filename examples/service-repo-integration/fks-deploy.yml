@@ -1,47 +1,96 @@
 # Example for FKS Repository
 # File: .github/workflows/deploy.yml in your FKS repo
 
-name: 🚀 Deploy FKS Trading System
+name: 🚀 Deploy FKS Service
 
 on:
   push:
     branches: [main, develop]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
+      action_type:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - 'deploy'
+          - 'destroy'
+          - 'health-check'
+          - 'restart'
+        default: 'deploy'
+      
       deployment_mode:
         description: 'Deployment mode'
-        required: true
+        required: false
         type: choice
         options:
           - 'full-deploy'
           - 'update-only'
           - 'restart-only'
-          - 'health-check'
+          - 'code-only'
         default: 'update-only'
       
-      create_new_server:
-        description: 'Create new server'
+      # 🎯 Your New Options
+      skip_tests:
+        description: 'Skip running code tests'
         required: false
         type: boolean
         default: false
+      
+      skip_docker_build:
+        description: 'Skip building Docker images'
+        required: false
+        type: boolean
+        default: false
+      
+      build_docker_on_changes:
+        description: 'Only build Docker if code/Dockerfile changed'
+        required: false
+        type: boolean
+        default: true
+      
+      overwrite_server:
+        description: 'Destroy and recreate Linode server'
+        required: false
+        type: boolean
+        default: false
+      
+      # Destroy Options (for destroy action)
+      destroy_scope:
+        description: 'What to destroy (for destroy action)'
+        required: false
+        type: choice
+        options:
+          - 'service-only'
+          - 'full-server'
+          - 'reset-service'
+        default: 'service-only'
+      
+      confirm_destruction:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: false
+        type: string
 
 jobs:
-  deploy-fks:
-    # 👇 This calls your standardized actions repository
-    uses: nuniesmith/actions/.github/workflows/deploy-service.yml@main
+  manage-fks:
+    # 👇 This calls your unified actions repository
+    uses: nuniesmith/actions/.github/workflows/deploy.yml@main
     with:
       service_name: fks
+      action_type: ${{ github.event.inputs.action_type || 'deploy' }}
       deployment_mode: ${{ github.event.inputs.deployment_mode || 'update-only' }}
-      create_new_server: ${{ github.event.inputs.create_new_server || false }}
+      skip_tests: ${{ github.event.inputs.skip_tests || false }}
+      skip_docker_build: ${{ github.event.inputs.skip_docker_build || false }}
+      build_docker_on_changes: ${{ github.event.inputs.build_docker_on_changes || true }}
+      overwrite_server: ${{ github.event.inputs.overwrite_server || false }}
+      destroy_scope: ${{ github.event.inputs.destroy_scope || 'service-only' }}
+      confirm_destruction: ${{ github.event.inputs.confirm_destruction || '' }}
       server_type: g6-standard-4  # 8GB RAM for FKS
       target_region: ca-central
       domain_suffix: 7gram.xyz
       enable_monitoring: true
       enable_backups: true
     secrets:
-      # All secrets are inherited from the calling repository
       LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
       SERVICE_ROOT_PASSWORD: ${{ secrets.FKS_ROOT_PASSWORD }}
       JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
@@ -49,33 +98,54 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
       TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-      JWT_SECRET: ${{ secrets.JWT_SECRET }}
-      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
       NETDATA_CLAIM_TOKEN: ${{ secrets.NETDATA_CLAIM_TOKEN }}
       NETDATA_CLAIM_ROOM: ${{ secrets.NETDATA_CLAIM_ROOM }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
-  # Optional: FKS-specific post-deployment steps
+  # FKS-specific post-deployment
   fks-post-deploy:
-    name: 🔧 FKS Post-Deploy Tasks
+    name: 🧠 FKS AI Service Setup
     runs-on: ubuntu-latest
-    needs: deploy-fks
-    if: success()
+    needs: manage-fks
+    if: success() && (github.event.inputs.action_type == 'deploy' || github.event.inputs.action_type == '')
     
     steps:
       - name: 📥 Checkout FKS Repository
         uses: actions/checkout@v4
       
-      - name: 🧪 FKS Health Checks
+      - name: 🔗 Setup Tailscale for Post-Deploy
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          tags: tag:ci
+      
+      - name: 🧠 Configure FKS AI Services
         run: |
-          echo "🧪 Running FKS-specific health checks..."
-          # Add FKS-specific validation here
+          echo "� Configuring FKS AI services..."
+          
+          # Upload FKS-specific configurations
+          if [[ -f "config/main.yaml" ]]; then
+            scp config/main.yaml fks_user@fks.7gram.xyz:/home/fks_user/fks/config/
+          fi
+          
+          # Restart FKS services if needed
+          ssh fks_user@fks.7gram.xyz "cd /home/fks_user/fks && docker-compose restart"
+          
+      - name: 🧪 Test FKS Services
+        run: |
+          echo "🧪 Testing FKS AI services..."
+          
+          # Test main API
           curl -f https://fks.7gram.xyz/api/health || echo "❌ FKS API not responding"
           
-      - name: 📊 Configure FKS Monitoring
-        run: |
-          echo "📊 Setting up FKS-specific monitoring dashboards..."
-          # Add any FKS-specific monitoring setup here
+          # Test AI endpoints
+          curl -f https://fks.7gram.xyz/api/v1/models || echo "⚠️ AI models endpoint not accessible"

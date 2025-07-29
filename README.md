@@ -212,5 +212,3 @@ infrastructure:
 MIT License - see [LICENSE](LICENSE) for details.
 
 ---
-
-**Built with ❤️ by Jordan for consistent, secure, and scalable deployments**

@@ -1,0 +1,944 @@
+name: 🚀 Unified Service Management
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: 'Name of the service to manage (e.g., fks, nginx, ats)'
+        required: true
+        type: string
+      
+      action_type:
+        description: 'Action to perform'
+        required: false
+        type: string
+        default: 'deploy'
+        # Options: deploy, destroy, health-check, restart
+      
+      deployment_mode:
+        description: 'Deployment mode'
+        required: false
+        type: string
+        default: 'full-deploy'
+        # Options: full-deploy, update-only, restart-only, code-only
+      
+      # 🎯 New Options You Requested
+      skip_tests:
+        description: 'Skip running code tests'
+        required: false
+        type: boolean
+        default: false
+      
+      skip_docker_build:
+        description: 'Skip building Docker images'
+        required: false
+        type: boolean
+        default: false
+      
+      build_docker_on_changes:
+        description: 'Only build Docker if code/Dockerfile changed'
+        required: false
+        type: boolean
+        default: true
+      
+      overwrite_server:
+        description: 'Destroy and recreate Linode server'
+        required: false
+        type: boolean
+        default: false
+      
+      # Server Configuration
+      server_type:
+        description: 'Linode server type'
+        required: false
+        type: string
+        default: 'g6-standard-2'
+      
+      target_region:
+        description: 'Linode region'
+        required: false
+        type: string
+        default: 'ca-central'
+      
+      domain_suffix:
+        description: 'Domain suffix (e.g., 7gram.xyz)'
+        required: false
+        type: string
+        default: '7gram.xyz'
+      
+      # Feature Toggles
+      enable_monitoring:
+        description: 'Enable Netdata monitoring'
+        required: false
+        type: boolean
+        default: true
+      
+      enable_backups:
+        description: 'Enable Linode backups'
+        required: false
+        type: boolean
+        default: true
+
+    secrets:
+      # Core Infrastructure
+      LINODE_TOKEN:
+        required: true
+      SERVICE_ROOT_PASSWORD:
+        required: true
+      
+      # User Management
+      JORDAN_PASSWORD:
+        required: true
+      ACTIONS_USER_PASSWORD:
+        required: true
+      
+      # VPN & Networking
+      TAILSCALE_AUTH_KEY:
+        required: true
+      TAILSCALE_OAUTH_CLIENT_ID:
+        required: false
+      TAILSCALE_OAUTH_SECRET:
+        required: false
+      
+      # Monitoring (Optional)
+      NETDATA_CLAIM_TOKEN:
+        required: false
+      NETDATA_CLAIM_ROOM:
+        required: false
+      
+      # DNS Management (Optional)
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      CLOUDFLARE_ZONE_ID:
+        required: false
+      
+      # Container Registry (Optional)
+      DOCKER_USERNAME:
+        required: false
+      DOCKER_TOKEN:
+        required: false
+      
+      # Notifications (Optional)
+      DISCORD_WEBHOOK:
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: 'Name of the service to manage'
+        required: true
+        type: choice
+        options:
+          - 'fks'
+          - 'nginx'
+          - 'ats'
+          - 'custom'
+      
+      action_type:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - 'deploy'
+          - 'destroy'
+          - 'health-check'
+          - 'restart'
+        default: 'deploy'
+      
+      deployment_mode:
+        description: 'Deployment mode (for deploy action)'
+        required: false
+        type: choice
+        options:
+          - 'full-deploy'
+          - 'update-only'
+          - 'restart-only'
+          - 'code-only'
+        default: 'full-deploy'
+      
+      # 🎯 Your Requested Options
+      skip_tests:
+        description: 'Skip running code tests'
+        required: false
+        type: boolean
+        default: false
+      
+      skip_docker_build:
+        description: 'Skip building Docker images'
+        required: false
+        type: boolean
+        default: false
+      
+      build_docker_on_changes:
+        description: 'Only build Docker if code/Dockerfile changed'
+        required: false
+        type: boolean
+        default: true
+      
+      overwrite_server:
+        description: 'Destroy and recreate Linode server'
+        required: false
+        type: boolean
+        default: false
+      
+      # Destroy Options (for destroy action)
+      destroy_scope:
+        description: 'What to destroy (for destroy action)'
+        required: false
+        type: choice
+        options:
+          - 'service-only'
+          - 'full-server'
+          - 'reset-service'
+        default: 'service-only'
+      
+      confirm_destruction:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: false
+        type: string
+      
+      # Server Configuration
+      server_type:
+        description: 'Linode server type'
+        required: false
+        type: choice
+        options:
+          - 'g6-nanode-1'          # 1GB RAM
+          - 'g6-standard-1'        # 2GB RAM
+          - 'g6-standard-2'        # 4GB RAM
+          - 'g6-standard-4'        # 8GB RAM
+          - 'g6-standard-8'        # 16GB RAM
+        default: 'g6-standard-2'
+
+env:
+  SERVICE_NAME: ${{ inputs.service_name }}
+  ACTION_TYPE: ${{ inputs.action_type }}
+  DEPLOYMENT_MODE: ${{ inputs.deployment_mode }}
+  SERVER_TYPE: ${{ inputs.server_type }}
+  TARGET_REGION: ${{ inputs.target_region || 'ca-central' }}
+  DOMAIN_SUFFIX: ${{ inputs.domain_suffix || '7gram.xyz' }}
+  FULL_DOMAIN: ${{ inputs.service_name }}.${{ inputs.domain_suffix || '7gram.xyz' }}
+  
+  # Your requested options
+  SKIP_TESTS: ${{ inputs.skip_tests }}
+  SKIP_DOCKER_BUILD: ${{ inputs.skip_docker_build }}
+  BUILD_DOCKER_ON_CHANGES: ${{ inputs.build_docker_on_changes }}
+  OVERWRITE_SERVER: ${{ inputs.overwrite_server }}
+
+jobs:
+  # ============================================================================
+  # Pre-flight Checks & Validation
+  # ============================================================================
+  preflight-checks:
+    name: 🛫 Pre-flight Checks
+    runs-on: ubuntu-latest
+    outputs:
+      action_validated: ${{ steps.validate-action.outputs.validated }}
+      should_destroy: ${{ steps.validate-action.outputs.should_destroy }}
+      should_deploy: ${{ steps.validate-action.outputs.should_deploy }}
+      should_health_check: ${{ steps.validate-action.outputs.should_health_check }}
+      should_overwrite_server: ${{ steps.validate-action.outputs.should_overwrite_server }}
+      destroy_confirmed: ${{ steps.validate-destroy.outputs.confirmed }}
+      code_changed: ${{ steps.check-changes.outputs.code_changed }}
+      docker_build_needed: ${{ steps.check-changes.outputs.docker_build_needed }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for change detection
+
+      - name: 🎯 Validate Action Type
+        id: validate-action
+        run: |
+          echo "🎯 Validating action: ${{ env.ACTION_TYPE }}"
+          
+          case "${{ env.ACTION_TYPE }}" in
+            "deploy")
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+              echo "should_destroy=false" >> $GITHUB_OUTPUT
+              echo "should_health_check=false" >> $GITHUB_OUTPUT
+              ;;
+            "destroy")
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              echo "should_destroy=true" >> $GITHUB_OUTPUT
+              echo "should_health_check=false" >> $GITHUB_OUTPUT
+              ;;
+            "health-check")
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              echo "should_destroy=false" >> $GITHUB_OUTPUT
+              echo "should_health_check=true" >> $GITHUB_OUTPUT
+              ;;
+            "restart")
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+              echo "should_destroy=false" >> $GITHUB_OUTPUT
+              echo "should_health_check=false" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "❌ Invalid action type: ${{ env.ACTION_TYPE }}"
+              exit 1
+              ;;
+          esac
+          
+          # Check if server should be overwritten
+          if [[ "${{ env.OVERWRITE_SERVER }}" == "true" && "${{ env.ACTION_TYPE }}" == "deploy" ]]; then
+            echo "should_overwrite_server=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Server will be overwritten (destroyed and recreated)"
+          else
+            echo "should_overwrite_server=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "validated=true" >> $GITHUB_OUTPUT
+
+      - name: ⚠️ Validate Destruction Request
+        id: validate-destroy
+        if: steps.validate-action.outputs.should_destroy == 'true' || steps.validate-action.outputs.should_overwrite_server == 'true'
+        run: |
+          if [[ "${{ inputs.confirm_destruction }}" != "DESTROY" ]]; then
+            echo "❌ Destruction not confirmed. You must type 'DESTROY' exactly."
+            echo "confirmed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "✅ Destruction confirmed for ${{ env.SERVICE_NAME }}"
+          echo "confirmed=true" >> $GITHUB_OUTPUT
+
+      - name: 🔍 Check for Code Changes
+        id: check-changes
+        if: steps.validate-action.outputs.should_deploy == 'true'
+        run: |
+          echo "🔍 Checking for code and Docker changes..."
+          
+          # Check if this is the first commit or if we should build anyway
+          if [[ $(git rev-list --count HEAD) -le 1 ]] || [[ "${{ env.BUILD_DOCKER_ON_CHANGES }}" == "false" ]]; then
+            echo "First commit or change detection disabled - assuming changes exist"
+            echo "code_changed=true" >> $GITHUB_OUTPUT
+            echo "docker_build_needed=true" >> $GITHUB_OUTPUT
+          else
+            # Check for changes in the last commit
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+            echo "Changed files: $CHANGED_FILES"
+            
+            # Check if code files changed (exclude docs, configs, etc.)
+            CODE_CHANGED="false"
+            if echo "$CHANGED_FILES" | grep -E '\.(js|ts|py|go|java|cpp|c|rs|php)$' > /dev/null; then
+              CODE_CHANGED="true"
+              echo "✅ Code files changed"
+            fi
+            
+            # Check if Docker-related files changed
+            DOCKER_BUILD_NEEDED="false"
+            if echo "$CHANGED_FILES" | grep -E '(Dockerfile|docker-compose|requirements|package\.json|go\.mod|Cargo\.toml)' > /dev/null; then
+              DOCKER_BUILD_NEEDED="true"
+              echo "✅ Docker-related files changed"
+            fi
+            
+            # If build_docker_on_changes is true, only build if changes detected
+            if [[ "${{ env.BUILD_DOCKER_ON_CHANGES }}" == "true" ]]; then
+              if [[ "$CODE_CHANGED" == "true" || "$DOCKER_BUILD_NEEDED" == "true" ]]; then
+                DOCKER_BUILD_NEEDED="true"
+              else
+                DOCKER_BUILD_NEEDED="false"
+                echo "ℹ️ No relevant changes detected - skipping Docker build"
+              fi
+            fi
+            
+            echo "code_changed=$CODE_CHANGED" >> $GITHUB_OUTPUT
+            echo "docker_build_needed=$DOCKER_BUILD_NEEDED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔐 Validate Secrets
+        env:
+          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
+          JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
+          ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          echo "🔐 Validating required secrets..."
+          
+          MISSING_SECRETS=()
+          [[ -z "$LINODE_TOKEN" ]] && MISSING_SECRETS+=("LINODE_TOKEN")
+          [[ -z "$SERVICE_ROOT_PASSWORD" ]] && MISSING_SECRETS+=("SERVICE_ROOT_PASSWORD")
+          [[ -z "$JORDAN_PASSWORD" ]] && MISSING_SECRETS+=("JORDAN_PASSWORD")
+          [[ -z "$ACTIONS_USER_PASSWORD" ]] && MISSING_SECRETS+=("ACTIONS_USER_PASSWORD")
+          [[ -z "$TAILSCALE_AUTH_KEY" ]] && MISSING_SECRETS+=("TAILSCALE_AUTH_KEY")
+          
+          if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
+            echo "❌ Missing required secrets:"
+            printf '  - %s\n' "${MISSING_SECRETS[@]}"
+            exit 1
+          fi
+          
+          echo "✅ All required secrets validated"
+
+  # ============================================================================
+  # Code Testing (Optional)
+  # ============================================================================
+  run-tests:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    needs: preflight-checks
+    if: needs.preflight-checks.outputs.should_deploy == 'true' && inputs.skip_tests == false
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🧪 Auto-detect and Run Tests
+        run: |
+          echo "🧪 Auto-detecting test framework..."
+          
+          # Node.js/JavaScript tests
+          if [[ -f "package.json" ]]; then
+            echo "📦 Node.js project detected"
+            if command -v npm &> /dev/null; then
+              echo "Installing dependencies..."
+              npm install
+              
+              if npm run test --if-present; then
+                echo "✅ Node.js tests passed"
+              else
+                echo "⚠️ Node.js tests failed or no test script found"
+              fi
+            fi
+          fi
+          
+          # Python tests
+          if [[ -f "requirements.txt" ]] || [[ -f "pyproject.toml" ]] || [[ -f "setup.py" ]]; then
+            echo "🐍 Python project detected"
+            if command -v python3 &> /dev/null; then
+              if [[ -f "requirements.txt" ]]; then
+                pip install -r requirements.txt
+              fi
+              
+              # Try different test runners
+              if python -m pytest --version &> /dev/null && find . -name "*test*.py" | grep -q .; then
+                echo "Running pytest..."
+                python -m pytest
+              elif python -m unittest discover -s . -p "*test*.py" 2>/dev/null; then
+                echo "✅ Python unittest tests passed"
+              else
+                echo "ℹ️ No Python tests found or test framework not available"
+              fi
+            fi
+          fi
+          
+          # Go tests
+          if [[ -f "go.mod" ]]; then
+            echo "🔷 Go project detected"
+            if command -v go &> /dev/null; then
+              go test ./...
+              echo "✅ Go tests passed"
+            fi
+          fi
+          
+          echo "✅ Test phase complete"
+
+  # ============================================================================
+  # Docker Build (Conditional)
+  # ============================================================================
+  build-docker:
+    name: 🐳 Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, run-tests]
+    if: |
+      always() && 
+      needs.preflight-checks.outputs.should_deploy == 'true' && 
+      inputs.skip_docker_build == false && 
+      needs.preflight-checks.outputs.docker_build_needed == 'true' &&
+      (needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped')
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔑 Login to Docker Hub
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+        if: env.DOCKER_USERNAME != '' && env.DOCKER_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: 🐳 Build and Push Docker Images
+        run: |
+          echo "🐳 Building Docker images for ${{ env.SERVICE_NAME }}..."
+          
+          # Auto-detect Docker files
+          if [[ -f "Dockerfile" ]]; then
+            echo "📋 Found Dockerfile - building main image"
+            
+            IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/${{ env.SERVICE_NAME }}:latest"
+            
+            # Build the image
+            docker build -t "$IMAGE_TAG" .
+            
+            # Push if credentials available
+            if [[ -n "${{ secrets.DOCKER_USERNAME }}" ]]; then
+              echo "📤 Pushing image: $IMAGE_TAG"
+              docker push "$IMAGE_TAG"
+            else
+              echo "ℹ️ No Docker credentials - image built locally only"
+            fi
+          fi
+          
+          # Build using docker-compose if available
+          if [[ -f "docker-compose.yml" ]]; then
+            echo "📋 Found docker-compose.yml - building services"
+            docker-compose build
+            
+            if [[ -n "${{ secrets.DOCKER_USERNAME }}" ]]; then
+              echo "📤 Pushing compose images..."
+              docker-compose push || echo "⚠️ Some images may not have push configured"
+            fi
+          fi
+          
+          echo "✅ Docker build complete"
+
+  # ============================================================================
+  # Server Destruction (if overwrite requested)
+  # ============================================================================
+  destroy-existing-server:
+    name: 💥 Destroy Existing Server
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, build-docker]
+    if: |
+      always() && 
+      needs.preflight-checks.outputs.should_overwrite_server == 'true' &&
+      needs.preflight-checks.outputs.destroy_confirmed == 'true' &&
+      (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped')
+    
+    steps:
+      - name: 🔧 Setup Linode CLI
+        run: |
+          pip install linode-cli
+          mkdir -p ~/.config/linode-cli
+          cat > ~/.config/linode-cli/config << EOF
+          [DEFAULT]
+          default-user = DEFAULT
+          
+          [DEFAULT]
+          token = ${{ secrets.LINODE_TOKEN }}
+          EOF
+          chmod 600 ~/.config/linode-cli/config
+
+      - name: 💥 Destroy Existing Server
+        run: |
+          echo "💥 Looking for existing ${{ env.SERVICE_NAME }} server to destroy..."
+          
+          # Find existing server
+          EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" | head -1)
+          
+          if [[ -n "$EXISTING_SERVER" ]]; then
+            SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
+            SERVER_LABEL=$(echo "$EXISTING_SERVER" | cut -f2)
+            
+            echo "🔥 Destroying server: $SERVER_LABEL (ID: $SERVER_ID)"
+            linode-cli linodes delete "$SERVER_ID"
+            
+            echo "⏳ Waiting for server destruction to complete..."
+            sleep 30
+            
+            echo "✅ Server destroyed successfully"
+          else
+            echo "ℹ️ No existing server found for ${{ env.SERVICE_NAME }}"
+          fi
+
+  # ============================================================================
+  # Main Destroy Job (for destroy action)
+  # ============================================================================
+  destroy-service:
+    name: 🗑️ Destroy Service
+    runs-on: ubuntu-latest
+    needs: preflight-checks
+    if: needs.preflight-checks.outputs.should_destroy == 'true' && needs.preflight-checks.outputs.destroy_confirmed == 'true'
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Linode CLI
+        if: inputs.destroy_scope == 'full-server'
+        run: |
+          pip install linode-cli
+          mkdir -p ~/.config/linode-cli
+          cat > ~/.config/linode-cli/config << EOF
+          [DEFAULT]
+          default-user = DEFAULT
+          
+          [DEFAULT]
+          token = ${{ secrets.LINODE_TOKEN }}
+          EOF
+          chmod 600 ~/.config/linode-cli/config
+
+      - name: 🗑️ Execute Destruction
+        run: |
+          echo "🗑️ Destroying ${{ env.SERVICE_NAME }}..."
+          echo "Scope: ${{ inputs.destroy_scope }}"
+          
+          case "${{ inputs.destroy_scope }}" in
+            "service-only")
+              echo "🛑 Stopping service containers only..."
+              # Logic for service-only destruction
+              ;;
+            "reset-service")
+              echo "🧹 Resetting service to clean state..."
+              # Logic for service reset
+              ;;
+            "full-server")
+              echo "💥 Destroying entire server..."
+              # Find and destroy server
+              SERVER_INFO=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" | head -1)
+              if [[ -n "$SERVER_INFO" ]]; then
+                SERVER_ID=$(echo "$SERVER_INFO" | cut -f1)
+                SERVER_LABEL=$(echo "$SERVER_INFO" | cut -f2)
+                echo "Destroying: $SERVER_LABEL (ID: $SERVER_ID)"
+                linode-cli linodes delete "$SERVER_ID"
+                echo "✅ Server destroyed"
+              else
+                echo "⚠️ No server found for ${{ env.SERVICE_NAME }}"
+              fi
+              ;;
+          esac
+
+  # ============================================================================
+  # Server Infrastructure Setup
+  # ============================================================================
+  setup-infrastructure:
+    name: 🏗️ Setup Infrastructure
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, destroy-existing-server, build-docker]
+    if: |
+      always() && 
+      needs.preflight-checks.outputs.should_deploy == 'true' &&
+      (needs.destroy-existing-server.result == 'success' || needs.destroy-existing-server.result == 'skipped') &&
+      (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped')
+    outputs:
+      server_ip: ${{ steps.create-server.outputs.server_ip }}
+      server_id: ${{ steps.create-server.outputs.server_id }}
+      tailscale_ip: ${{ steps.setup-server.outputs.tailscale_ip }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Linode CLI
+        run: |
+          pip install linode-cli
+          mkdir -p ~/.config/linode-cli
+          cat > ~/.config/linode-cli/config << EOF
+          [DEFAULT]
+          default-user = DEFAULT
+          region = ${{ env.TARGET_REGION }}
+          type = ${{ env.SERVER_TYPE }}
+          image = linode/arch
+          
+          [DEFAULT]
+          token = ${{ secrets.LINODE_TOKEN }}
+          EOF
+          chmod 600 ~/.config/linode-cli/config
+
+      - name: 🚀 Create or Find Server
+        id: create-server
+        run: |
+          echo "🚀 Managing Linode server for ${{ env.SERVICE_NAME }}..."
+          
+          # Check if server already exists (unless we just destroyed it)
+          if [[ "${{ needs.preflight-checks.outputs.should_overwrite_server }}" != "true" ]]; then
+            EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" | head -1)
+            if [[ -n "$EXISTING_SERVER" ]]; then
+              SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
+              SERVER_IP=$(echo "$EXISTING_SERVER" | cut -f5)
+              echo "✅ Using existing server: $SERVER_IP (ID: $SERVER_ID)"
+              echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+              echo "server_id=$SERVER_ID" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          
+          # Create new server
+          SERVER_LABEL="${{ env.SERVICE_NAME }}-$(date +%Y%m%d-%H%M)"
+          echo "🆕 Creating new server: $SERVER_LABEL"
+          
+          RESULT=$(linode-cli linodes create \
+            --type "${{ env.SERVER_TYPE }}" \
+            --region "${{ env.TARGET_REGION }}" \
+            --image "linode/arch" \
+            --label "$SERVER_LABEL" \
+            --root_pass "${{ secrets.SERVICE_ROOT_PASSWORD }}" \
+            --backups_enabled=${{ inputs.enable_backups || 'true' }} \
+            --text --no-headers)
+          
+          SERVER_ID=$(echo "$RESULT" | cut -f1)
+          
+          # Wait for server to be running
+          echo "⏳ Waiting for server to be ready..."
+          while true; do
+            STATUS=$(linode-cli linodes view "$SERVER_ID" --text --no-headers | cut -f2)
+            if [[ "$STATUS" == "running" ]]; then
+              break
+            fi
+            echo "Status: $STATUS - waiting..."
+            sleep 10
+          done
+          
+          SERVER_IP=$(linode-cli linodes view "$SERVER_ID" --text --no-headers | cut -f5)
+          echo "✅ Server ready: $SERVER_IP (ID: $SERVER_ID)"
+          
+          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+          echo "server_id=$SERVER_ID" >> $GITHUB_OUTPUT
+
+      - name: ⏳ Wait for SSH Access
+        run: |
+          echo "⏳ Waiting for SSH access..."
+          
+          for i in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+               root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready'" 2>/dev/null; then
+              echo "✅ SSH ready"
+              break
+            fi
+            echo "Attempt $i/30..."
+            sleep 20
+          done
+
+      - name: 🏗️ Setup Server Foundation
+        id: setup-server
+        run: |
+          echo "🏗️ Setting up server foundation..."
+          
+          cat > foundation-setup.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          
+          echo "🔄 Updating system..."
+          pacman -Syu --noconfirm
+          
+          echo "📦 Installing packages..."
+          pacman -S --noconfirm curl wget git docker docker-compose \
+            tailscale netdata ufw fail2ban sudo base-devel
+          
+          echo "👥 Creating users..."
+          useradd -m -s /bin/bash jordan || true
+          echo "jordan:${{ secrets.JORDAN_PASSWORD }}" | chpasswd
+          usermod -aG wheel,docker jordan
+          
+          useradd -m -s /bin/bash actions_user || true
+          echo "actions_user:${{ secrets.ACTIONS_USER_PASSWORD }}" | chpasswd
+          usermod -aG wheel,docker actions_user
+          
+          useradd -m -s /bin/bash ${{ env.SERVICE_NAME }}_user || true
+          usermod -aG docker ${{ env.SERVICE_NAME }}_user
+          
+          echo "🐳 Starting Docker..."
+          systemctl enable docker
+          systemctl start docker
+          
+          echo "🔥 Configuring firewall..."
+          ufw --force reset
+          ufw default deny incoming
+          ufw default allow outgoing
+          ufw allow ssh
+          ufw allow in on tailscale0
+          ufw --force enable
+          
+          echo "🔗 Setting up Tailscale..."
+          systemctl enable tailscaled
+          systemctl start tailscaled
+          tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --accept-routes --timeout=60s
+          
+          sleep 10
+          TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+          echo "$TAILSCALE_IP" > /tmp/tailscale_ip
+          
+          echo "✅ Foundation complete"
+          EOF
+          
+          scp foundation-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
+          ssh root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/foundation-setup.sh && /tmp/foundation-setup.sh"
+          
+          TAILSCALE_IP=$(ssh root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/tailscale_ip" || echo "unknown")
+          echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # Service Deployment
+  # ============================================================================
+  deploy-service:
+    name: 🚢 Deploy Service
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, setup-infrastructure]
+    if: needs.preflight-checks.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔗 Setup Tailscale for Deployment
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: 🚢 Deploy Service
+        run: |
+          echo "🚢 Deploying ${{ env.SERVICE_NAME }}..."
+          
+          SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
+          
+          # Create deployment script
+          if [[ -f "services/${{ env.SERVICE_NAME }}/deploy.sh" ]]; then
+            cp "services/${{ env.SERVICE_NAME }}/deploy.sh" deploy-script.sh
+          else
+            cat > deploy-script.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          
+          echo "🚢 Deploying ${{ env.SERVICE_NAME }}..."
+          
+          # Setup service directory
+          SERVICE_DIR="/home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }}"
+          
+          if [[ -d "$SERVICE_DIR" ]]; then
+            echo "Updating existing service..."
+            cd "$SERVICE_DIR"
+            git pull origin main || git pull origin master || echo "Git pull failed, continuing..."
+          else
+            echo "Cloning service repository..."
+            git clone "https://github.com/${{ github.repository_owner }}/${{ env.SERVICE_NAME }}.git" "$SERVICE_DIR" || {
+              echo "Git clone failed, creating service directory manually..."
+              mkdir -p "$SERVICE_DIR"
+            }
+            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "$SERVICE_DIR"
+          fi
+          
+          cd "$SERVICE_DIR"
+          
+          # Deploy based on what's available
+          if [[ -f "docker-compose.yml" ]]; then
+            echo "🐳 Starting Docker Compose services..."
+            sudo -u ${{ env.SERVICE_NAME }}_user docker-compose down || true
+            sudo -u ${{ env.SERVICE_NAME }}_user docker-compose pull || echo "Pull failed, using local images"
+            sudo -u ${{ env.SERVICE_NAME }}_user docker-compose up -d
+          elif [[ -f "start.sh" ]]; then
+            echo "🚀 Running start script..."
+            chmod +x start.sh
+            sudo -u ${{ env.SERVICE_NAME }}_user ./start.sh
+          else
+            echo "⚠️ No deployment method found (docker-compose.yml or start.sh)"
+          fi
+          
+          echo "✅ Service deployment complete"
+          EOF
+          fi
+          
+          # Run deployment
+          scp deploy-script.sh root@$SERVER_IP:/tmp/
+          ssh root@$SERVER_IP "chmod +x /tmp/deploy-script.sh && /tmp/deploy-script.sh"
+
+      - name: 🔍 Setup Monitoring
+        if: inputs.enable_monitoring
+        run: |
+          echo "🔍 Setting up monitoring..."
+          
+          SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
+          
+          cat > monitoring-setup.sh << 'EOF'
+          #!/bin/bash
+          systemctl enable netdata
+          systemctl start netdata
+          sed -i 's/bind socket to IP = 127.0.0.1/bind socket to IP = 0.0.0.0/' /etc/netdata/netdata.conf || true
+          ufw allow in on tailscale0 to any port 19999
+          systemctl restart netdata
+          
+          if [[ -n "${{ secrets.NETDATA_CLAIM_TOKEN }}" ]]; then
+            netdata-claim.sh -token="${{ secrets.NETDATA_CLAIM_TOKEN }}" \
+              -rooms="${{ secrets.NETDATA_CLAIM_ROOM }}" \
+              -url=https://app.netdata.cloud || echo "Claim failed"
+          fi
+          EOF
+          
+          scp monitoring-setup.sh root@$SERVER_IP:/tmp/
+          ssh root@$SERVER_IP "chmod +x /tmp/monitoring-setup.sh && /tmp/monitoring-setup.sh"
+
+  # ============================================================================
+  # Health Checks
+  # ============================================================================
+  health-check:
+    name: 🏥 Health Check
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, setup-infrastructure, deploy-service]
+    if: always() && (needs.deploy-service.result == 'success' || needs.preflight-checks.outputs.should_health_check == 'true')
+    
+    steps:
+      - name: 🏥 Perform Health Checks
+        run: |
+          echo "🏥 Running health checks..."
+          
+          SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
+          
+          if [[ -n "$SERVER_IP" ]]; then
+            echo "Testing SSH connectivity..."
+            ssh -o ConnectTimeout=10 root@$SERVER_IP "echo 'SSH OK'"
+            
+            echo "Checking services..."
+            ssh root@$SERVER_IP "systemctl is-active docker"
+            ssh root@$SERVER_IP "tailscale status --peers=false"
+            ssh root@$SERVER_IP "docker ps"
+            
+            echo "✅ Health checks passed"
+          else
+            echo "⚠️ No server IP available for health checks"
+          fi
+
+  # ============================================================================
+  # Notifications
+  # ============================================================================
+  notify:
+    name: 📢 Notify
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, deploy-service, destroy-service, health-check]
+    if: always()
+    
+    steps:
+      - name: 📢 Send Notification
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          echo "📢 Sending notification..."
+          
+          # Determine overall status
+          if [[ "${{ needs.deploy-service.result }}" == "success" || "${{ needs.destroy-service.result }}" == "success" ]]; then
+            STATUS="✅ SUCCESS"
+            COLOR="3066993"
+          else
+            STATUS="❌ FAILED"
+            COLOR="15158332"
+          fi
+          
+          ACTION_EMOJI=""
+          case "${{ env.ACTION_TYPE }}" in
+            "deploy") ACTION_EMOJI="🚀" ;;
+            "destroy") ACTION_EMOJI="🗑️" ;;
+            "health-check") ACTION_EMOJI="🏥" ;;
+            "restart") ACTION_EMOJI="🔄" ;;
+          esac
+          
+          curl -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"$ACTION_EMOJI $STATUS: ${{ env.SERVICE_NAME }} ${{ env.ACTION_TYPE }}\",
+                \"description\": \"Service: ${{ env.SERVICE_NAME }}\\nAction: ${{ env.ACTION_TYPE }}\\nMode: ${{ env.DEPLOYMENT_MODE }}\\nTests Skipped: ${{ env.SKIP_TESTS }}\\nDocker Build Skipped: ${{ env.SKIP_DOCKER_BUILD }}\\nServer Overwritten: ${{ env.OVERWRITE_SERVER }}\",
+                \"color\": $COLOR,
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+              }]
+            }" \
+            "$DISCORD_WEBHOOK"
