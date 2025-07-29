@@ -89,7 +89,7 @@ jobs:
       target_region: ca-central
       domain_suffix: 7gram.xyz
       enable_monitoring: true
-      enable_backups: true
+      enable_backups: false
     secrets:
       LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
       SERVICE_ROOT_PASSWORD: ${{ secrets.ATS_ROOT_PASSWORD }}
