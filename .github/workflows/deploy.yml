@@ -532,7 +532,10 @@ jobs:
       (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped')
     
     steps:
-      - name: 🔧 Setup Linode CLI
+      - name: � Checkout repository
+        uses: actions/checkout@v4
+
+      - name: �🔧 Setup Linode CLI
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
@@ -541,6 +544,86 @@ jobs:
           export LINODE_CLI_TOKEN="${{ secrets.LINODE_TOKEN }}"
           # Test CLI access
           linode-cli --version
+
+      - name: 🔗 Setup Cleanup Connection (Tailscale)
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        continue-on-error: true
+
+      - name: 🧹 Cleanup Services Before Destruction
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+        run: |
+          echo "🧹 Cleaning up external service registrations..."
+          
+          # Find existing server
+          EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" | head -1)
+          
+          if [[ -n "$EXISTING_SERVER" ]]; then
+            SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
+            SERVER_LABEL=$(echo "$EXISTING_SERVER" | cut -f2)
+            
+            # Try to get server IP for cleanup
+            SERVER_INFO=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
+            SERVER_IP_COL4=$(echo "$SERVER_INFO" | cut -f4)
+            SERVER_IP_COL5=$(echo "$SERVER_INFO" | cut -f5)
+            SERVER_IP_COL6=$(echo "$SERVER_INFO" | cut -f6)
+            SERVER_IP_COL7=$(echo "$SERVER_INFO" | cut -f7)
+            
+            SERVER_IP=""
+            for IP in "$SERVER_IP_COL4" "$SERVER_IP_COL5" "$SERVER_IP_COL6" "$SERVER_IP_COL7"; do
+              if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                SERVER_IP="$IP"
+                break
+              fi
+            done
+            
+            if [[ -n "$SERVER_IP" ]]; then
+              echo "🔍 Found server to cleanup: $SERVER_LABEL ($SERVER_IP)"
+              
+              # Generate SSH key for cleanup access
+              ssh-keygen -t rsa -b 4096 -f ~/.ssh/cleanup_key -N "" -C "cleanup-${{ env.SERVICE_NAME }}" || true
+              
+              # Try to connect and cleanup (with error handling)
+              if timeout 30 ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$SERVER_IP "echo 'Cleanup connection successful'" 2>/dev/null; then
+                echo "🔗 Connected to server for cleanup..."
+                
+                # Cleanup Tailscale
+                echo "🧹 Removing Tailscale device..."
+                ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "tailscale logout || true" || true
+                
+                # Cleanup Netdata cloud connection
+                echo "🧹 Cleaning up Netdata cloud connection..."
+                ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "systemctl stop netdata || true; rm -rf /var/lib/netdata/cloud.d/ || true; rm -rf /var/lib/netdata/registry/ || true" || true
+                
+                echo "✅ Service cleanup completed"
+              else
+                echo "⚠️ Could not connect to server for cleanup (server may be down or SSH not configured)"
+              fi
+            else
+              echo "⚠️ Could not determine server IP for cleanup"
+            fi
+            
+            # Additional Tailscale cleanup via API if available
+            if command -v tailscale >/dev/null 2>&1; then
+              echo "🔗 Attempting Tailscale device cleanup via local client..."
+              # List devices and try to remove the one matching our service name
+              tailscale status --json 2>/dev/null | jq -r '.Peer[] | select(.HostName == "${{ env.SERVICE_NAME }}") | .ID' | while read device_id; do
+                if [[ -n "$device_id" ]]; then
+                  echo "Removing Tailscale device: $device_id"
+                  tailscale delete "$device_id" || true
+                fi
+              done || true
+            fi
+          else
+            echo "ℹ️ No existing server found for cleanup"
+          fi
 
       - name: 💥 Destroy Existing Server
         env:
@@ -590,7 +673,18 @@ jobs:
           # Test CLI access
           linode-cli --version
 
-      - name: 🗑️ Execute Destruction
+      - name: � Setup Cleanup Connection (Tailscale)
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != '' && inputs.destroy_scope == 'full-server'
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        continue-on-error: true
+
+      - name: �🗑️ Execute Destruction
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
@@ -607,12 +701,51 @@ jobs:
               # Logic for service reset
               ;;
             "full-server")
-              echo "💥 Destroying entire server..."
-              # Find and destroy server
+              echo "💥 Destroying entire server with cleanup..."
+              
+              # Find and cleanup server before destruction
               SERVER_INFO=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" | head -1)
               if [[ -n "$SERVER_INFO" ]]; then
                 SERVER_ID=$(echo "$SERVER_INFO" | cut -f1)
                 SERVER_LABEL=$(echo "$SERVER_INFO" | cut -f2)
+                
+                # Try to get server IP for cleanup
+                SERVER_DETAILS=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
+                SERVER_IP_COL4=$(echo "$SERVER_DETAILS" | cut -f4)
+                SERVER_IP_COL5=$(echo "$SERVER_DETAILS" | cut -f5)
+                SERVER_IP_COL6=$(echo "$SERVER_DETAILS" | cut -f6)
+                SERVER_IP_COL7=$(echo "$SERVER_DETAILS" | cut -f7)
+                
+                SERVER_IP=""
+                for IP in "$SERVER_IP_COL4" "$SERVER_IP_COL5" "$SERVER_IP_COL6" "$SERVER_IP_COL7"; do
+                  if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    SERVER_IP="$IP"
+                    break
+                  fi
+                done
+                
+                if [[ -n "$SERVER_IP" ]]; then
+                  echo "🧹 Cleaning up services on server before destruction..."
+                  
+                  # Generate SSH key for cleanup
+                  ssh-keygen -t rsa -b 4096 -f ~/.ssh/cleanup_key -N "" -C "cleanup-${{ env.SERVICE_NAME }}" || true
+                  
+                  # Try to connect and cleanup
+                  if timeout 30 ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$SERVER_IP "echo 'Cleanup connection successful'" 2>/dev/null; then
+                    echo "🔗 Connected for cleanup..."
+                    
+                    # Cleanup Tailscale
+                    ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "tailscale logout || true" || true
+                    
+                    # Cleanup Netdata
+                    ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "systemctl stop netdata || true; rm -rf /var/lib/netdata/cloud.d/ || true" || true
+                    
+                    echo "✅ Service cleanup completed"
+                  else
+                    echo "⚠️ Could not connect for cleanup"
+                  fi
+                fi
+                
                 echo "Destroying: $SERVER_LABEL (ID: $SERVER_ID)"
                 linode-cli linodes delete "$SERVER_ID"
                 echo "✅ Server destroyed"
@@ -878,10 +1011,18 @@ jobs:
             }
           }
           
-          echo "📦 Installing core packages (excluding iptables for now)..."
+          echo "📦 Installing core packages (excluding iptables and netdata for now)..."
           # Install everything except iptables-related packages to avoid conflicts
+          # Note: We'll install Netdata separately with cloud support
           pacman -S --noconfirm curl wget git docker docker-compose \
-            tailscale netdata fail2ban sudo base-devel
+            tailscale fail2ban sudo base-devel
+          
+          echo "📊 Installing Netdata with cloud support..."
+          # Install Netdata using official installer which includes claim script
+          bash <(curl -Ss https://my-netdata.io/kickstart.sh) --dont-wait --disable-telemetry || {
+            echo "⚠️ Official Netdata installer failed, falling back to package manager..."
+            pacman -S --noconfirm netdata
+          }
           
           echo "👥 Creating users..."
           useradd -m -s /bin/bash jordan || true
@@ -1106,7 +1247,7 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      - name:  Deploy Service
+      - name: 🚢 Deploy Service
         run: |
           echo "🚢 Deploying ${{ env.SERVICE_NAME }}..."
           
@@ -1218,15 +1359,69 @@ jobs:
           if [[ -n "${{ secrets.NETDATA_CLAIM_TOKEN }}" && -n "${{ secrets.NETDATA_CLAIM_ROOM }}" ]]; then
             echo "🔗 Claiming Netdata to cloud..."
             
-            # Check if claim script exists
-            if command -v netdata-claim.sh >/dev/null 2>&1; then
-              netdata-claim.sh -token="${{ secrets.NETDATA_CLAIM_TOKEN }}" \
+            # Multiple methods to find and run claim script
+            CLAIM_SCRIPT=""
+            
+            # Method 1: Check common locations for claim script
+            for script_path in "/usr/sbin/netdata-claim.sh" "/opt/netdata/bin/netdata-claim.sh" "/usr/libexec/netdata/netdata-claim.sh" "/usr/lib/netdata/netdata-claim.sh"; do
+              if [[ -f "$script_path" ]]; then
+                CLAIM_SCRIPT="$script_path"
+                echo "Found claim script at: $script_path"
+                break
+              fi
+            done
+            
+            # Method 2: Search for the script
+            if [[ -z "$CLAIM_SCRIPT" ]]; then
+              CLAIM_SCRIPT=$(find /usr /opt -name "netdata-claim.sh" 2>/dev/null | head -1)
+              if [[ -n "$CLAIM_SCRIPT" ]]; then
+                echo "Found claim script via search: $CLAIM_SCRIPT"
+              fi
+            fi
+            
+            # Method 3: Check if it's in PATH
+            if [[ -z "$CLAIM_SCRIPT" ]] && command -v netdata-claim.sh >/dev/null 2>&1; then
+              CLAIM_SCRIPT="netdata-claim.sh"
+              echo "Found claim script in PATH"
+            fi
+            
+            # Method 4: Download claim script directly if not found
+            if [[ -z "$CLAIM_SCRIPT" ]]; then
+              echo "Claim script not found locally, downloading..."
+              wget -O /tmp/netdata-claim.sh https://raw.githubusercontent.com/netdata/netdata/master/claim/netdata-claim.sh
+              chmod +x /tmp/netdata-claim.sh
+              CLAIM_SCRIPT="/tmp/netdata-claim.sh"
+            fi
+            
+            # Attempt to claim
+            if [[ -n "$CLAIM_SCRIPT" ]]; then
+              echo "Attempting to claim with script: $CLAIM_SCRIPT"
+              "$CLAIM_SCRIPT" -token="${{ secrets.NETDATA_CLAIM_TOKEN }}" \
                 -rooms="${{ secrets.NETDATA_CLAIM_ROOM }}" \
-                -url=https://app.netdata.cloud || {
-                echo "⚠️ Netdata cloud claim failed - continuing without cloud integration"
+                -url=https://app.netdata.cloud \
+                -hostname="${{ env.SERVICE_NAME }}" || {
+                echo "⚠️ Netdata cloud claim failed with script - trying alternative method..."
+                
+                # Alternative method: Manual claiming via API
+                echo "Trying manual claim via Netdata API..."
+                curl -X POST "http://localhost:19999/api/v1/registry" \
+                  -H "Content-Type: application/json" \
+                  -d '{
+                    "action": "claim",
+                    "token": "${{ secrets.NETDATA_CLAIM_TOKEN }}",
+                    "rooms": "${{ secrets.NETDATA_CLAIM_ROOM }}",
+                    "url": "https://app.netdata.cloud",
+                    "hostname": "${{ env.SERVICE_NAME }}"
+                  }' || echo "Manual claim also failed"
               }
+              
+              # Restart Netdata after claiming
+              systemctl restart netdata
+              sleep 5
+              
+              echo "✅ Netdata claim process completed"
             else
-              echo "⚠️ netdata-claim.sh not found - skipping cloud integration"
+              echo "⚠️ Could not find or download claim script - skipping cloud integration"
             fi
           else
             echo "ℹ️ No Netdata cloud credentials provided - running locally only"
