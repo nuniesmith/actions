@@ -127,7 +127,7 @@ cd "$SERVICE_DIR"
 
 echo "🔐 Deploying Auth Server (Authentik + Nginx)..."
 
-# Pull latest images
+# Pull latest images for auth services
 docker compose -f docker-compose.auth.yml pull
 
 # Start auth services
@@ -184,7 +184,7 @@ if [ -n "AUTH_SERVER_PLACEHOLDER" ]; then
     echo "🔗 Using auth server: $AUTHENTIK_URL"
 fi
 
-# Pull latest images
+# Pull latest images for API services
 docker compose -f docker-compose.api.yml pull
 
 # Start API services
@@ -249,12 +249,11 @@ cd "$SERVICE_DIR"
 
 echo "🌐 Deploying Web Server (React + Nginx)..."
 
-# Build React app with proper environment variables
-echo "🔨 Building React application..."
-docker compose -f docker-compose.web.yml --profile build up frontend-builder
+# Pull latest images for web services
+docker compose -f docker-compose.web.yml pull
 
 # Start web services
-docker compose -f docker-compose.web.yml up -d nginx
+docker compose -f docker-compose.web.yml up -d
 
 # Wait for services to be ready
 echo "⏳ Waiting for web services to be ready..."

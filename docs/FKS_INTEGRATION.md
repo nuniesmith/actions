@@ -2,14 +2,30 @@
 
 This document describes the enhanced integration between your shared actions repository and FKS project for seamless multi-server deployment with Tailscale VPN and Cloudflare DNS automation.
 
+## 🎯 Updated Multi-Server Implementation
+
+**FIXED**: The enhanced deployment workflow now properly creates and deploys to three separate servers:
+- `fks-auth` - Authentication and user management services
+- `fks-api` - Trading API, workers, and data services  
+- `fks-web` - React frontend and web services
+
+Each server uses the appropriate Docker Compose file:
+- `docker-compose.auth.yml` for auth server
+- `docker-compose.api.yml` for API server
+- `docker-compose.web.yml` for web server
+
+## 🏗️ Architecture OverviewFKS Multi-Server Deployment Integration
+
+This document describes the enhanced integration between your shared actions repository and FKS project for seamless multi-server deployment with Tailscale VPN and Cloudflare DNS automation.
+
 ## 🏗️ Architecture Overview
 
 ### Multi-Server Setup
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Auth Server   │    │   API Server    │    │   Web Server    │
-│   (g6-nanode-1) │    │ (g6-standard-2) │    │   (g6-nanode-1) │
-│     $5/month    │    │    $20/month    │    │     $5/month    │
+│   (g6-nanode-1) │    │ (g6-standard-1) │    │   (g6-nanode-1) │
+│     $5/month    │    │    $12/month    │    │     $5/month    │
 ├─────────────────┤    ├─────────────────┤    ├─────────────────┤
 │ • Authentik SSO │    │ • Trading API   │    │ • React Frontend│
 │ • User Auth     │    │ • Workers       │    │ • Nginx Proxy   │
@@ -31,6 +47,10 @@ This document describes the enhanced integration between your shared actions rep
                     │   7gram.xyz     │
                     └─────────────────┘
 ```
+
+**💰 Cost-Optimized Architecture**: Total monthly cost of $22 for complete multi-server setup
+- Auth/Web servers use lightweight 1GB instances for $5/month each
+- API server uses enhanced 2GB instance for better performance at $12/month
 
 ## ✨ New Features Added
 
