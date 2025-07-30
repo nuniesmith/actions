@@ -36,7 +36,7 @@ Configure these secrets in your GitHub repository settings:
 #### Core Infrastructure
 | Secret | Description | Required |
 |--------|-------------|----------|
-| `LINODE_TOKEN` | Linode API access token | ✅ |
+| `LINODE_CLI_TOKEN` | Linode API access token | ✅ |
 | `SERVICE_ROOT_PASSWORD` | Root password for servers | ✅ |
 
 #### User Management

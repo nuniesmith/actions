@@ -74,11 +74,11 @@ main() {
     echo "🏗️ Core Infrastructure Secrets"
     echo "==============================="
     
-    read -p "Enter your Linode API Token: " -s LINODE_TOKEN
+    read -p "Enter your Linode API Token: " -s LINODE_CLI_TOKEN
     echo
-    if [[ -n "$LINODE_TOKEN" ]]; then
-        set_secret "LINODE_TOKEN" "$LINODE_TOKEN"
-        success "LINODE_TOKEN set"
+    if [[ -n "$LINODE_CLI_TOKEN" ]]; then
+        set_secret "LINODE_CLI_TOKEN" "$LINODE_CLI_TOKEN"
+        success "LINODE_CLI_TOKEN set"
     fi
     
     echo

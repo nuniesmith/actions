@@ -32,7 +32,7 @@ gh workflow run deploy-service.yml \
 #### Issue: Linode server creation fails
 ```bash
 # Check Linode API status
-curl -H "Authorization: Bearer $LINODE_TOKEN" \
+curl -H "Authorization: Bearer $LINODE_CLI_TOKEN" \
   https://api.linode.com/v4/account
 
 # Verify token permissions
@@ -43,7 +43,7 @@ linode-cli account view
 ```
 
 **Solutions:**
-- Verify `LINODE_TOKEN` is valid and has compute instance permissions
+- Verify `LINODE_CLI_TOKEN` is valid and has compute instance permissions
 - Check account billing status and payment methods
 - Ensure selected region has capacity for requested server type
 - Try alternative regions: `us-east`, `us-central`, `ca-central`
@@ -140,7 +140,7 @@ ssh-copy-id user@server-ip
 #### Issue: API token permissions
 ```bash
 # Test Linode token
-curl -H "Authorization: Bearer $LINODE_TOKEN" \
+curl -H "Authorization: Bearer $LINODE_CLI_TOKEN" \
   https://api.linode.com/v4/profile
 
 # Test Tailscale OAuth

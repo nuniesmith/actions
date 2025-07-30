@@ -52,15 +52,15 @@ Examples:
   $0 ssh --service fks
 
 Environment Variables:
-  LINODE_TOKEN           Linode API token (required)
+  LINODE_CLI_TOKEN           Linode API token (required)
   SERVICE_ROOT_PASSWORD  Default root password
 EOF
 }
 
 # Check requirements
 check_requirements() {
-    if [[ -z "${LINODE_TOKEN:-}" ]]; then
-        error "LINODE_TOKEN environment variable is required"
+    if [[ -z "${LINODE_CLI_TOKEN:-}" ]]; then
+        error "LINODE_CLI_TOKEN environment variable is required"
         exit 1
     fi
     
@@ -81,7 +81,7 @@ type = $DEFAULT_TYPE
 image = $DEFAULT_IMAGE
 
 [DEFAULT]
-token = $LINODE_TOKEN
+token = $LINODE_CLI_TOKEN
 EOF
         chmod 600 ~/.config/linode-cli/config
         success "Linode CLI configured"

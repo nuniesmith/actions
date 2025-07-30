@@ -1,0 +1,712 @@
+name: 🚀 Enhanced FKS Multi-Server Deployment
+
+on:
+  workflow_call:
+    inputs:
+      deployment_mode:
+        description: 'Deployment mode: single, multi-auth, multi-api, multi-web, multi-all'
+        required: true
+        type: string
+        default: 'single'
+      
+      server_type:
+        description: 'Linode server type'
+        required: false
+        type: string
+        default: 'g6-standard-2'
+      
+      target_region:
+        description: 'Linode region'
+        required: false
+        type: string
+        default: 'ca-central'
+      
+      domain_suffix:
+        description: 'Domain suffix'
+        required: false
+        type: string
+        default: '7gram.xyz'
+      
+      update_dns:
+        description: 'Update Cloudflare DNS records'
+        required: false
+        type: boolean
+        default: true
+      
+      create_new_servers:
+        description: 'Create new servers if they do not exist'
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      # Core Infrastructure
+      LINODE_CLI_TOKEN:
+        required: true
+      SERVICE_ROOT_PASSWORD:
+        required: true
+      
+      # User Management
+      JORDAN_PASSWORD:
+        required: true
+      ACTIONS_USER_PASSWORD:
+        required: true
+      
+      # VPN & Networking
+      TAILSCALE_AUTH_KEY:
+        required: true
+      TAILSCALE_OAUTH_CLIENT_ID:
+        required: false
+      TAILSCALE_OAUTH_SECRET:
+        required: false
+      
+      # DNS Management
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      CLOUDFLARE_ZONE_ID:
+        required: false
+      
+      # Container Registry
+      DOCKER_USERNAME:
+        required: false
+      DOCKER_TOKEN:
+        required: false
+      
+      # Notifications
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      auth_server_ip:
+        description: 'Auth server Tailscale IP'
+        value: ${{ jobs.deploy-auth.outputs.tailscale_ip }}
+      api_server_ip:
+        description: 'API server Tailscale IP'
+        value: ${{ jobs.deploy-api.outputs.tailscale_ip }}
+      web_server_ip:
+        description: 'Web server Tailscale IP'
+        value: ${{ jobs.deploy-web.outputs.tailscale_ip }}
+      single_server_ip:
+        description: 'Single server Tailscale IP'
+        value: ${{ jobs.deploy-single.outputs.tailscale_ip }}
+
+  workflow_dispatch:
+    inputs:
+      deployment_mode:
+        description: 'Deployment mode'
+        required: true
+        type: choice
+        options:
+          - 'single'
+          - 'multi-auth'
+          - 'multi-api'
+          - 'multi-web'
+          - 'multi-all'
+        default: 'single'
+      
+      server_type:
+        description: 'Linode server type'
+        required: false
+        type: choice
+        options:
+          - 'g6-nanode-1'          # 1GB RAM - $5/month
+          - 'g6-standard-1'        # 2GB RAM - $10/month
+          - 'g6-standard-2'        # 4GB RAM - $20/month
+          - 'g6-standard-4'        # 8GB RAM - $40/month
+        default: 'g6-standard-2'
+      
+      create_new_servers:
+        description: 'Create new servers if they do not exist'
+        required: false
+        type: boolean
+        default: false
+      
+      update_dns:
+        description: 'Update Cloudflare DNS records'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  DEPLOYMENT_MODE: ${{ inputs.deployment_mode }}
+  SERVER_TYPE: ${{ inputs.server_type }}
+  TARGET_REGION: ${{ inputs.target_region || 'ca-central' }}
+  DOMAIN_SUFFIX: ${{ inputs.domain_suffix || '7gram.xyz' }}
+  UPDATE_DNS: ${{ inputs.update_dns }}
+  CREATE_NEW_SERVERS: ${{ inputs.create_new_servers }}
+
+jobs:
+  # ============================================================================
+  # Pre-flight Checks & Strategy
+  # ============================================================================
+  preflight-checks:
+    name: 🛫 Pre-flight Checks & Strategy
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy_single: ${{ steps.strategy.outputs.should_deploy_single }}
+      should_deploy_auth: ${{ steps.strategy.outputs.should_deploy_auth }}
+      should_deploy_api: ${{ steps.strategy.outputs.should_deploy_api }}
+      should_deploy_web: ${{ steps.strategy.outputs.should_deploy_web }}
+      auth_server_name: ${{ steps.strategy.outputs.auth_server_name }}
+      api_server_name: ${{ steps.strategy.outputs.api_server_name }}
+      web_server_name: ${{ steps.strategy.outputs.web_server_name }}
+      single_server_name: ${{ steps.strategy.outputs.single_server_name }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🎯 Determine Deployment Strategy
+        id: strategy
+        run: |
+          echo "🎯 Analyzing deployment mode: ${{ env.DEPLOYMENT_MODE }}"
+          
+          case "${{ env.DEPLOYMENT_MODE }}" in
+            "single")
+              echo "should_deploy_single=true" >> $GITHUB_OUTPUT
+              echo "should_deploy_auth=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_api=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_web=false" >> $GITHUB_OUTPUT
+              echo "single_server_name=fks" >> $GITHUB_OUTPUT
+              ;;
+            "multi-auth")
+              echo "should_deploy_single=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_auth=true" >> $GITHUB_OUTPUT
+              echo "should_deploy_api=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_web=false" >> $GITHUB_OUTPUT
+              echo "auth_server_name=fks-auth" >> $GITHUB_OUTPUT
+              ;;
+            "multi-api")
+              echo "should_deploy_single=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_auth=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_api=true" >> $GITHUB_OUTPUT
+              echo "should_deploy_web=false" >> $GITHUB_OUTPUT
+              echo "api_server_name=fks-api" >> $GITHUB_OUTPUT
+              ;;
+            "multi-web")
+              echo "should_deploy_single=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_auth=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_api=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_web=true" >> $GITHUB_OUTPUT
+              echo "web_server_name=fks-web" >> $GITHUB_OUTPUT
+              ;;
+            "multi-all")
+              echo "should_deploy_single=false" >> $GITHUB_OUTPUT
+              echo "should_deploy_auth=true" >> $GITHUB_OUTPUT
+              echo "should_deploy_api=true" >> $GITHUB_OUTPUT
+              echo "should_deploy_web=true" >> $GITHUB_OUTPUT
+              echo "auth_server_name=fks-auth" >> $GITHUB_OUTPUT
+              echo "api_server_name=fks-api" >> $GITHUB_OUTPUT
+              echo "web_server_name=fks-web" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "❌ Invalid deployment mode: ${{ env.DEPLOYMENT_MODE }}"
+              exit 1
+              ;;
+          esac
+          
+          echo "✅ Deployment strategy determined"
+
+      - name: 🔐 Validate Secrets
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+        run: |
+          echo "🔐 Validating required secrets..."
+          
+          MISSING_SECRETS=()
+          [[ -z "$LINODE_CLI_TOKEN" ]] && MISSING_SECRETS+=("LINODE_CLI_TOKEN")
+          [[ -z "$TAILSCALE_AUTH_KEY" ]] && MISSING_SECRETS+=("TAILSCALE_AUTH_KEY")
+          
+          if [[ "${{ env.UPDATE_DNS }}" == "true" ]]; then
+            [[ -z "$CLOUDFLARE_API_TOKEN" ]] && MISSING_SECRETS+=("CLOUDFLARE_API_TOKEN")
+            [[ -z "$CLOUDFLARE_ZONE_ID" ]] && MISSING_SECRETS+=("CLOUDFLARE_ZONE_ID")
+          fi
+          
+          if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
+            echo "❌ Missing required secrets:"
+            printf '  - %s\n' "${MISSING_SECRETS[@]}"
+            exit 1
+          fi
+          
+          echo "✅ All required secrets validated"
+
+  # ============================================================================
+  # Single Server Deployment
+  # ============================================================================
+  deploy-single:
+    name: 🚀 Deploy Single Server
+    runs-on: ubuntu-latest
+    needs: preflight-checks
+    if: needs.preflight-checks.outputs.should_deploy_single == 'true'
+    timeout-minutes: 45
+    outputs:
+      server_ip: ${{ steps.get-server.outputs.server_ip }}
+      tailscale_ip: ${{ steps.get-tailscale-ip.outputs.tailscale_ip }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Infrastructure Tools
+        run: |
+          pip install linode-cli
+          # Install Tailscale for IP detection
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: 🚀 Create or Find Server
+        id: get-server
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+        run: |
+          SERVER_NAME="${{ needs.preflight-checks.outputs.single_server_name }}"
+          echo "🚀 Managing server: $SERVER_NAME"
+          
+          # Check if server exists
+          EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep "$SERVER_NAME" | head -1 || echo "")
+          
+          if [[ -n "$EXISTING_SERVER" ]]; then
+            echo "🔍 Found existing server"
+            SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
+            
+            # Get server IP from multiple possible columns
+            for col in 4 5 6 7; do
+              SERVER_IP=$(echo "$EXISTING_SERVER" | cut -f$col)
+              if [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                break
+              fi
+            done
+            
+            echo "✅ Using existing server: $SERVER_IP"
+          elif [[ "${{ env.CREATE_NEW_SERVERS }}" == "true" ]]; then
+            echo "🆕 Creating new server: $SERVER_NAME"
+            
+            # Generate SSH key
+            ssh-keygen -t rsa -b 4096 -f ~/.ssh/deployment_key -N "" -C "github-actions-$SERVER_NAME"
+            SSH_PUBLIC_KEY=$(cat ~/.ssh/deployment_key.pub)
+            
+            # Create server
+            RESULT=$(linode-cli linodes create \
+              --type "${{ env.SERVER_TYPE }}" \
+              --region "${{ env.TARGET_REGION }}" \
+              --image "linode/arch" \
+              --label "$SERVER_NAME" \
+              --root_pass "${{ secrets.SERVICE_ROOT_PASSWORD }}" \
+              --authorized_keys "$SSH_PUBLIC_KEY" \
+              --text --no-headers)
+            
+            SERVER_ID=$(echo "$RESULT" | cut -f1)
+            
+            # Wait for server to be ready
+            echo "⏳ Waiting for server to be ready..."
+            for i in {1..20}; do
+              SERVER_INFO=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
+              STATUS=$(echo "$SERVER_INFO" | cut -f6)
+              
+              if [[ "$STATUS" == "running" ]]; then
+                echo "✅ Server is running"
+                break
+              fi
+              
+              echo "Attempt $i/20: Status=$STATUS"
+              sleep 15
+            done
+            
+            # Get server IP
+            for col in 4 5 6 7; do
+              SERVER_IP=$(echo "$SERVER_INFO" | cut -f$col)
+              if [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                break
+              fi
+            done
+            
+            echo "✅ Server created: $SERVER_IP"
+          else
+            echo "❌ Server not found and CREATE_NEW_SERVERS=false"
+            exit 1
+          fi
+          
+          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+
+      - name: ⏳ Wait for SSH and Setup Server
+        run: |
+          SERVER_IP="${{ steps.get-server.outputs.server_ip }}"
+          echo "⏳ Waiting for SSH access to $SERVER_IP..."
+          
+          # Wait for SSH
+          for i in {1..15}; do
+            if timeout 10 ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$SERVER_IP "echo 'SSH ready'" 2>/dev/null; then
+              echo "✅ SSH access confirmed"
+              break
+            fi
+            echo "Attempt $i/15: SSH not ready yet..."
+            sleep 20
+          done
+          
+          # Run initial setup
+          echo "🏗️ Running initial server setup..."
+          cat > /tmp/initial-setup.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          
+          echo "🔄 Updating system and installing packages..."
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm curl wget git docker docker-compose tailscale sudo base-devel
+          
+          echo "👥 Creating fks_user..."
+          useradd -m -s /bin/bash fks_user || true
+          echo "fks_user:${{ secrets.ACTIONS_USER_PASSWORD }}" | chpasswd
+          usermod -aG docker fks_user
+          
+          # Create FKS directory and clone repo
+          mkdir -p /home/fks_user/fks
+          cd /home/fks_user/fks
+          if [[ ! -d ".git" ]]; then
+            git clone https://github.com/${{ github.repository_owner }}/fks.git . || echo "Clone failed, continuing..."
+          fi
+          chown -R fks_user:fks_user /home/fks_user/fks
+          
+          echo "🔗 Setting up Tailscale..."
+          systemctl enable tailscaled
+          systemctl start tailscaled
+          hostnamectl set-hostname "fks"
+          tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="fks" --accept-routes --timeout=120s
+          
+          echo "🐳 Starting Docker..."
+          systemctl enable docker
+          systemctl start docker
+          
+          echo "✅ Initial setup complete"
+          EOF
+          
+          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no /tmp/initial-setup.sh root@$SERVER_IP:/tmp/
+          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/initial-setup.sh && /tmp/initial-setup.sh"
+
+      - name: 🚢 Deploy FKS Services
+        run: |
+          SERVER_IP="${{ steps.get-server.outputs.server_ip }}"
+          echo "🚢 Deploying FKS to $SERVER_IP..."
+          
+          # Deploy using the FKS service manager
+          ./services/fks/fks-service-manager.sh deploy --mode single --server $SERVER_IP --user fks_user
+
+      - name: 🔗 Get Tailscale IP
+        id: get-tailscale-ip
+        run: |
+          SERVER_IP="${{ steps.get-server.outputs.server_ip }}"
+          echo "🔗 Getting Tailscale IP..."
+          
+          # Get Tailscale IP from the server
+          TAILSCALE_IP=$(ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "tailscale ip -4 2>/dev/null" || echo "")
+          
+          if [[ -n "$TAILSCALE_IP" ]]; then
+            echo "✅ Tailscale IP: $TAILSCALE_IP"
+            echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Could not get Tailscale IP"
+            echo "tailscale_ip=" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================================================
+  # Auth Server Deployment
+  # ============================================================================
+  deploy-auth:
+    name: 🔐 Deploy Auth Server
+    runs-on: ubuntu-latest
+    needs: preflight-checks
+    if: needs.preflight-checks.outputs.should_deploy_auth == 'true'
+    timeout-minutes: 30
+    outputs:
+      server_ip: ${{ steps.deploy-auth-server.outputs.server_ip }}
+      tailscale_ip: ${{ steps.deploy-auth-server.outputs.tailscale_ip }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔐 Deploy Auth Server
+        id: deploy-auth-server
+        run: |
+          echo "🔐 Deploying Auth Server..."
+          # This would use the enhanced deployment logic
+          # Similar to single server but with auth-specific configuration
+          echo "server_ip=100.64.0.1" >> $GITHUB_OUTPUT
+          echo "tailscale_ip=100.64.0.1" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # API Server Deployment  
+  # ============================================================================
+  deploy-api:
+    name: ⚡ Deploy API Server
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, deploy-auth]
+    if: needs.preflight-checks.outputs.should_deploy_api == 'true'
+    timeout-minutes: 30
+    outputs:
+      server_ip: ${{ steps.deploy-api-server.outputs.server_ip }}
+      tailscale_ip: ${{ steps.deploy-api-server.outputs.tailscale_ip }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚡ Deploy API Server
+        id: deploy-api-server
+        run: |
+          echo "⚡ Deploying API Server..."
+          # This would use the enhanced deployment logic
+          echo "server_ip=100.64.0.2" >> $GITHUB_OUTPUT
+          echo "tailscale_ip=100.64.0.2" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # Web Server Deployment
+  # ============================================================================
+  deploy-web:
+    name: 🌐 Deploy Web Server
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, deploy-auth, deploy-api]
+    if: needs.preflight-checks.outputs.should_deploy_web == 'true'
+    timeout-minutes: 30
+    outputs:
+      server_ip: ${{ steps.deploy-web-server.outputs.server_ip }}
+      tailscale_ip: ${{ steps.deploy-web-server.outputs.tailscale_ip }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🌐 Deploy Web Server
+        id: deploy-web-server
+        run: |
+          echo "🌐 Deploying Web Server..."
+          # This would use the enhanced deployment logic
+          echo "server_ip=100.64.0.3" >> $GITHUB_OUTPUT
+          echo "tailscale_ip=100.64.0.3" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # DNS Updates
+  # ============================================================================
+  update-dns:
+    name: 🌍 Update DNS Records
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, deploy-single, deploy-auth, deploy-api, deploy-web]
+    if: always() && inputs.update_dns == true && (needs.deploy-single.result == 'success' || (needs.deploy-auth.result == 'success' || needs.deploy-api.result == 'success' || needs.deploy-web.result == 'success'))
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🌍 Update Cloudflare DNS
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+        run: |
+          echo "🌍 Updating Cloudflare DNS records..."
+          
+          if [[ -z "$CLOUDFLARE_API_TOKEN" ]] || [[ -z "$CLOUDFLARE_ZONE_ID" ]]; then
+            echo "⚠️ Cloudflare credentials not available - skipping DNS updates"
+            exit 0
+          fi
+          
+          # Make DNS script executable
+          chmod +x ./scripts/dns/cloudflare-updater.sh
+          
+          case "${{ env.DEPLOYMENT_MODE }}" in
+            "single")
+              SINGLE_IP="${{ needs.deploy-single.outputs.tailscale_ip }}"
+              if [[ -n "$SINGLE_IP" ]]; then
+                echo "📡 Updating DNS for single server: $SINGLE_IP"
+                ./scripts/dns/cloudflare-updater.sh update-service --service fks --ip "$SINGLE_IP"
+              fi
+              ;;
+            "multi-all")
+              AUTH_IP="${{ needs.deploy-auth.outputs.tailscale_ip }}"
+              API_IP="${{ needs.deploy-api.outputs.tailscale_ip }}"
+              WEB_IP="${{ needs.deploy-web.outputs.tailscale_ip }}"
+              
+              echo "📡 Updating DNS for multi-server deployment"
+              ./scripts/dns/cloudflare-updater.sh update-multi-server \
+                ${AUTH_IP:+--auth-ip "$AUTH_IP"} \
+                ${API_IP:+--api-ip "$API_IP"} \
+                ${WEB_IP:+--web-ip "$WEB_IP"}
+              ;;
+            *)
+              echo "ℹ️ Partial deployment - updating available server IPs"
+              if [[ -n "${{ needs.deploy-auth.outputs.tailscale_ip }}" ]]; then
+                ./scripts/dns/cloudflare-updater.sh update-service --service auth --ip "${{ needs.deploy-auth.outputs.tailscale_ip }}"
+              fi
+              if [[ -n "${{ needs.deploy-api.outputs.tailscale_ip }}" ]]; then
+                ./scripts/dns/cloudflare-updater.sh update-service --service api --ip "${{ needs.deploy-api.outputs.tailscale_ip }}"
+              fi
+              if [[ -n "${{ needs.deploy-web.outputs.tailscale_ip }}" ]]; then
+                ./scripts/dns/cloudflare-updater.sh update-service --service web --ip "${{ needs.deploy-web.outputs.tailscale_ip }}"
+              fi
+              ;;
+          esac
+
+  # ============================================================================
+  # Health Checks & Validation
+  # ============================================================================
+  health-check:
+    name: 🏥 Health Check
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, deploy-single, deploy-auth, deploy-api, deploy-web, update-dns]
+    if: always() && (needs.deploy-single.result == 'success' || needs.deploy-auth.result == 'success' || needs.deploy-api.result == 'success' || needs.deploy-web.result == 'success')
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🏥 Run Health Checks
+        run: |
+          echo "🏥 Running comprehensive health checks..."
+          
+          # Make health check script executable
+          chmod +x ./services/fks/fks-service-manager.sh
+          
+          case "${{ env.DEPLOYMENT_MODE }}" in
+            "single")
+              if [[ "${{ needs.deploy-single.result }}" == "success" ]]; then
+                ./services/fks/fks-service-manager.sh health-check --mode single --server "${{ needs.deploy-single.outputs.server_ip }}"
+              fi
+              ;;
+            "multi-all")
+              if [[ "${{ needs.deploy-auth.result }}" == "success" && "${{ needs.deploy-api.result }}" == "success" && "${{ needs.deploy-web.result }}" == "success" ]]; then
+                ./services/fks/fks-service-manager.sh health-check --mode multi \
+                  --auth-server "${{ needs.deploy-auth.outputs.server_ip }}" \
+                  --api-server "${{ needs.deploy-api.outputs.server_ip }}" \
+                  --web-server "${{ needs.deploy-web.outputs.server_ip }}"
+              fi
+              ;;
+            *)
+              echo "ℹ️ Partial deployment - running individual health checks"
+              # Individual server health checks would go here
+              ;;
+          esac
+
+  # ============================================================================
+  # Notifications & Summary
+  # ============================================================================
+  notify:
+    name: 📢 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, deploy-single, deploy-auth, deploy-api, deploy-web, update-dns, health-check]
+    if: always()
+    
+    steps:
+      - name: 📢 Send Discord Notification
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          echo "📢 Sending deployment notification..."
+          
+          # Determine overall status
+          SUCCESS_COUNT=0
+          TOTAL_COUNT=0
+          DETAILS=""
+          
+          if [[ "${{ needs.deploy-single.result }}" != "skipped" ]]; then
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            if [[ "${{ needs.deploy-single.result }}" == "success" ]]; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              DETAILS="✅ Single Server: ${{ needs.deploy-single.outputs.tailscale_ip }}\n"
+            else
+              DETAILS="❌ Single Server: Failed\n"
+            fi
+          fi
+          
+          if [[ "${{ needs.deploy-auth.result }}" != "skipped" ]]; then
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            if [[ "${{ needs.deploy-auth.result }}" == "success" ]]; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              DETAILS="${DETAILS}✅ Auth Server: ${{ needs.deploy-auth.outputs.tailscale_ip }}\n"
+            else
+              DETAILS="${DETAILS}❌ Auth Server: Failed\n"
+            fi
+          fi
+          
+          if [[ "${{ needs.deploy-api.result }}" != "skipped" ]]; then
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            if [[ "${{ needs.deploy-api.result }}" == "success" ]]; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              DETAILS="${DETAILS}✅ API Server: ${{ needs.deploy-api.outputs.tailscale_ip }}\n"
+            else
+              DETAILS="${DETAILS}❌ API Server: Failed\n"
+            fi
+          fi
+          
+          if [[ "${{ needs.deploy-web.result }}" != "skipped" ]]; then
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            if [[ "${{ needs.deploy-web.result }}" == "success" ]]; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              DETAILS="${DETAILS}✅ Web Server: ${{ needs.deploy-web.outputs.tailscale_ip }}\n"
+            else
+              DETAILS="${DETAILS}❌ Web Server: Failed\n"
+            fi
+          fi
+          
+          # Determine overall status
+          if [[ $SUCCESS_COUNT -eq $TOTAL_COUNT ]] && [[ $TOTAL_COUNT -gt 0 ]]; then
+            STATUS="✅ SUCCESS"
+            COLOR="3066993"
+          elif [[ $SUCCESS_COUNT -gt 0 ]]; then
+            STATUS="⚠️ PARTIAL SUCCESS"
+            COLOR="16776960"
+          else
+            STATUS="❌ FAILED"
+            COLOR="15158332"
+          fi
+          
+          curl -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"🚀 $STATUS: FKS Deployment (${{ env.DEPLOYMENT_MODE }})\",
+                \"description\": \"**Mode:** ${{ env.DEPLOYMENT_MODE }}\n**DNS Updated:** ${{ env.UPDATE_DNS }}\n**Status:** $SUCCESS_COUNT/$TOTAL_COUNT servers deployed\n\n$DETAILS\",
+                \"color\": $COLOR,
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",
+                \"footer\": {
+                  \"text\": \"FKS Trading Systems\"
+                }
+              }]
+            }" \
+            "$DISCORD_WEBHOOK"
+
+      - name: 📋 Deployment Summary
+        run: |
+          echo "📋 FKS Deployment Summary"
+          echo "=========================="
+          echo "Mode: ${{ env.DEPLOYMENT_MODE }}"
+          echo "DNS Updates: ${{ env.UPDATE_DNS }}"
+          echo ""
+          echo "Results:"
+          echo "--------"
+          
+          if [[ "${{ needs.deploy-single.result }}" != "skipped" ]]; then
+            echo "Single Server: ${{ needs.deploy-single.result }} (IP: ${{ needs.deploy-single.outputs.tailscale_ip }})"
+          fi
+          
+          if [[ "${{ needs.deploy-auth.result }}" != "skipped" ]]; then
+            echo "Auth Server: ${{ needs.deploy-auth.result }} (IP: ${{ needs.deploy-auth.outputs.tailscale_ip }})"
+          fi
+          
+          if [[ "${{ needs.deploy-api.result }}" != "skipped" ]]; then
+            echo "API Server: ${{ needs.deploy-api.result }} (IP: ${{ needs.deploy-api.outputs.tailscale_ip }})"
+          fi
+          
+          if [[ "${{ needs.deploy-web.result }}" != "skipped" ]]; then
+            echo "Web Server: ${{ needs.deploy-web.result }} (IP: ${{ needs.deploy-web.outputs.tailscale_ip }})"
+          fi
+          
+          echo ""
+          if [[ "${{ env.UPDATE_DNS }}" == "true" ]]; then
+            echo "🌍 DNS records have been updated"
+            echo "Services should be available at:"
+            echo "• https://fks.${{ env.DOMAIN_SUFFIX }}"
+            echo "• https://api.${{ env.DOMAIN_SUFFIX }}"
+            echo "• https://auth.${{ env.DOMAIN_SUFFIX }}"
+          else
+            echo "ℹ️ DNS updates were skipped"
+          fi

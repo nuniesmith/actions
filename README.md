@@ -121,7 +121,7 @@ actions/
 ### Required GitHub Secrets
 ```bash
 # Linode Infrastructure
-LINODE_TOKEN                 # Linode API access token
+LINODE_CLI_TOKEN                 # Linode API access token
 SERVICE_ROOT_PASSWORD        # Root password for new servers
 
 # User Accounts

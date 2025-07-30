@@ -43,7 +43,7 @@ jobs:
       server_type: g6-standard-2
       target_region: ca-central
     secrets:
-      LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+      LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
       SERVICE_ROOT_PASSWORD: ${{ secrets.MY_SERVICE_ROOT_PASSWORD }}
       JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
       ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}

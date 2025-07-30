@@ -91,7 +91,7 @@ jobs:
       enable_monitoring: true
       enable_backups: false
     secrets:
-      LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+      LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
       SERVICE_ROOT_PASSWORD: ${{ secrets.ATS_ROOT_PASSWORD }}
       JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
       ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}

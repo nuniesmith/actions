@@ -93,7 +93,7 @@ on:
 
     secrets:
       # Core Infrastructure
-      LINODE_TOKEN:
+      LINODE_CLI_TOKEN:
         required: true
       SERVICE_ROOT_PASSWORD:
         required: true
@@ -381,7 +381,7 @@ jobs:
 
       - name: 🔐 Validate Secrets
         env:
-          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
           SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
           ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
@@ -390,7 +390,7 @@ jobs:
           echo "🔐 Validating required secrets..."
           
           MISSING_SECRETS=()
-          [[ -z "$LINODE_TOKEN" ]] && MISSING_SECRETS+=("LINODE_TOKEN")
+          [[ -z "$LINODE_CLI_TOKEN" ]] && MISSING_SECRETS+=("LINODE_CLI_TOKEN")
           [[ -z "$SERVICE_ROOT_PASSWORD" ]] && MISSING_SECRETS+=("SERVICE_ROOT_PASSWORD")
           [[ -z "$JORDAN_PASSWORD" ]] && MISSING_SECRETS+=("JORDAN_PASSWORD")
           [[ -z "$ACTIONS_USER_PASSWORD" ]] && MISSING_SECRETS+=("ACTIONS_USER_PASSWORD")
@@ -549,11 +549,11 @@ jobs:
 
       - name: �🔧 Setup Linode CLI
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           pip install linode-cli
           # Configure via environment variable to avoid config file issues
-          export LINODE_CLI_TOKEN="${{ secrets.LINODE_TOKEN }}"
+          export LINODE_CLI_TOKEN="${{ secrets.LINODE_CLI_TOKEN }}"
           # Test CLI access
           linode-cli --version
 
@@ -570,7 +570,7 @@ jobs:
 
       - name: 🧹 Cleanup Services Before Destruction
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           echo "🧹 Cleaning up external service registrations..."
           
@@ -652,7 +652,7 @@ jobs:
 
       - name: 💥 Destroy Existing Server
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           echo "💥 Looking for existing ${{ env.SERVICE_NAME }} server to destroy..."
           
@@ -690,11 +690,11 @@ jobs:
       - name: 🔧 Setup Linode CLI
         if: inputs.destroy_scope == 'full-server'
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           pip install linode-cli
           # Configure via environment variable to avoid config file issues
-          export LINODE_CLI_TOKEN="${{ secrets.LINODE_TOKEN }}"
+          export LINODE_CLI_TOKEN="${{ secrets.LINODE_CLI_TOKEN }}"
           # Test CLI access
           linode-cli --version
 
@@ -711,7 +711,7 @@ jobs:
 
       - name: �🗑️ Execute Destruction
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           echo "🗑️ Destroying ${{ env.SERVICE_NAME }}..."
           echo "Scope: ${{ inputs.destroy_scope }}"
@@ -804,18 +804,18 @@ jobs:
 
       - name: 🔧 Setup Linode CLI
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           pip install linode-cli
           # Configure via environment variable to avoid config file issues
-          export LINODE_CLI_TOKEN="${{ secrets.LINODE_TOKEN }}"
+          export LINODE_CLI_TOKEN="${{ secrets.LINODE_CLI_TOKEN }}"
           # Test CLI access
           linode-cli --version
 
       - name: 🚀 Create or Find Server
         id: create-server
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           echo "🚀 Managing Linode server for ${{ env.SERVICE_NAME }}..."
           

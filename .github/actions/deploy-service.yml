@@ -55,7 +55,7 @@ on:
 
     secrets:
       # Core Infrastructure
-      LINODE_TOKEN:
+      LINODE_CLI_TOKEN:
         required: true
       SERVICE_ROOT_PASSWORD:
         required: true
@@ -175,7 +175,7 @@ jobs:
       - name: 🔐 Validate Required Secrets
         id: validate-secrets
         env:
-          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
           SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
           ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
@@ -185,7 +185,7 @@ jobs:
           
           MISSING_SECRETS=()
           
-          [[ -z "$LINODE_TOKEN" ]] && MISSING_SECRETS+=("LINODE_TOKEN")
+          [[ -z "$LINODE_CLI_TOKEN" ]] && MISSING_SECRETS+=("LINODE_CLI_TOKEN")
           [[ -z "$SERVICE_ROOT_PASSWORD" ]] && MISSING_SECRETS+=("SERVICE_ROOT_PASSWORD")
           [[ -z "$JORDAN_PASSWORD" ]] && MISSING_SECRETS+=("JORDAN_PASSWORD")
           [[ -z "$ACTIONS_USER_PASSWORD" ]] && MISSING_SECRETS+=("ACTIONS_USER_PASSWORD")
@@ -275,7 +275,7 @@ jobs:
           image = linode/arch
           
           [DEFAULT]
-          token = ${{ secrets.LINODE_TOKEN }}
+          token = ${{ secrets.LINODE_CLI_TOKEN }}
           EOF
           
           chmod 600 ~/.config/linode-cli/config

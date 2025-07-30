@@ -57,7 +57,7 @@ Your secrets should already be set up in the `nuniesmith/actions` repository. Ve
 ```
 
 **Required secrets:**
-- `LINODE_TOKEN`
+- `LINODE_CLI_TOKEN`
 - `FKS_ROOT_PASSWORD`, `NGINX_ROOT_PASSWORD`, `ATS_ROOT_PASSWORD`
 - `JORDAN_PASSWORD`
 - `ACTIONS_USER_PASSWORD`
@@ -135,7 +135,7 @@ curl https://ats.7gram.xyz/api/health
 
 ### Issue: Secret Not Available
 
-**Error:** `Secret LINODE_TOKEN is not available`
+**Error:** `Secret LINODE_CLI_TOKEN is not available`
 
 **Solution:**
 1. Verify secrets are set in the `nuniesmith/actions` repository

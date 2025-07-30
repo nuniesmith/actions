@@ -82,7 +82,7 @@ jobs:
           default-user = DEFAULT
           
           [DEFAULT]
-          token = ${{ secrets.LINODE_TOKEN }}
+          token = ${{ secrets.LINODE_CLI_TOKEN }}
           EOF
           
           chmod 600 ~/.config/linode-cli/config
