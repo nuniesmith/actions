@@ -347,6 +347,7 @@ jobs:
           echo "✅ Auth Server ready: $SERVER_IP"
 
       - name: 🛠️ Configure Auth Server
+        id: configure-auth
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
@@ -373,7 +374,14 @@ jobs:
           set -euo pipefail
           
           echo "🔄 Updating system..."
-          pacman -Syu --noconfirm
+          # Handle potential NVIDIA firmware conflicts
+          if ! pacman -Syu --noconfirm 2>&1; then
+            echo "⚠️ System update failed, trying to resolve conflicts..."
+            # Remove conflicting NVIDIA firmware files
+            rm -f /usr/lib/firmware/nvidia/ad103 /usr/lib/firmware/nvidia/ad104 /usr/lib/firmware/nvidia/ad106 /usr/lib/firmware/nvidia/ad107 2>/dev/null || true
+            # Try update again
+            pacman -Syu --noconfirm
+          fi
           pacman -S --noconfirm curl wget git docker docker-compose tailscale sudo base-devel
           
           echo "👥 Creating service users..."
@@ -441,6 +449,60 @@ jobs:
           else
             echo "⚠️ Could not get Tailscale IP"
             echo "tailscale_ip=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🧹 Cleanup Auth Server on Failure
+        if: failure()
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+        run: |
+          echo "❌ Auth server deployment failed, cleaning up..."
+          SERVER_ID="${{ steps.stage0-auth.outputs.server_id }}"
+          SERVER_IP="${{ steps.stage0-auth.outputs.server_ip }}"
+          
+          if [[ -n "$SERVER_ID" && "$SERVER_ID" != "null" ]]; then
+            echo "🗑️ Deleting failed auth server (ID: $SERVER_ID)..."
+            
+            # Configure Linode CLI
+            mkdir -p ~/.config/linode-cli
+            cat > ~/.config/linode-cli/config << EOF
+            [DEFAULT]
+            default-user = DEFAULT
+            region = ${{ inputs.target_region }}
+            type = g6-nanode-1
+            image = linode/arch
+            token = ${{ secrets.LINODE_CLI_TOKEN }}
+            EOF
+            chmod 600 ~/.config/linode-cli/config
+            
+            # Delete the server
+            if linode-cli linodes delete $SERVER_ID --no-defaults 2>/dev/null; then
+              echo "✅ Failed auth server deleted successfully"
+            else
+              echo "⚠️ Failed to delete auth server automatically - manual cleanup may be required"
+              echo "Server ID: $SERVER_ID"
+              echo "Server IP: $SERVER_IP"
+            fi
+          else
+            echo "ℹ️ No auth server ID found, nothing to clean up"
+          fi
+          
+          # Also try to remove from DNS if it was added
+          if [[ "${{ inputs.update_dns }}" == "true" && -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]]; then
+            echo "🌐 Cleaning up DNS records for failed auth server..."
+            ZONE_ID="${{ secrets.CLOUDFLARE_ZONE_ID }}"
+            if [[ -n "$ZONE_ID" ]]; then
+              # Try to delete auth DNS record
+              RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=auth.${{ inputs.domain_suffix }}" \
+                -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+                -H "Content-Type: application/json" | jq -r '.result[0].id // empty')
+              
+              if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+                curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                  -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" >/dev/null
+                echo "✅ DNS record for auth.${{ inputs.domain_suffix }} removed"
+              fi
+            fi
           fi
 
   # ============================================================================
@@ -568,7 +630,14 @@ jobs:
           set -euo pipefail
           
           echo "🔄 Updating system..."
-          pacman -Syu --noconfirm
+          # Handle potential NVIDIA firmware conflicts
+          if ! pacman -Syu --noconfirm 2>&1; then
+            echo "⚠️ System update failed, trying to resolve conflicts..."
+            # Remove conflicting NVIDIA firmware files
+            rm -f /usr/lib/firmware/nvidia/ad103 /usr/lib/firmware/nvidia/ad104 /usr/lib/firmware/nvidia/ad106 /usr/lib/firmware/nvidia/ad107 2>/dev/null || true
+            # Try update again
+            pacman -Syu --noconfirm
+          fi
           pacman -S --noconfirm curl wget git docker docker-compose tailscale sudo base-devel
           
           echo "👥 Creating service users..."
@@ -638,6 +707,60 @@ jobs:
           else
             echo "⚠️ Could not get Tailscale IP"
             echo "tailscale_ip=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🧹 Cleanup API Server on Failure
+        if: failure()
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+        run: |
+          echo "❌ API server deployment failed, cleaning up..."
+          SERVER_ID="${{ steps.stage0-api.outputs.server_id }}"
+          SERVER_IP="${{ steps.stage0-api.outputs.server_ip }}"
+          
+          if [[ -n "$SERVER_ID" && "$SERVER_ID" != "null" ]]; then
+            echo "🗑️ Deleting failed API server (ID: $SERVER_ID)..."
+            
+            # Configure Linode CLI
+            mkdir -p ~/.config/linode-cli
+            cat > ~/.config/linode-cli/config << EOF
+            [DEFAULT]
+            default-user = DEFAULT
+            region = ${{ inputs.target_region }}
+            type = g6-standard-1
+            image = linode/arch
+            token = ${{ secrets.LINODE_CLI_TOKEN }}
+            EOF
+            chmod 600 ~/.config/linode-cli/config
+            
+            # Delete the server
+            if linode-cli linodes delete $SERVER_ID --no-defaults 2>/dev/null; then
+              echo "✅ Failed API server deleted successfully"
+            else
+              echo "⚠️ Failed to delete API server automatically - manual cleanup may be required"
+              echo "Server ID: $SERVER_ID"
+              echo "Server IP: $SERVER_IP"
+            fi
+          else
+            echo "ℹ️ No API server ID found, nothing to clean up"
+          fi
+          
+          # Also try to remove from DNS if it was added
+          if [[ "${{ inputs.update_dns }}" == "true" && -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]]; then
+            echo "🌐 Cleaning up DNS records for failed API server..."
+            ZONE_ID="${{ secrets.CLOUDFLARE_ZONE_ID }}"
+            if [[ -n "$ZONE_ID" ]]; then
+              # Try to delete API DNS record
+              RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=api.${{ inputs.domain_suffix }}" \
+                -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+                -H "Content-Type: application/json" | jq -r '.result[0].id // empty')
+              
+              if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+                curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                  -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" >/dev/null
+                echo "✅ DNS record for api.${{ inputs.domain_suffix }} removed"
+              fi
+            fi
           fi
 
   # ============================================================================
@@ -764,7 +887,14 @@ jobs:
           set -euo pipefail
           
           echo "🔄 Updating system..."
-          pacman -Syu --noconfirm
+          # Handle potential NVIDIA firmware conflicts
+          if ! pacman -Syu --noconfirm 2>&1; then
+            echo "⚠️ System update failed, trying to resolve conflicts..."
+            # Remove conflicting NVIDIA firmware files
+            rm -f /usr/lib/firmware/nvidia/ad103 /usr/lib/firmware/nvidia/ad104 /usr/lib/firmware/nvidia/ad106 /usr/lib/firmware/nvidia/ad107 2>/dev/null || true
+            # Try update again
+            pacman -Syu --noconfirm
+          fi
           pacman -S --noconfirm curl wget git docker docker-compose tailscale sudo base-devel
           
           echo "👥 Creating service users..."
@@ -836,6 +966,62 @@ jobs:
           else
             echo "⚠️ Could not get Tailscale IP"
             echo "tailscale_ip=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🧹 Cleanup Web Server on Failure
+        if: failure()
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+        run: |
+          echo "❌ Web server deployment failed, cleaning up..."
+          SERVER_ID="${{ steps.stage0-web.outputs.server_id }}"
+          SERVER_IP="${{ steps.stage0-web.outputs.server_ip }}"
+          
+          if [[ -n "$SERVER_ID" && "$SERVER_ID" != "null" ]]; then
+            echo "🗑️ Deleting failed Web server (ID: $SERVER_ID)..."
+            
+            # Configure Linode CLI
+            mkdir -p ~/.config/linode-cli
+            cat > ~/.config/linode-cli/config << EOF
+            [DEFAULT]
+            default-user = DEFAULT
+            region = ${{ inputs.target_region }}
+            type = g6-nanode-1
+            image = linode/arch
+            token = ${{ secrets.LINODE_CLI_TOKEN }}
+            EOF
+            chmod 600 ~/.config/linode-cli/config
+            
+            # Delete the server
+            if linode-cli linodes delete $SERVER_ID --no-defaults 2>/dev/null; then
+              echo "✅ Failed Web server deleted successfully"
+            else
+              echo "⚠️ Failed to delete Web server automatically - manual cleanup may be required"
+              echo "Server ID: $SERVER_ID"
+              echo "Server IP: $SERVER_IP"
+            fi
+          else
+            echo "ℹ️ No Web server ID found, nothing to clean up"
+          fi
+          
+          # Also try to remove from DNS if it was added
+          if [[ "${{ inputs.update_dns }}" == "true" && -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]]; then
+            echo "🌐 Cleaning up DNS records for failed Web server..."
+            ZONE_ID="${{ secrets.CLOUDFLARE_ZONE_ID }}"
+            if [[ -n "$ZONE_ID" ]]; then
+              # Try to delete web DNS records
+              for subdomain in "fks" "web"; do
+                RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$subdomain.${{ inputs.domain_suffix }}" \
+                  -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+                  -H "Content-Type: application/json" | jq -r '.result[0].id // empty')
+                
+                if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+                  curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                    -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" >/dev/null
+                  echo "✅ DNS record for $subdomain.${{ inputs.domain_suffix }} removed"
+                fi
+              done
+            fi
           fi
 
   # ============================================================================
@@ -956,7 +1142,14 @@ jobs:
           set -euo pipefail
           
           echo "🔄 Updating system and installing packages..."
-          pacman -Syu --noconfirm
+          # Handle potential NVIDIA firmware conflicts
+          if ! pacman -Syu --noconfirm 2>&1; then
+            echo "⚠️ System update failed, trying to resolve conflicts..."
+            # Remove conflicting NVIDIA firmware files
+            rm -f /usr/lib/firmware/nvidia/ad103 /usr/lib/firmware/nvidia/ad104 /usr/lib/firmware/nvidia/ad106 /usr/lib/firmware/nvidia/ad107 2>/dev/null || true
+            # Try update again
+            pacman -Syu --noconfirm
+          fi
           pacman -S --noconfirm curl wget git docker docker-compose tailscale sudo base-devel
           
           echo "👥 Creating fks_user..."
@@ -1011,6 +1204,66 @@ jobs:
           else
             echo "⚠️ Could not get Tailscale IP"
             echo "tailscale_ip=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🧹 Cleanup Single Server on Failure
+        if: failure()
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+        run: |
+          echo "❌ Single server deployment failed, cleaning up..."
+          SERVER_IP="${{ steps.get-server.outputs.server_ip }}"
+          
+          if [[ -n "$SERVER_IP" && "$SERVER_IP" != "null" ]]; then
+            echo "🗑️ Deleting failed single server (IP: $SERVER_IP)..."
+            
+            # Configure Linode CLI
+            mkdir -p ~/.config/linode-cli
+            cat > ~/.config/linode-cli/config << EOF
+            [DEFAULT]
+            default-user = DEFAULT
+            region = ${{ inputs.target_region }}
+            type = ${{ inputs.server_type }}
+            image = linode/arch
+            token = ${{ secrets.LINODE_CLI_TOKEN }}
+            EOF
+            chmod 600 ~/.config/linode-cli/config
+            
+            # Find and delete server by IP
+            SERVER_NAME="${{ needs.preflight-checks.outputs.single_server_name }}"
+            SERVER_ID=$(linode-cli linodes list --text --no-headers | grep "$SERVER_NAME" | head -1 | cut -f1 || echo "")
+            
+            if [[ -n "$SERVER_ID" ]]; then
+              if linode-cli linodes delete $SERVER_ID --no-defaults 2>/dev/null; then
+                echo "✅ Failed single server deleted successfully"
+              else
+                echo "⚠️ Failed to delete single server automatically - manual cleanup may be required"
+                echo "Server Name: $SERVER_NAME"
+                echo "Server IP: $SERVER_IP"
+              fi
+            else
+              echo "⚠️ Could not find server ID for cleanup"
+            fi
+          else
+            echo "ℹ️ No single server IP found, nothing to clean up"
+          fi
+          
+          # Also try to remove from DNS if it was added
+          if [[ "${{ inputs.update_dns }}" == "true" && -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]]; then
+            echo "🌐 Cleaning up DNS records for failed single server..."
+            ZONE_ID="${{ secrets.CLOUDFLARE_ZONE_ID }}"
+            if [[ -n "$ZONE_ID" ]]; then
+              # Try to delete FKS DNS record
+              RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=fks.${{ inputs.domain_suffix }}" \
+                -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+                -H "Content-Type: application/json" | jq -r '.result[0].id // empty')
+              
+              if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+                curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                  -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" >/dev/null
+                echo "✅ DNS record for fks.${{ inputs.domain_suffix }} removed"
+              fi
+            fi
           fi
 
   # ============================================================================
