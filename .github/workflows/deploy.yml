@@ -559,8 +559,13 @@ jobs:
       - name: 🧹 Cleanup Services Before Destruction
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
           echo "🧹 Cleaning up external service registrations..."
+          
+          # Install dependencies
+          sudo apt-get update && sudo apt-get install -y curl jq sshpass >/dev/null 2>&1 || true
           
           # Find existing server
           EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" | head -1)
@@ -589,9 +594,6 @@ jobs:
               
               # Try to connect using password authentication for cleanup
               echo "🔗 Attempting cleanup connection via password auth..."
-              
-              # Install sshpass for password authentication
-              sudo apt-get update && sudo apt-get install -y sshpass >/dev/null 2>&1 || true
               
               # Try to connect and cleanup using root password
               if timeout 30 sshpass -p "${{ secrets.SERVICE_ROOT_PASSWORD }}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$SERVER_IP "echo 'Cleanup connection successful'" 2>/dev/null; then
@@ -623,16 +625,50 @@ jobs:
               echo "⚠️ Could not determine server IP for cleanup"
             fi
             
-            # Additional Tailscale cleanup via API if available
-            if command -v tailscale >/dev/null 2>&1; then
-              echo "🔗 Attempting Tailscale device cleanup via local client..."
-              # List devices and try to remove the one matching our service name
-              tailscale status --json 2>/dev/null | jq -r '.Peer[] | select(.HostName == "${{ env.SERVICE_NAME }}") | .ID' | while read device_id; do
-                if [[ -n "$device_id" ]]; then
-                  echo "Removing Tailscale device: $device_id"
-                  tailscale delete "$device_id" || true
+            # Cleanup Tailscale devices via API (more reliable)
+            if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
+              echo "🔗 Cleaning up Tailscale devices via API..."
+              
+              TAILNET="${TAILSCALE_TAILNET}"
+              if [[ -z "$TAILNET" ]]; then
+                echo "⚠️ TAILSCALE_TAILNET not set, using default discovery"
+                # Try to discover tailnet from API
+                DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                  "https://api.tailscale.com/api/v2/devices" 2>/dev/null || echo '{"devices":[]}')
+              else
+                echo "🔍 Using tailnet: $TAILNET"
+                DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                  "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>/dev/null || echo '{"devices":[]}')
+              fi
+              
+              if echo "$DEVICES_RESPONSE" | jq -e '.devices' >/dev/null 2>&1; then
+                # Find devices matching our service name
+                DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg service "${{ env.SERVICE_NAME }}" '.devices[]? | select(.hostname == $service or .name == $service) | .id // empty' | grep -v '^$')
+                
+                if [[ -n "$DEVICES" ]]; then
+                  echo "Found Tailscale devices to remove:"
+                  for device_id in $DEVICES; do
+                    if [[ -n "$device_id" ]]; then
+                      echo "🗑️ Removing Tailscale device: $device_id"
+                      if [[ -z "$TAILNET" ]]; then
+                        curl -s -X DELETE \
+                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                          "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "Failed to remove device $device_id"
+                      else
+                        curl -s -X DELETE \
+                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                          "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id" 2>/dev/null || echo "Failed to remove device $device_id"
+                      fi
+                    fi
+                  done
+                else
+                  echo "No Tailscale devices found matching service name: ${{ env.SERVICE_NAME }}"
                 fi
-              done || true
+              else
+                echo "⚠️ Could not retrieve Tailscale devices list"
+              fi
+            else
+              echo "⚠️ Tailscale API key not available"
             fi
           else
             echo "ℹ️ No existing server found for cleanup"
@@ -689,9 +725,14 @@ jobs:
       - name: 🗑️ Execute Destruction
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
           echo "🗑️ Destroying ${{ env.SERVICE_NAME }}..."
           echo "Scope: ${{ inputs.destroy_scope }}"
+          
+          # Install dependencies for API calls
+          sudo apt-get update && sudo apt-get install -y curl jq >/dev/null 2>&1 || true
           
           case "${{ inputs.destroy_scope }}" in
             "service-only")
@@ -751,6 +792,46 @@ jobs:
                 echo "Destroying: $SERVER_LABEL (ID: $SERVER_ID)"
                 linode-cli linodes delete "$SERVER_ID"
                 echo "✅ Server destroyed"
+                
+                # Cleanup Tailscale devices via API after server destruction
+                if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
+                  echo "🔗 Cleaning up Tailscale devices via API after server destruction..."
+                  
+                  TAILNET="${TAILSCALE_TAILNET}"
+                  if [[ -z "$TAILNET" ]]; then
+                    echo "⚠️ TAILSCALE_TAILNET not set, using default discovery"
+                    DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                      "https://api.tailscale.com/api/v2/devices" 2>/dev/null || echo '{"devices":[]}')
+                  else
+                    echo "🔍 Using tailnet: $TAILNET"
+                    DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                      "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>/dev/null || echo '{"devices":[]}')
+                  fi
+                  
+                  if echo "$DEVICES_RESPONSE" | jq -e '.devices' >/dev/null 2>&1; then
+                    DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg service "${{ env.SERVICE_NAME }}" '.devices[]? | select(.hostname == $service or .name == $service) | .id // empty' | grep -v '^$')
+                    
+                    if [[ -n "$DEVICES" ]]; then
+                      echo "Found orphaned Tailscale devices to remove:"
+                      for device_id in $DEVICES; do
+                        if [[ -n "$device_id" ]]; then
+                          echo "🗑️ Removing orphaned Tailscale device: $device_id"
+                          if [[ -z "$TAILNET" ]]; then
+                            curl -s -X DELETE \
+                              -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                              "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "Failed to remove device $device_id"
+                          else
+                            curl -s -X DELETE \
+                              -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                              "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id" 2>/dev/null || echo "Failed to remove device $device_id"
+                          fi
+                        fi
+                      done
+                    else
+                      echo "No orphaned Tailscale devices found"
+                    fi
+                  fi
+                fi
               else
                 echo "⚠️ No server found for ${{ env.SERVICE_NAME }}"
               fi
@@ -1049,6 +1130,11 @@ jobs:
           sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
           
+          echo "🏷️ Setting hostname in Stage 1 (before Tailscale auth)..."
+          # Set hostname to service name for better identification - MUST be done in Stage 1
+          hostnamectl set-hostname "${{ env.SERVICE_NAME }}"
+          echo "✅ Hostname set to: ${{ env.SERVICE_NAME }}"
+          
           echo "⚙️ Enabling services for post-reboot..."
           systemctl enable docker
           systemctl enable tailscaled
@@ -1078,8 +1164,7 @@ jobs:
           echo "🔗 Starting and authenticating Tailscale..."
           systemctl start tailscaled
           sleep 5
-          # Set hostname to service name for better identification
-          hostnamectl set-hostname "${{ env.SERVICE_NAME }}"
+          # Hostname was already set in Stage 1 - using it for Tailscale auth
           tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --timeout=120s
           
           # Wait for Tailscale to be ready
