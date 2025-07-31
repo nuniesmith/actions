@@ -108,6 +108,7 @@ on:
       TAILSCALE_AUTH_KEY:
         required: true
       TAILSCALE_TAILNET:
+        description: 'Tailscale tailnet name (optional)'
         required: false
       
       # Monitoring (Optional)
