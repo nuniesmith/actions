@@ -443,6 +443,7 @@ jobs:
   cleanup-old-resources:
     name: 🧹 Cleanup Old Resources
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: preflight-checks
     if: |
       needs.preflight-checks.outputs.should_deploy == 'true' && 
@@ -456,6 +457,54 @@ jobs:
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
           echo "🧹 Cleaning up old ${{ env.SERVICE_NAME }} resources..."
+          
+          # For nginx deployments, do minimal cleanup to speed up deployment
+          if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
+            echo "⚡ Fast cleanup mode for nginx deployment"
+            
+            # Install dependencies
+            sudo apt-get update && sudo apt-get install -y curl jq
+            
+            # Quick Tailscale cleanup (only exact matches)
+            if [[ -n "$TAILSCALE_AUTH_KEY" && -n "$TAILSCALE_TAILNET" ]]; then
+              echo "🔗 Quick Tailscale cleanup for nginx..."
+              DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices" || echo '{"devices":[]}')
+              
+              if echo "$DEVICES_RESPONSE" | jq -e '.devices' >/dev/null 2>&1; then
+                NGINX_DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r '.devices[]? | select(.hostname == "nginx" or .name == "nginx") | .id')
+                for device_id in $NGINX_DEVICES; do
+                  if [[ -n "$device_id" ]]; then
+                    echo "🗑️ Removing nginx device: $device_id"
+                    curl -s -X DELETE -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                      "https://api.tailscale.com/api/v2/device/$device_id" || true
+                  fi
+                done
+              fi
+            fi
+            
+            # Quick Linode cleanup
+            if [[ -n "$LINODE_CLI_TOKEN" ]]; then
+              echo "🖥️ Quick Linode cleanup for nginx..."
+              pip install linode-cli
+              echo "[DEFAULT]
+          token = $LINODE_CLI_TOKEN" > ~/.linode-cli
+              
+              OLD_SERVERS=$(linode-cli linodes list --json | jq -r '.[] | select(.label == "nginx") | .id')
+              for server_id in $OLD_SERVERS; do
+                if [[ -n "$server_id" ]]; then
+                  echo "🗑️ Removing nginx server: $server_id"
+                  linode-cli linodes delete $server_id --format id || echo "Failed to remove $server_id"
+                fi
+              done
+            fi
+            
+            echo "✅ Quick cleanup completed for nginx"
+            exit 0
+          fi
+          
+          # Full cleanup for other services
+          echo "🔧 Full cleanup mode for ${{ env.SERVICE_NAME }}"
           
           # Install dependencies
           sudo apt-get update && sudo apt-get install -y curl jq
