@@ -1498,7 +1498,7 @@ jobs:
           fi
           
           echo "📦 Installing core packages with retry logic..."
-          # Install essential packages first (most important ones)
+          # Install essential packages first (most important ones) - using modern Docker with Compose plugin
           CORE_PACKAGES="curl wget git docker docker-compose tailscale fail2ban sudo rsync"
           
           echo "🔄 Installing essential packages: $CORE_PACKAGES"
@@ -1526,6 +1526,48 @@ jobs:
               echo "Installing $pkg..."
               timeout 120 pacman -S --noconfirm "$pkg" || echo "⚠️ Failed to install $pkg, continuing..."
             done
+          fi
+          
+          echo "🐳 Ensuring modern Docker Compose is available..."
+          # Install Docker Compose plugin for modern 'docker compose' command
+          if ! docker compose version &>/dev/null; then
+            echo "🔧 Installing Docker Compose plugin..."
+            
+            # Method 1: Try installing from AUR if available
+            if command -v yay &>/dev/null || command -v paru &>/dev/null; then
+              echo "📦 Installing docker-compose plugin via AUR helper..."
+              if command -v yay &>/dev/null; then
+                yay -S --noconfirm docker-compose-plugin || echo "⚠️ AUR installation failed"
+              elif command -v paru &>/dev/null; then
+                paru -S --noconfirm docker-compose-plugin || echo "⚠️ AUR installation failed"
+              fi
+            fi
+            
+            # Method 2: Manual installation if AUR failed
+            if ! docker compose version &>/dev/null; then
+              echo "🔧 Installing Docker Compose plugin manually..."
+              
+              # Create docker plugins directory
+              mkdir -p /usr/local/lib/docker/cli-plugins
+              
+              # Download latest Docker Compose plugin
+              COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d'"' -f4 | sed 's/v//')
+              echo "📥 Downloading Docker Compose v$COMPOSE_VERSION..."
+              
+              curl -SL "https://github.com/docker/compose/releases/download/v$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose
+              
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              
+              # Verify installation
+              if /usr/local/lib/docker/cli-plugins/docker-compose version &>/dev/null; then
+                echo "✅ Docker Compose plugin installed successfully"
+              else
+                echo "⚠️ Docker Compose plugin installation may have issues"
+              fi
+            fi
+          else
+            echo "✅ Docker Compose plugin already available"
           fi
           
           # Try to install base-devel (development tools) - optional
@@ -2043,9 +2085,43 @@ jobs:
           # Deploy based on what's available
           if [[ -f "docker-compose.yml" ]]; then
             echo "🐳 Starting Docker Compose services..."
-            sudo -u ${{ env.SERVICE_NAME }}_user docker compose down || true
-            sudo -u ${{ env.SERVICE_NAME }}_user docker compose pull || echo "Pull failed, using local images"
-            sudo -u ${{ env.SERVICE_NAME }}_user docker compose up -d
+            
+            # Detect which Docker Compose command to use
+            if docker compose version &> /dev/null 2>&1; then
+              COMPOSE_CMD="docker compose"
+              echo "✅ Using modern Docker Compose (docker compose)"
+            elif command -v docker-compose &> /dev/null; then
+              COMPOSE_CMD="docker-compose"
+              echo "✅ Using legacy Docker Compose (docker-compose)"
+            else
+              echo "❌ No Docker Compose found! Installing manually..."
+              
+              # Emergency Docker Compose installation
+              curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
+                -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              
+              if command -v docker-compose &> /dev/null; then
+                COMPOSE_CMD="docker-compose"
+                echo "✅ Emergency Docker Compose installation successful"
+              else
+                echo "❌ Failed to install Docker Compose"
+                exit 1
+              fi
+            fi
+            
+            echo "🐳 Using compose command: $COMPOSE_CMD"
+            
+            # Use the detected compose command with appropriate flags
+            sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD down || true
+            sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD pull || echo "Pull failed, using local images"
+            
+            # Use appropriate up flag based on compose version
+            if [[ "$COMPOSE_CMD" == "docker compose" ]]; then
+              sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD up --detach
+            else
+              sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD up -d
+            fi
             
             # Special post-deployment steps for services with SSL
             if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
