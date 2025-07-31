@@ -2116,16 +2116,49 @@ jobs:
             
             echo "🐳 Using compose command: $COMPOSE_CMD"
             
-            # Use the detected compose command with appropriate flags
-            sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD down || true
-            sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD pull || echo "Pull failed, using local images"
+            # Ensure Docker daemon is accessible and service user has permissions
+            echo "🔧 Setting up Docker permissions..."
             
-            # Use appropriate up flag based on compose version
-            if [[ "$COMPOSE_CMD" == "docker compose" ]]; then
-              sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD up --detach
-            else
-              sudo -u ${{ env.SERVICE_NAME }}_user $COMPOSE_CMD up -d
+            # Add service user to docker group (ensure it's effective)
+            usermod -aG docker ${{ env.SERVICE_NAME }}_user 2>/dev/null || true
+            
+            # Create a docker group if it doesn't exist
+            groupadd -f docker
+            
+            # Ensure docker socket has proper permissions
+            chown root:docker /var/run/docker.sock 2>/dev/null || true
+            chmod 660 /var/run/docker.sock 2>/dev/null || true
+            
+            # Restart Docker service to ensure clean state
+            systemctl restart docker
+            sleep 5
+            
+            # Test Docker access
+            if ! docker info >/dev/null 2>&1; then
+                echo "❌ Docker daemon is not accessible"
+                exit 1
             fi
+            
+            # Change to service directory
+            cd "$SERVICE_DIR"
+            
+            # Run Docker Compose commands as root (since we're already root in the script)
+            echo "🐳 Stopping existing services..."
+            $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
+            
+            echo "🐳 Pulling latest images..."
+            $COMPOSE_CMD pull --ignore-pull-failures 2>/dev/null || echo "Pull failed, using local images"
+            
+            echo "🐳 Starting services..."
+            $COMPOSE_CMD up -d
+            
+            # Verify services started
+            echo "🔍 Checking service status..."
+            $COMPOSE_CMD ps
+            
+            # Fix ownership of any created files to service user
+            echo "🔧 Fixing file ownership..."
+            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "$SERVICE_DIR" 2>/dev/null || true
             
             # Special post-deployment steps for services with SSL
             if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
