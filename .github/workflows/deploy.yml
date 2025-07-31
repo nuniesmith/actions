@@ -393,6 +393,9 @@ jobs:
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
           ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          # SSL-related secrets (optional for nginx)
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           echo "🔐 Validating required secrets..."
           
@@ -410,6 +413,23 @@ jobs:
           fi
           
           echo "✅ All required secrets validated"
+          
+          # Check SSL-related secrets for nginx deployments
+          if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
+            SSL_SECRETS=()
+            [[ -z "$CLOUDFLARE_EMAIL" ]] && SSL_SECRETS+=("CLOUDFLARE_EMAIL")
+            [[ -z "$CLOUDFLARE_API_TOKEN" ]] && SSL_SECRETS+=("CLOUDFLARE_API_TOKEN")
+            
+            if [[ ${#SSL_SECRETS[@]} -gt 0 ]]; then
+              echo "⚠️ SSL secrets missing (will use HTTP challenge or self-signed):"
+              printf '  - %s\n' "${SSL_SECRETS[@]}"
+              echo "💡 For wildcard certificates and better reliability, add:"
+              echo "   - CLOUDFLARE_EMAIL (your Cloudflare account email)"
+              echo "   - CLOUDFLARE_API_TOKEN (Cloudflare API token with DNS edit permissions)"
+            else
+              echo "✅ SSL secrets available for DNS-01 challenge"
+            fi
+          fi
 
   # ============================================================================
   # Code Testing (Optional)
@@ -1860,12 +1880,55 @@ jobs:
           
           cd "$SERVICE_DIR"
           
+          # Special handling for nginx service (SSL setup)
+          if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
+            echo "🔐 Setting up SSL certificate management for nginx..."
+            
+            # Install SSL management system
+            if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
+              chmod +x scripts/*.sh
+              ./scripts/install-ssl-systemd.sh install
+              
+              # Configure environment for SSL
+              cat >> /opt/nginx/.env << SSL_ENV
+          DOMAIN_NAME=${{ env.FULL_DOMAIN }}
+          LETSENCRYPT_EMAIL=admin@${{ inputs.domain_suffix || '7gram.xyz' }}
+          SSL_ENV
+              
+              # Add Cloudflare credentials if available
+              if [[ -n "${{ secrets.CLOUDFLARE_EMAIL || '' }}" ]]; then
+                echo "CLOUDFLARE_EMAIL=${{ secrets.CLOUDFLARE_EMAIL }}" >> /opt/nginx/.env
+                echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> /opt/nginx/.env
+              fi
+              
+              # Run initial SSL setup
+              nginx-ssl setup || echo "⚠️ SSL setup completed with warnings"
+            else
+              echo "⚠️ SSL management scripts not found, continuing without SSL automation"
+            fi
+          fi
+          
           # Deploy based on what's available
           if [[ -f "docker-compose.yml" ]]; then
             echo "🐳 Starting Docker Compose services..."
             sudo -u ${{ env.SERVICE_NAME }}_user docker compose down || true
             sudo -u ${{ env.SERVICE_NAME }}_user docker compose pull || echo "Pull failed, using local images"
             sudo -u ${{ env.SERVICE_NAME }}_user docker compose up -d
+            
+            # Special post-deployment steps for nginx
+            if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
+              echo "🔍 Verifying SSL setup..."
+              sleep 10  # Wait for nginx to start
+              
+              # Test HTTP endpoint
+              curl -f http://localhost/health || echo "⚠️ HTTP health check failed"
+              
+              # Test HTTPS endpoint (allow self-signed)
+              curl -k -f https://localhost/health || echo "⚠️ HTTPS health check failed"
+              
+              # Show SSL certificate status
+              nginx-ssl status || echo "⚠️ Could not get SSL status"
+            fi
           elif [[ -f "start.sh" ]]; then
             echo "🚀 Running start script..."
             chmod +x start.sh
