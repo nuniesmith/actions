@@ -2002,6 +2002,13 @@ jobs:
           if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
             echo "🔐 Setting up SSL certificate management for nginx..."
             
+            # Run pre-deployment cleanup for nginx
+            if [[ -f "scripts/cleanup-development-resources.sh" ]]; then
+              echo "🧹 Running pre-deployment cleanup..."
+              chmod +x scripts/cleanup-development-resources.sh
+              ./scripts/cleanup-development-resources.sh || echo "⚠️ Cleanup completed with warnings"
+            fi
+            
             # Install SSL management system
             if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
               chmod +x scripts/*.sh
