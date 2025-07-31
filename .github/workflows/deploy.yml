@@ -816,15 +816,6 @@ jobs:
                 DEVICE_NAME=$(sshpass -p "${{ secrets.SERVICE_ROOT_PASSWORD }}" ssh -o StrictHostKeyChecking=no root@$SERVER_IP "hostname 2>/dev/null || echo '${{ env.SERVICE_NAME }}'" || echo "${{ env.SERVICE_NAME }}")
                 echo "Device name for cleanup: $DEVICE_NAME"
                 
-                # Cleanup Netdata cloud connection
-                echo "🧹 Cleaning up Netdata cloud connection..."
-                sshpass -p "${{ secrets.SERVICE_ROOT_PASSWORD }}" ssh -o StrictHostKeyChecking=no root@$SERVER_IP "
-                  systemctl stop netdata 2>/dev/null || true
-                  rm -rf /var/lib/netdata/cloud.d/ 2>/dev/null || true
-                  rm -rf /var/lib/netdata/registry/ 2>/dev/null || true
-                  echo 'Netdata cleanup completed'
-                " || true
-                
                 echo "✅ Service cleanup completed"
               else
                 echo "⚠️ Could not connect to server for cleanup (server may be down, password changed, or SSH not configured)"
@@ -836,7 +827,7 @@ jobs:
             
             # Cleanup Tailscale devices via API (more reliable and comprehensive)
             if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
-              echo "🔗 Cleaning up ALL Tailscale devices for service ${{ env.SERVICE_NAME }}..."
+              echo "🔗 Comprehensive Tailscale cleanup for service ${{ env.SERVICE_NAME }}..."
               
               TAILNET="${TAILSCALE_TAILNET}"
               if [[ -z "$TAILNET" ]]; then
@@ -848,7 +839,7 @@ jobs:
                 DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
               fi
               
-              echo "🌐 Fetching devices from: $DEVICES_URL"
+              echo "🌐 Fetching ALL devices for comprehensive cleanup..."
               DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
               
               # Extract HTTP status code
@@ -858,29 +849,46 @@ jobs:
               echo "🔍 API Response Code: $HTTP_CODE"
               
               if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                # Find ALL devices matching our service name (including numbered variants like service-1, service-2, etc.)
-                SERVICE_PATTERN="^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
+                # Multiple cleanup patterns to catch all variants
+                CLEANUP_PATTERNS=(
+                  "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
+                  "^${{ env.SERVICE_NAME }}$" 
+                  "^${{ env.SERVICE_NAME }}-"
+                  "${{ env.SERVICE_NAME }}"
+                )
                 
-                echo "🔍 Searching for devices matching pattern: $SERVICE_PATTERN"
+                TOTAL_REMOVED=0
+                ALL_FOUND_DEVICES=""
                 
-                DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$SERVICE_PATTERN" '
-                  .devices[]? | 
-                  select(
-                    (.hostname // .name | test($pattern; "i")) or 
-                    (.name // .hostname | test($pattern; "i"))
-                  ) | 
-                  .id // empty' | grep -v '^$' | head -20)  # Limit to prevent excessive API calls
+                # First pass: collect all matching device IDs
+                for pattern in "${CLEANUP_PATTERNS[@]}"; do
+                  echo "🔍 Searching for devices matching pattern: $pattern"
+                  
+                  DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$pattern" '
+                    .devices[]? | 
+                    select(
+                      (.hostname // .name | test($pattern; "i")) or 
+                      (.name // .hostname | test($pattern; "i"))
+                    ) | 
+                    .id // empty' | grep -v '^$')
+                  
+                  if [[ -n "$DEVICES" ]]; then
+                    ALL_FOUND_DEVICES="$ALL_FOUND_DEVICES $DEVICES"
+                  fi
+                done
                 
-                if [[ -n "$DEVICES" ]]; then
-                  echo "Found Tailscale devices to remove:"
-                  REMOVED_COUNT=0
-                  for device_id in $DEVICES; do
+                # Remove duplicates and clean up the list
+                UNIQUE_DEVICES=$(echo "$ALL_FOUND_DEVICES" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+                
+                if [[ -n "$UNIQUE_DEVICES" ]]; then
+                  echo "Found devices to remove:"
+                  for device_id in $UNIQUE_DEVICES; do
                     if [[ -n "$device_id" ]]; then
                       # Get device details before removal
                       DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
-                      echo "🗑️ Removing Tailscale device: $device_id - $DEVICE_INFO"
+                      echo "🗑️ Removing device: $device_id - $DEVICE_INFO"
                       
-                      # Use the correct API endpoint for device removal
+                      # Try both API endpoint formats
                       DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
                       REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
                         -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
@@ -890,16 +898,34 @@ jobs:
                       
                       if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
                         echo "   ✅ Successfully removed"
-                        ((REMOVED_COUNT++))
+                        ((TOTAL_REMOVED++))
                       else
-                        echo "   ❌ Failed to remove device $device_id (HTTP: $REMOVE_CODE)"
+                        echo "   ⚠️ Primary endpoint failed (HTTP: $REMOVE_CODE), trying alternative..."
+                        # Try alternative API endpoint format
+                        if [[ -n "$TAILNET" ]]; then
+                          ALT_DELETE_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id"
+                        else
+                          ALT_DELETE_URL="https://api.tailscale.com/api/v2/devices/$device_id"
+                        fi
+                        
+                        ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                          "$ALT_DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
+                        
+                        ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                        if [[ "$ALT_REMOVE_CODE" == "200" || "$ALT_REMOVE_CODE" == "204" ]]; then
+                          echo "   ✅ Successfully removed via alternative endpoint"
+                          ((TOTAL_REMOVED++))
+                        else
+                          echo "   ❌ Failed to remove device $device_id (Primary: $REMOVE_CODE, Alt: $ALT_REMOVE_CODE)"
+                        fi
                       fi
                       
                       # Rate limiting: small delay between deletions
                       sleep 1
                     fi
                   done
-                  echo "✅ Tailscale device cleanup completed - removed $REMOVED_COUNT devices"
+                  echo "✅ Comprehensive Tailscale cleanup completed - removed $TOTAL_REMOVED devices total"
                 else
                   echo "ℹ️ No Tailscale devices found matching service name pattern: $SERVICE_PATTERN"
                 fi
@@ -1027,9 +1053,6 @@ jobs:
                     # Cleanup Tailscale
                     ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "tailscale logout || true" || true
                     
-                    # Cleanup Netdata
-                    ssh -i ~/.ssh/cleanup_key -o StrictHostKeyChecking=no root@$SERVER_IP "systemctl stop netdata || true; rm -rf /var/lib/netdata/cloud.d/ || true" || true
-                    
                     echo "✅ Service cleanup completed"
                   else
                     echo "⚠️ Could not connect for cleanup"
@@ -1042,7 +1065,7 @@ jobs:
                 
                 # Cleanup Tailscale devices via API after server destruction (comprehensive)
                 if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
-                  echo "🔗 Cleaning up ALL Tailscale devices for service ${{ env.SERVICE_NAME }} after server destruction..."
+                  echo "🔗 Final comprehensive Tailscale cleanup for service ${{ env.SERVICE_NAME }}..."
                   
                   TAILNET="${TAILSCALE_TAILNET}"
                   if [[ -z "$TAILNET" ]]; then
@@ -1053,7 +1076,7 @@ jobs:
                     DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
                   fi
                   
-                  echo "🌐 Fetching devices from: $DEVICES_URL"
+                  echo "🌐 Fetching ALL remaining devices for final cleanup..."
                   DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
                   
                   # Extract HTTP status code
@@ -1063,26 +1086,84 @@ jobs:
                   echo "🔍 API Response Code: $HTTP_CODE"
                   
                   if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                    # Find ALL devices matching our service name (including numbered variants)
-                    SERVICE_PATTERN="^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
+                    # Even more aggressive cleanup patterns for final cleanup
+                    CLEANUP_PATTERNS=(
+                      "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
+                      "^${{ env.SERVICE_NAME }}$" 
+                      "^${{ env.SERVICE_NAME }}-"
+                      "${{ env.SERVICE_NAME }}"
+                      ".*${{ env.SERVICE_NAME }}.*"  # Catch any device containing the service name
+                    )
                     
-                    echo "🔍 Searching for orphaned devices matching pattern: $SERVICE_PATTERN"
+                    TOTAL_REMOVED=0
+                    ALL_FOUND_DEVICES=""
                     
-                    DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$SERVICE_PATTERN" '
-                      .devices[]? | 
-                      select(
-                        (.hostname // .name | test($pattern; "i")) or 
-                        (.name // .hostname | test($pattern; "i"))
-                      ) | 
-                      .id // empty' | grep -v '^$' | head -20)
+                    # Collect all matching device IDs from all patterns
+                    for pattern in "${CLEANUP_PATTERNS[@]}"; do
+                      echo "🔍 Final scan for pattern: $pattern"
+                      
+                      DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$pattern" '
+                        .devices[]? | 
+                        select(
+                          (.hostname // .name | test($pattern; "i")) or 
+                          (.name // .hostname | test($pattern; "i"))
+                        ) | 
+                        .id // empty' | grep -v '^$')
+                      
+                      if [[ -n "$DEVICES" ]]; then
+                        ALL_FOUND_DEVICES="$ALL_FOUND_DEVICES $DEVICES"
+                      fi
+                    done
                     
-                    if [[ -n "$DEVICES" ]]; then
-                      echo "Found orphaned Tailscale devices to remove:"
-                      REMOVED_COUNT=0
-                      for device_id in $DEVICES; do
+                    # Remove duplicates and clean up the list
+                    UNIQUE_DEVICES=$(echo "$ALL_FOUND_DEVICES" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+                    
+                    if [[ -n "$UNIQUE_DEVICES" ]]; then
+                      echo "Found orphaned devices for final removal:"
+                      for device_id in $UNIQUE_DEVICES; do
                         if [[ -n "$device_id" ]]; then
                           # Get device details before removal
                           DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
+                          echo "🗑️ Final cleanup - removing: $device_id - $DEVICE_INFO"
+                          
+                          # Try both API endpoint formats aggressively
+                          DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
+                          REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                            -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                            "$DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
+                          
+                          REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                          
+                          if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
+                            echo "   ✅ Successfully removed"
+                            ((TOTAL_REMOVED++))
+                          else
+                            echo "   ⚠️ Trying alternative endpoint (HTTP: $REMOVE_CODE)..."
+                            # Try alternative API endpoint format
+                            if [[ -n "$TAILNET" ]]; then
+                              ALT_DELETE_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id"
+                            else
+                              ALT_DELETE_URL="https://api.tailscale.com/api/v2/devices/$device_id"
+                            fi
+                            
+                            ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                              -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                              "$ALT_DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
+                            
+                            ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                            if [[ "$ALT_REMOVE_CODE" == "200" || "$ALT_REMOVE_CODE" == "204" ]]; then
+                              echo "   ✅ Successfully removed via alternative endpoint"
+                              ((TOTAL_REMOVED++))
+                            else
+                              echo "   ❌ Could not remove device $device_id (Primary: $REMOVE_CODE, Alt: $ALT_REMOVE_CODE)"
+                            fi
+                          fi
+                          
+                          # Rate limiting: small delay between deletions
+                          sleep 1
+                        fi
+                      done
+                      echo "✅ Final Tailscale cleanup completed - removed $TOTAL_REMOVED devices total"
                           echo "🗑️ Removing orphaned Tailscale device: $device_id - $DEVICE_INFO"
                           
                           DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
@@ -1350,8 +1431,6 @@ jobs:
             
             # Inject environment variables into the script
             sed -i 's/\$ACTIONS_USER_PASSWORD/${{ secrets.ACTIONS_USER_PASSWORD }}/g' stage1-setup.sh
-            sed -i 's/\$NETDATA_CLAIM_TOKEN/${{ secrets.NETDATA_CLAIM_TOKEN }}/g' stage1-setup.sh
-            sed -i 's/\$NETDATA_CLAIM_ROOM/${{ secrets.NETDATA_CLAIM_ROOM }}/g' stage1-setup.sh
             sed -i 's/\$TAILSCALE_AUTH_KEY/${{ secrets.TAILSCALE_AUTH_KEY }}/g' stage1-setup.sh
           else
             echo "ℹ️ No service-specific stage1 script found, using generated script"
@@ -1455,43 +1534,8 @@ jobs:
             echo "⚠️ Failed to install base-devel, continuing without development tools..."
           }
           
-          echo "📊 Installing Netdata monitoring (optional)..."
-          # Try multiple methods to install Netdata, but don't fail if it doesn't work
-          NETDATA_INSTALLED=false
-          
-          # Method 1: Try official installer (most reliable for cloud features)
-          echo "🔄 Attempting Netdata installation via official installer..."
-          if timeout 180 bash -c "curl -Ss https://my-netdata.io/kickstart.sh | bash -s -- --dont-wait --disable-telemetry --non-interactive" 2>/dev/null; then
-            NETDATA_INSTALLED=true
-            echo "✅ Netdata installed via official installer"
-          else
-            echo "⚠️ Official Netdata installer failed or timed out"
-            
-            # Method 2: Try package manager (simpler, fewer dependencies)
-            echo "🔄 Attempting Netdata installation via package manager..."
-            if timeout 120 pacman -S --noconfirm netdata 2>/dev/null; then
-              NETDATA_INSTALLED=true
-              echo "✅ Netdata installed via package manager"
-            else
-              echo "⚠️ Package manager Netdata installation also failed"
-              
-              # Method 3: Try minimal installation (fallback)
-              echo "🔄 Attempting minimal Netdata installation..."
-              if timeout 60 bash -c "curl -Ss https://my-netdata.io/kickstart-static64.sh | sh -s -- --dont-wait --disable-telemetry" 2>/dev/null; then
-                NETDATA_INSTALLED=true
-                echo "✅ Netdata installed via static binary"
-              else
-                echo "⚠️ All Netdata installation methods failed"
-                echo "ℹ️ Server will continue without monitoring - can be added later"
-              fi
-            fi
-          fi
-          
-          if [[ "$NETDATA_INSTALLED" == "true" ]]; then
-            echo "📊 Netdata installation completed successfully"
-          else
-            echo "📊 Netdata installation skipped - monitoring will be disabled"
-          fi
+          echo "ℹ️ Skipping Netdata installation - using Docker-based monitoring"
+          # Netdata is now handled via Docker compose in the application deployment
           
           echo "👥 Creating users..."
           useradd -m -s /bin/bash jordan || true
@@ -1526,12 +1570,8 @@ jobs:
           systemctl enable tailscaled
           
           # Enable Netdata only if it was successfully installed
-          if [[ "$NETDATA_INSTALLED" == "true" ]] && systemctl list-unit-files | grep -q netdata; then
-            systemctl enable netdata
-            echo "✅ Netdata service enabled"
-          else
-            echo "ℹ️ Netdata not available - monitoring service skipped"
-          fi
+          # Netdata is now handled via Docker - skipping service enable
+          echo "ℹ️ Netdata monitoring handled via Docker - system service skipped"
           
           echo "� Creating post-reboot script..."
           cat > /usr/local/bin/stage2-post-reboot.sh << 'STAGE2EOF'
@@ -1702,21 +1742,7 @@ jobs:
           ls -la /home/${{ env.SERVICE_NAME }}_user/.ssh 2>/dev/null || echo "ℹ️ SSH directory not found for service user"
           
           echo "📊 Starting monitoring services..."
-          if systemctl list-unit-files | grep -q netdata && systemctl is-enabled netdata >/dev/null 2>&1; then
-            echo "🔄 Starting Netdata monitoring..."
-            systemctl start netdata || {
-              echo "⚠️ Failed to start Netdata, but continuing deployment..."
-            }
-            
-            # Verify Netdata is running
-            if systemctl is-active netdata >/dev/null 2>&1; then
-              echo "✅ Netdata monitoring active"
-            else
-              echo "⚠️ Netdata failed to start properly"
-            fi
-          else
-            echo "ℹ️ Netdata not installed - monitoring disabled"
-          fi
+          echo "ℹ️ Netdata monitoring handled via Docker - system service skipped"
           
           echo "✅ Stage 2 complete - server ready for service deployment"
           STAGE2EOF
@@ -1777,6 +1803,42 @@ jobs:
         id: stage2-setup
         run: |
           echo "🏗️ Stage 2: Verifying post-reboot setup..."
+          
+          # Wait for SSH to be available after reboot (servers take time to reboot)
+          echo "⏳ Waiting for server to come back online after reboot..."
+          SSH_READY=false
+          
+          # Give server more time to reboot and be ready
+          sleep 30  # Initial wait for reboot to complete
+          
+          for i in {1..20}; do
+            echo "Attempt $i/20: Testing SSH connection after reboot..."
+            
+            # Test basic connectivity first
+            if timeout 5 nc -zv ${{ steps.create-server.outputs.server_ip }} 22 2>/dev/null; then
+              # Now test SSH authentication
+              if timeout 10 ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready after reboot'" 2>/dev/null; then
+                echo "✅ SSH ready after reboot (attempt $i)"
+                SSH_READY=true
+                break
+              else
+                echo "SSH connection failed, retrying..."
+              fi
+            else
+              echo "Port 22 not ready, server may still be rebooting..."
+            fi
+            
+            sleep 15  # Wait longer between attempts for reboot
+          done
+          
+          if [[ "$SSH_READY" != "true" ]]; then
+            echo "❌ SSH failed to become ready after reboot"
+            echo "🔍 Attempting one final connection attempt with debug info..."
+            timeout 10 ssh -i ~/.ssh/linode_deployment_key -v -o StrictHostKeyChecking=no \
+              root@${{ steps.create-server.outputs.server_ip }} "echo 'Final attempt'" || true
+            exit 1
+          fi
           
           # Wait for stage2 service to complete - should be fast (30-60 seconds)
           echo "⏳ Waiting for stage2-setup service to complete (optimized timing)..."
