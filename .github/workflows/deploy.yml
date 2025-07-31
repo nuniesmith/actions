@@ -2058,6 +2058,10 @@ jobs:
           if [[ "${{ env.SERVICE_NAME }}" == "ats" ]]; then
             echo "🔐 Setting up SSL certificate management for ATS..."
             
+            # Create ATS directory and initial environment file
+            mkdir -p /opt/ats
+            touch /opt/ats/.env
+            
             # Install SSL management system
             if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
               chmod +x scripts/*.sh

@@ -56,4 +56,69 @@ else
 fi
 
 echo ""
-echo "🎯 Now try: cd /home/ats_user/ats && docker compose up -d"
+#!/bin/bash
+# Quick Docker Compose Fix Script
+# Can be called from any project to ensure Docker Compose works
+
+set -e
+
+# Colors for output
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Function to detect and set the correct Docker Compose command
+detect_compose_cmd() {
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        echo "docker-compose"
+    else
+        echo ""
+    fi
+}
+
+# Main function
+main() {
+    log_info "🔧 Quick Docker Compose compatibility check..."
+    
+    # Check if Docker is available
+    if ! command -v docker >/dev/null 2>&1; then
+        log_error "Docker is not installed or not in PATH"
+        exit 1
+    fi
+    
+    # Check if Docker daemon is running
+    if ! docker info >/dev/null 2>&1; then
+        log_error "Docker daemon is not running"
+        exit 1
+    fi
+    
+    # Detect compose command
+    COMPOSE_CMD=$(detect_compose_cmd)
+    
+    if [[ -z "$COMPOSE_CMD" ]]; then
+        log_error "No Docker Compose command available"
+        log_info "Please install Docker Compose plugin or standalone docker-compose"
+        exit 1
+    fi
+    
+    log_info "✅ Found Docker Compose: $COMPOSE_CMD"
+    
+    # Test basic functionality
+    if $COMPOSE_CMD --version >/dev/null 2>&1; then
+        log_info "✅ Docker Compose is working"
+        echo "$COMPOSE_CMD"
+        exit 0
+    else
+        log_error "Docker Compose command failed"
+        exit 1
+    fi
+}
+
+main "$@"
