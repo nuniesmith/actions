@@ -1343,6 +1343,19 @@ jobs:
         run: |
           echo "🏗️ Stage 1: Pre-reboot foundation setup..."
           
+          # Check if service has its own stage1 script
+          if [ -f "scripts/stage1-setup.sh" ]; then
+            echo "✅ Using service-specific stage1 script: scripts/stage1-setup.sh"
+            cp scripts/stage1-setup.sh stage1-setup.sh
+            
+            # Inject environment variables into the script
+            sed -i 's/\$ACTIONS_USER_PASSWORD/${{ secrets.ACTIONS_USER_PASSWORD }}/g' stage1-setup.sh
+            sed -i 's/\$NETDATA_CLAIM_TOKEN/${{ secrets.NETDATA_CLAIM_TOKEN }}/g' stage1-setup.sh
+            sed -i 's/\$NETDATA_CLAIM_ROOM/${{ secrets.NETDATA_CLAIM_ROOM }}/g' stage1-setup.sh
+            sed -i 's/\$TAILSCALE_AUTH_KEY/${{ secrets.TAILSCALE_AUTH_KEY }}/g' stage1-setup.sh
+          else
+            echo "ℹ️ No service-specific stage1 script found, using generated script"
+          
           cat > stage1-setup.sh << 'EOF'
           #!/bin/bash
           set -euo pipefail
@@ -1407,7 +1420,7 @@ jobs:
           
           echo "📦 Installing core packages with retry logic..."
           # Install essential packages first (most important ones)
-          CORE_PACKAGES="curl wget git docker docker-compose tailscale fail2ban sudo"
+          CORE_PACKAGES="curl wget git docker docker-compose tailscale fail2ban sudo rsync"
           
           echo "🔄 Installing essential packages: $CORE_PACKAGES"
           INSTALL_SUCCESS=false
@@ -1733,6 +1746,7 @@ jobs:
           echo "✅ Stage 1 complete - system ready for reboot"
           echo "NEEDS_REBOOT" > /tmp/stage1_status
           EOF
+          fi
           
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/stage1-setup.sh && /tmp/stage1-setup.sh"
