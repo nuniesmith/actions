@@ -1529,6 +1529,116 @@ jobs:
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no monitoring-setup.sh root@$SERVER_IP:/tmp/
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/monitoring-setup.sh && /tmp/monitoring-setup.sh"
 
+      - name: 🌐 Update DNS Records with Tailscale IP
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TAILSCALE_IP: ${{ needs.setup-infrastructure.outputs.tailscale_ip }}
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ZONE_ID != '' && env.TAILSCALE_IP != ''
+        run: |
+          echo "🌐 Updating DNS records to use Tailscale IP instead of public IP..."
+          
+          # Install dependencies
+          sudo apt-get update && sudo apt-get install -y curl jq >/dev/null 2>&1 || true
+          
+          # Set variables
+          TAILSCALE_IP="${{ needs.setup-infrastructure.outputs.tailscale_ip }}"
+          SERVICE_NAME="${{ env.SERVICE_NAME }}"
+          DOMAIN_NAME="${SERVICE_NAME}.7gram.xyz"
+          
+          echo "🔍 Service: $SERVICE_NAME"
+          echo "🔗 Tailscale IP: $TAILSCALE_IP"
+          echo "🌐 Domain: $DOMAIN_NAME"
+          
+          # Validate inputs
+          if [[ "$TAILSCALE_IP" == "pending" || -z "$TAILSCALE_IP" ]]; then
+            echo "⚠️ Tailscale IP not available, skipping DNS update"
+            exit 0
+          fi
+          
+          # Test Cloudflare API connectivity
+          echo "🔧 Testing Cloudflare API connectivity..."
+          API_TEST_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json")
+          
+          API_SUCCESS=$(echo "$API_TEST_RESPONSE" | jq -r '.success')
+          if [[ "$API_SUCCESS" != "true" ]]; then
+            echo "❌ Cloudflare API test failed:"
+            echo "$API_TEST_RESPONSE" | jq -r '.errors[]?.message // "Unknown error"'
+            exit 1
+          fi
+          
+          ZONE_NAME=$(echo "$API_TEST_RESPONSE" | jq -r '.result.name')
+          echo "✅ API connection successful - Zone: $ZONE_NAME"
+          
+          # Check for existing DNS record
+          echo "🔍 Checking for existing DNS record: $DOMAIN_NAME"
+          EXISTING_RESPONSE=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$DOMAIN_NAME&type=A" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json")
+          
+          RECORD_ID=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].id // empty')
+          CURRENT_IP=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].content // empty')
+          
+          echo "🔍 Current record ID: $RECORD_ID"
+          echo "🔍 Current IP: $CURRENT_IP"
+          
+          # Update or create DNS record with Tailscale IP
+          if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+            # Update existing record
+            echo "📝 Updating existing DNS record: $DOMAIN_NAME → $TAILSCALE_IP"
+            UPDATE_RESPONSE=$(curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"A\",
+                \"name\": \"$DOMAIN_NAME\",
+                \"content\": \"$TAILSCALE_IP\",
+                \"ttl\": 120,
+                \"proxied\": false,
+                \"comment\": \"Updated by GitHub Actions - Tailscale IP\"
+              }")
+          else
+            # Create new record
+            echo "➕ Creating new DNS record: $DOMAIN_NAME → $TAILSCALE_IP"
+            UPDATE_RESPONSE=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"A\",
+                \"name\": \"$DOMAIN_NAME\",
+                \"content\": \"$TAILSCALE_IP\",
+                \"ttl\": 120,
+                \"proxied\": false,
+                \"comment\": \"Created by GitHub Actions - Tailscale IP\"
+              }")
+          fi
+          
+          # Check result
+          UPDATE_SUCCESS=$(echo "$UPDATE_RESPONSE" | jq -r '.success')
+          if [[ "$UPDATE_SUCCESS" == "true" ]]; then
+            NEW_RECORD_ID=$(echo "$UPDATE_RESPONSE" | jq -r '.result.id')
+            echo "✅ DNS record updated successfully!"
+            echo "   🔗 Domain: $DOMAIN_NAME"
+            echo "   🌐 Tailscale IP: $TAILSCALE_IP"
+            echo "   🆔 Record ID: $NEW_RECORD_ID"
+            echo "   ⏱️ TTL: 120 seconds (fast propagation)"
+            echo ""
+            echo "🎯 Access your service via Tailscale VPN:"
+            echo "   • Direct: http://$TAILSCALE_IP"
+            echo "   • Domain: http://$DOMAIN_NAME (after DNS propagation)"
+            echo ""
+            echo "⚠️ Note: This domain only resolves within the Tailscale network for security"
+          else
+            echo "❌ DNS record update failed:"
+            echo "$UPDATE_RESPONSE" | jq -r '.errors[]?.message // "Unknown error"'
+            exit 1
+          fi
+
   # ============================================================================
   # Health Checks
   # ============================================================================
