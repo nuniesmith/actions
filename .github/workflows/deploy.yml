@@ -1335,8 +1335,46 @@ MIRROREOF
             pacman -S --noconfirm iptables-nft ufw
           }
           
-          echo "🐳 Starting Docker service..."
+          echo "� Configuring firewall before starting services..."
+          # Configure firewall first, before starting Docker
+          ufw --force reset
+          ufw default deny incoming
+          ufw default allow outgoing
+          ufw allow ssh
+          
+          # Initialize iptables chains that Docker expects
+          echo "🔧 Initializing iptables chains for Docker..."
+          iptables -t nat -N DOCKER 2>/dev/null || true
+          iptables -t filter -N DOCKER 2>/dev/null || true
+          iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+          iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+          iptables -t filter -N DOCKER-USER 2>/dev/null || true
+          
+          # Add basic Docker chains if they don't exist
+          iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
+            iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+          iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
+            iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+          iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
+            iptables -t filter -I FORWARD -j DOCKER-USER
+          iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || \
+            iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+          iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
+            iptables -t filter -A DOCKER-USER -j RETURN
+          
+          echo "�🐳 Starting Docker service..."
           systemctl start docker
+          
+          # Wait for Docker to be ready
+          echo "⏳ Waiting for Docker to be ready..."
+          for i in {1..10}; do
+            if docker info >/dev/null 2>&1; then
+              echo "✅ Docker is ready"
+              break
+            fi
+            echo "Attempt $i/10: Waiting for Docker..."
+            sleep 5
+          done
           
           echo "🔗 Starting and authenticating Tailscale..."
           systemctl start tailscaled
@@ -1430,11 +1468,8 @@ MIRROREOF
             echo "pending" > /tmp/tailscale_ip
           fi
           
-          echo "🔥 Configuring firewall after reboot..."
-          ufw --force reset
-          ufw default deny incoming
-          ufw default allow outgoing
-          ufw allow ssh
+          echo "🔥 Completing firewall configuration with Tailscale rules..."
+          # Add Tailscale-specific rules now that Tailscale is connected
           ufw allow in on tailscale0
           ufw --force enable
           
