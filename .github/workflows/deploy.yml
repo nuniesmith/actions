@@ -1153,17 +1153,17 @@ jobs:
           cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup || true
           
           # Use faster mirrors and optimize pacman configuration
-          cat > /etc/pacman.d/mirrorlist << 'MIRROREOF'
-## United States
-Server = https://america.mirror.pkgbuild.com/$repo/os/$arch
-Server = https://mirror.arizona.edu/archlinux/$repo/os/$arch
-Server = https://mirrors.ocf.berkeley.edu/archlinux/$repo/os/$arch
-Server = https://mirror.cs.pitt.edu/archlinux/$repo/os/$arch
-Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
-
-## Global CDN
-Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
-MIRROREOF
+          {
+            echo "## United States"
+            echo "Server = https://america.mirror.pkgbuild.com/\$repo/os/\$arch"
+            echo "Server = https://mirror.arizona.edu/archlinux/\$repo/os/\$arch"
+            echo "Server = https://mirrors.ocf.berkeley.edu/archlinux/\$repo/os/\$arch"
+            echo "Server = https://mirror.cs.pitt.edu/archlinux/\$repo/os/\$arch"
+            echo "Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch"
+            echo ""
+            echo "## Global CDN"
+            echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"
+          } > /etc/pacman.d/mirrorlist
           
           # Optimize pacman for faster downloads
           sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf || true
