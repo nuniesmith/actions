@@ -1,5 +1,17 @@
 name: 🚀 Unified Service Management
 
+# Docker Network Configuration:
+# This workflow sets up dedicated Docker networks with static IP ranges for each service:
+# - FKS:   172.20.0.0/16 (containers: 172.20.1.0/24)
+# - ATS:   172.21.0.0/16 (containers: 172.21.1.0/24)  
+# - Nginx: 172.22.0.0/16 (containers: 172.22.1.0/24)
+# 
+# Benefits:
+# - Predictable IP addresses for service communication
+# - Proper iptables rules for inter-service traffic
+# - Tailscale subnet advertisement for VPN access to all containers
+# - Network isolation between services while allowing controlled communication
+
 on:
   workflow_call:
     inputs:
@@ -65,6 +77,12 @@ on:
         required: false
         type: string
         default: '7gram.xyz'
+      
+      custom_domains:
+        description: 'Comma-separated list of custom domains for DNS updates (overrides defaults)'
+        required: false
+        type: string
+        default: ''
       
       # Feature Toggles
       enable_backups:
@@ -420,13 +438,159 @@ jobs:
           fi
 
   # ============================================================================
+  # Resource Cleanup (Optional, runs before deployment)
+  # ============================================================================
+  cleanup-old-resources:
+    name: 🧹 Cleanup Old Resources
+    runs-on: ubuntu-latest
+    needs: preflight-checks
+    if: |
+      needs.preflight-checks.outputs.should_deploy == 'true' && 
+      (github.event_name == 'push' || inputs.overwrite_server == true)
+    
+    steps:
+      - name: 🧹 Cleanup Tailscale and Linode Resources
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
+        run: |
+          echo "🧹 Cleaning up old ${{ env.SERVICE_NAME }} resources..."
+          
+          # Install dependencies
+          sudo apt-get update && sudo apt-get install -y curl jq
+          
+          # Cleanup Tailscale devices first
+          if [[ -n "$TAILSCALE_AUTH_KEY" && -n "$TAILSCALE_TAILNET" ]]; then
+            echo "🔗 Cleaning up old Tailscale devices..."
+            
+            # Remove old service devices using direct API
+            echo "🔍 Comprehensive cleanup of old ${{ env.SERVICE_NAME }} devices..."
+            DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+              "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices" 2>/dev/null || echo "CURL_FAILED")
+            
+            # Extract HTTP status code
+            HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+            DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+            
+            if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
+              # Multiple patterns to catch all service variants
+              CLEANUP_PATTERNS=(
+                "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
+                "^${{ env.SERVICE_NAME }}$" 
+                "^${{ env.SERVICE_NAME }}-"
+                "${{ env.SERVICE_NAME }}"
+              )
+              
+              TOTAL_REMOVED=0
+              ALL_FOUND_DEVICES=""
+              
+              # Collect all matching device IDs
+              for pattern in "${CLEANUP_PATTERNS[@]}"; do
+                echo "🔍 Searching for pattern: $pattern"
+                
+                DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$pattern" '
+                  .devices[]? | 
+                  select(
+                    (.hostname // .name | test($pattern; "i")) or 
+                    (.name // .hostname | test($pattern; "i"))
+                  ) | 
+                  .id // empty' | grep -v '^$')
+                
+                if [[ -n "$DEVICES" ]]; then
+                  ALL_FOUND_DEVICES="$ALL_FOUND_DEVICES $DEVICES"
+                fi
+              done
+              
+              # Remove duplicates
+              UNIQUE_DEVICES=$(echo "$ALL_FOUND_DEVICES" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+              
+              if [[ -n "$UNIQUE_DEVICES" ]]; then
+                echo "Found ${{ env.SERVICE_NAME }} devices to remove..."
+                for device_id in $UNIQUE_DEVICES; do
+                  if [[ -n "$device_id" ]]; then
+                    DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
+                    echo "🗑️ Removing Tailscale device: $device_id - $DEVICE_INFO"
+                    
+                    # Try primary endpoint
+                    REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                      -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                      "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "CURL_FAILED")
+                    
+                    REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                    
+                    if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
+                      echo "   ✅ Successfully removed"
+                      ((TOTAL_REMOVED++))
+                    else
+                      echo "   ⚠️ Trying alternative endpoint..."
+                      # Try alternative endpoint
+                      ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                        -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                        "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices/$device_id" 2>/dev/null || echo "CURL_FAILED")
+                      
+                      ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                      if [[ "$ALT_REMOVE_CODE" == "200" || "$ALT_REMOVE_CODE" == "204" ]]; then
+                        echo "   ✅ Successfully removed via alternative endpoint"
+                        ((TOTAL_REMOVED++))
+                      else
+                        echo "   ❌ Failed to remove device $device_id"
+                      fi
+                    fi
+                    sleep 1
+                  fi
+                done
+                echo "✅ ${{ env.SERVICE_NAME }} Tailscale cleanup completed - removed $TOTAL_REMOVED devices"
+              else
+                echo "No ${{ env.SERVICE_NAME }} devices found to remove"
+              fi
+            else
+              echo "⚠️ No devices array in Tailscale response or API error"
+            fi
+          else
+            echo "⚠️ Tailscale API credentials not available"
+          fi
+          
+          # Cleanup Linode servers
+          if [[ -n "$LINODE_CLI_TOKEN" ]]; then
+            echo "🖥️ Cleaning up old Linode servers..."
+            
+            # Install linode-cli
+            pip install linode-cli
+            
+            # Configure linode-cli
+            echo "[DEFAULT]
+          token = $LINODE_CLI_TOKEN" > ~/.linode-cli
+            
+            # Remove old service servers
+            echo "🔍 Looking for old ${{ env.SERVICE_NAME }} servers..."
+            OLD_SERVERS=$(linode-cli linodes list --json | jq -r --arg service "${{ env.SERVICE_NAME }}" '.[] | select(.label | startswith($service)) | .id')
+            
+            for server_id in $OLD_SERVERS; do
+              if [[ -n "$server_id" ]]; then
+                echo "🗑️ Removing old Linode server: $server_id (${{ env.SERVICE_NAME }})"
+                linode-cli linodes delete "$server_id" --json || echo "Failed to remove server $server_id"
+                sleep 10
+              fi
+            done
+          else
+            echo "⚠️ Linode CLI token not available"
+          fi
+          
+          echo "✅ Cleanup completed for ${{ env.SERVICE_NAME }}"
+
+  # ============================================================================
   # Code Testing (Optional)
   # ============================================================================
   run-tests:
     name: 🧪 Run Tests
     runs-on: ubuntu-latest
-    needs: preflight-checks
-    if: needs.preflight-checks.outputs.should_deploy == 'true' && inputs.skip_tests == false
+    needs: [preflight-checks, cleanup-old-resources]
+    if: |
+      always() &&
+      needs.preflight-checks.outputs.should_deploy == 'true' && 
+      inputs.skip_tests == false &&
+      (needs.cleanup-old-resources.result == 'success' || needs.cleanup-old-resources.result == 'skipped')
     
     steps:
       - name: 📥 Checkout repository
@@ -488,12 +652,13 @@ jobs:
   build-docker-api:
     name: 🐳 Build API Docker Images
     runs-on: ubuntu-latest
-    needs: [preflight-checks, run-tests]
+    needs: [preflight-checks, cleanup-old-resources, run-tests]
     if: |
       always() && 
       needs.preflight-checks.outputs.should_deploy == 'true' && 
       inputs.skip_docker_build == false && 
       needs.preflight-checks.outputs.docker_build_needed == 'true' &&
+      (needs.cleanup-old-resources.result == 'success' || needs.cleanup-old-resources.result == 'skipped') &&
       (needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped')
     
     steps:
@@ -573,12 +738,13 @@ jobs:
   build-docker-web:
     name: 🌐 Build Web Docker Images  
     runs-on: ubuntu-latest
-    needs: [preflight-checks, run-tests]
+    needs: [preflight-checks, cleanup-old-resources, run-tests]
     if: |
       always() && 
       needs.preflight-checks.outputs.should_deploy == 'true' && 
       inputs.skip_docker_build == false && 
       needs.preflight-checks.outputs.docker_build_needed == 'true' &&
+      (needs.cleanup-old-resources.result == 'success' || needs.cleanup-old-resources.result == 'skipped') &&
       (needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped')
     
     steps:
@@ -658,12 +824,13 @@ jobs:
   build-docker-auth:
     name: 🔐 Build Auth Docker Images
     runs-on: ubuntu-latest
-    needs: [preflight-checks, run-tests]
+    needs: [preflight-checks, cleanup-old-resources, run-tests]
     if: |
       always() && 
       needs.preflight-checks.outputs.should_deploy == 'true' && 
       inputs.skip_docker_build == false && 
       needs.preflight-checks.outputs.docker_build_needed == 'true' &&
+      (needs.cleanup-old-resources.result == 'success' || needs.cleanup-old-resources.result == 'skipped') &&
       (needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped')
     
     steps:
@@ -730,11 +897,12 @@ jobs:
   destroy-existing-server:
     name: 💥 Destroy Existing Server
     runs-on: ubuntu-latest
-    needs: [preflight-checks, build-docker-api, build-docker-web, build-docker-auth]
+    needs: [preflight-checks, cleanup-old-resources, build-docker-api, build-docker-web, build-docker-auth]
     if: |
       always() && 
       needs.preflight-checks.outputs.should_overwrite_server == 'true' &&
       needs.preflight-checks.outputs.destroy_confirmed == 'true' &&
+      (needs.cleanup-old-resources.result == 'success' || needs.cleanup-old-resources.result == 'skipped') &&
       (needs.build-docker-api.result == 'success' || needs.build-docker-api.result == 'skipped') &&
       (needs.build-docker-web.result == 'success' || needs.build-docker-web.result == 'skipped') &&
       (needs.build-docker-auth.result == 'success' || needs.build-docker-auth.result == 'skipped')
@@ -1193,10 +1361,11 @@ jobs:
     name: 🏗️ Setup Infrastructure
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [preflight-checks, destroy-existing-server, build-docker-api, build-docker-web, build-docker-auth]
+    needs: [preflight-checks, cleanup-old-resources, destroy-existing-server, build-docker-api, build-docker-web, build-docker-auth]
     if: |
       always() && 
       needs.preflight-checks.outputs.should_deploy == 'true' &&
+      (needs.cleanup-old-resources.result == 'success' || needs.cleanup-old-resources.result == 'skipped') &&
       (needs.destroy-existing-server.result == 'success' || needs.destroy-existing-server.result == 'skipped') &&
       (needs.build-docker-api.result == 'success' || needs.build-docker-api.result == 'skipped') &&
       (needs.build-docker-web.result == 'success' || needs.build-docker-web.result == 'skipped') &&
@@ -1548,16 +1717,77 @@ jobs:
               
               chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
               
+              # Also install to /usr/local/bin for backward compatibility
+              cp /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              
+              # Create symlink for easy access
+              ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose 2>/dev/null || true
+              
               # Verify installation
               if /usr/local/lib/docker/cli-plugins/docker-compose version &>/dev/null; then
                 echo "✅ Docker Compose plugin installed successfully"
+                /usr/local/lib/docker/cli-plugins/docker-compose version
               else
                 echo "⚠️ Docker Compose plugin installation may have issues"
+              fi
+              
+              # Also verify standalone docker-compose command
+              if docker-compose --version &>/dev/null; then
+                echo "✅ Standalone docker-compose command also available"
+                docker-compose --version
               fi
             fi
           else
             echo "✅ Docker Compose plugin already available"
+            docker compose version
           fi
+          
+          echo "🌐 Setting up Docker networks with static IPs for services..."
+          # Create dedicated networks for each service with predictable IP ranges
+          # This allows proper iptables rules and Tailscale subnet sharing
+          
+          # Start Docker service temporarily to create networks
+          systemctl start docker
+          sleep 5
+          
+          # Remove any existing networks that might conflict
+          docker network rm fks-network 2>/dev/null || true
+          docker network rm ats-network 2>/dev/null || true  
+          docker network rm nginx-network 2>/dev/null || true
+          
+          # Create service-specific networks with static IP ranges
+          echo "🔧 Creating FKS network (172.20.0.0/16)..."
+          docker network create \
+            --driver bridge \
+            --subnet=172.20.0.0/16 \
+            --ip-range=172.20.1.0/24 \
+            --gateway=172.20.0.1 \
+            fks-network
+          
+          echo "🔧 Creating ATS network (172.21.0.0/16)..."
+          docker network create \
+            --driver bridge \
+            --subnet=172.21.0.0/16 \
+            --ip-range=172.21.1.0/24 \
+            --gateway=172.21.0.1 \
+            ats-network
+          
+          echo "🔧 Creating Nginx network (172.22.0.0/16)..."
+          docker network create \
+            --driver bridge \
+            --subnet=172.22.0.0/16 \
+            --ip-range=172.22.1.0/24 \
+            --gateway=172.22.0.1 \
+            nginx-network
+          
+          # Stop Docker service (will be started properly in Stage 2)
+          systemctl stop docker
+          
+          echo "✅ Docker networks configured with static IP ranges"
+          echo "   📍 FKS:   172.20.0.0/16 (containers: 172.20.1.0/24)"
+          echo "   📍 ATS:   172.21.0.0/16 (containers: 172.21.1.0/24)" 
+          echo "   📍 Nginx: 172.22.0.0/16 (containers: 172.22.1.0/24)"
           
           # Try to install base-devel (development tools) - optional
           echo "📦 Installing development tools (optional)..."
@@ -1644,7 +1874,7 @@ jobs:
           iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
             iptables -t filter -A DOCKER-USER -j RETURN
           
-          echo "�🐳 Starting Docker service..."
+          echo "🐳 Starting Docker service..."
           systemctl start docker
           
           # Wait for Docker to be ready
@@ -1657,6 +1887,127 @@ jobs:
             echo "Attempt $i/10: Waiting for Docker..."
             sleep 5
           done
+          
+          echo "🔧 Ensuring Docker Compose is available after reboot..."
+          # Verify Docker Compose is still available after reboot
+          if ! docker compose version &>/dev/null && ! docker-compose --version &>/dev/null; then
+            echo "⚠️ Docker Compose not found after reboot, reinstalling..."
+            
+            # Recreate symlinks and paths
+            if [[ -f "/usr/local/lib/docker/cli-plugins/docker-compose" ]]; then
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              cp /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose 2>/dev/null || true
+            else
+              echo "🔧 Reinstalling Docker Compose..."
+              mkdir -p /usr/local/lib/docker/cli-plugins
+              COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d'"' -f4 | sed 's/v//')
+              curl -SL "https://github.com/docker/compose/releases/download/v$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              cp /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose 2>/dev/null || true
+            fi
+          fi
+          
+          # Verify Docker Compose is working
+          echo "🔍 Verifying Docker Compose installation..."
+          if docker compose version &>/dev/null; then
+            echo "✅ 'docker compose' command working"
+            docker compose version
+          elif docker-compose --version &>/dev/null; then
+            echo "✅ 'docker-compose' command working"
+            docker-compose --version
+          else
+            echo "❌ Docker Compose installation failed"
+          fi
+          
+          echo "🌐 Recreating Docker networks with static IPs..."
+          # Recreate the service networks (they may not persist through reboot)
+          docker network rm fks-network 2>/dev/null || true
+          docker network rm ats-network 2>/dev/null || true  
+          docker network rm nginx-network 2>/dev/null || true
+          
+          # Create service-specific networks with static IP ranges
+          echo "🔧 Creating FKS network (172.20.0.0/16)..."
+          docker network create \
+            --driver bridge \
+            --subnet=172.20.0.0/16 \
+            --ip-range=172.20.1.0/24 \
+            --gateway=172.20.0.1 \
+            fks-network
+          
+          echo "🔧 Creating ATS network (172.21.0.0/16)..."
+          docker network create \
+            --driver bridge \
+            --subnet=172.21.0.0/16 \
+            --ip-range=172.21.1.0/24 \
+            --gateway=172.21.0.1 \
+            ats-network
+          
+          echo "🔧 Creating Nginx network (172.22.0.0/16)..."
+          docker network create \
+            --driver bridge \
+            --subnet=172.22.0.0/16 \
+            --ip-range=172.22.1.0/24 \
+            --gateway=172.22.0.1 \
+            nginx-network
+          
+          echo "🔧 Configuring iptables rules for Docker networks..."
+          # Allow traffic between service networks for inter-service communication
+          iptables -I DOCKER-USER -s 172.20.0.0/16 -d 172.21.0.0/16 -j ACCEPT 2>/dev/null || true  # FKS → ATS
+          iptables -I DOCKER-USER -s 172.20.0.0/16 -d 172.22.0.0/16 -j ACCEPT 2>/dev/null || true  # FKS → Nginx
+          iptables -I DOCKER-USER -s 172.21.0.0/16 -d 172.20.0.0/16 -j ACCEPT 2>/dev/null || true  # ATS → FKS
+          iptables -I DOCKER-USER -s 172.21.0.0/16 -d 172.22.0.0/16 -j ACCEPT 2>/dev/null || true  # ATS → Nginx
+          iptables -I DOCKER-USER -s 172.22.0.0/16 -d 172.20.0.0/16 -j ACCEPT 2>/dev/null || true  # Nginx → FKS
+          iptables -I DOCKER-USER -s 172.22.0.0/16 -d 172.21.0.0/16 -j ACCEPT 2>/dev/null || true  # Nginx → ATS
+          
+          echo "✅ Docker networks configured with static IP ranges"
+          echo "   📍 FKS:   172.20.0.0/16 (containers: 172.20.1.0/24)"
+          echo "   📍 ATS:   172.21.0.0/16 (containers: 172.21.1.0/24)" 
+          echo "   📍 Nginx: 172.22.0.0/16 (containers: 172.22.1.0/24)"
+          
+          echo "📝 Creating network configuration file for services..."
+          # Create a configuration file that services can use for network setup
+          cat > /opt/docker-networks.conf << 'NETWORKS_EOF'
+          # Docker Network Configuration for Services
+          # This file is sourced by service start scripts to use correct networks
+          
+          # Network Names and Subnets
+          FKS_NETWORK_NAME="fks-network"
+          FKS_NETWORK_SUBNET="172.20.0.0/16"
+          FKS_NETWORK_GATEWAY="172.20.0.1"
+          FKS_CONTAINER_RANGE="172.20.1.0/24"
+          
+          ATS_NETWORK_NAME="ats-network"
+          ATS_NETWORK_SUBNET="172.21.0.0/16"
+          ATS_NETWORK_GATEWAY="172.21.0.1"
+          ATS_CONTAINER_RANGE="172.21.1.0/24"
+          
+          NGINX_NETWORK_NAME="nginx-network"
+          NGINX_NETWORK_SUBNET="172.22.0.0/16"
+          NGINX_NETWORK_GATEWAY="172.22.0.1"
+          NGINX_CONTAINER_RANGE="172.22.1.0/24"
+          
+          # Service-specific IP assignments (for static IPs if needed)
+          FKS_API_IP="172.20.1.10"
+          FKS_WEB_IP="172.20.1.11"
+          FKS_AUTH_IP="172.20.1.12"
+          
+          ATS_GAME_IP="172.21.1.10"
+          ATS_WEB_IP="172.21.1.11"
+          
+          NGINX_PROXY_IP="172.22.1.10"
+          NGINX_WEB_IP="172.22.1.11"
+          
+          # All networks (for Tailscale advertisement)
+          ALL_DOCKER_SUBNETS="172.17.0.0/16,172.20.0.0/16,172.21.0.0/16,172.22.0.0/16"
+          NETWORKS_EOF
+          
+          chmod 644 /opt/docker-networks.conf
+          echo "✅ Network configuration saved to /opt/docker-networks.conf"
           
           echo "🔗 Starting and authenticating Tailscale..."
           systemctl start tailscaled
@@ -1683,40 +2034,53 @@ jobs:
             echo "⚠️ Warning: Auth key doesn't start with 'tskey-' - this may not be a valid key"
           fi
           
-          echo "🔗 Authenticating with Tailscale..."
+          echo "🔗 Authenticating with Tailscale and advertising Docker subnets..."
           # Multiple authentication attempts with different strategies
           TAILSCALE_CONNECTED=false
           
-          # Attempt 1: Standard connection
-          echo "🔄 Attempt 1: Standard Tailscale connection..."
-          if tailscale up --authkey="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --timeout=180s; then
+          # Define all Docker subnets to advertise
+          DOCKER_SUBNETS="172.17.0.0/16,172.20.0.0/16,172.21.0.0/16,172.22.0.0/16"
+          echo "📍 Will advertise Docker subnets: $DOCKER_SUBNETS"
+          
+          # Attempt 1: Standard connection with subnet advertisement
+          echo "🔄 Attempt 1: Standard Tailscale connection with Docker subnets..."
+          if tailscale up --authkey="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --advertise-routes="$DOCKER_SUBNETS" --timeout=180s; then
             TAILSCALE_CONNECTED=true
-            echo "✅ Tailscale connected on first attempt"
+            echo "✅ Tailscale connected on first attempt with Docker subnets"
           else
             echo "⚠️ First attempt failed, trying alternative methods..."
             
-            # Attempt 2: Reset and reconnect
-            echo "🔄 Attempt 2: Reset and reconnect..."
+            # Attempt 2: Reset and reconnect with tags
+            echo "🔄 Attempt 2: Reset and reconnect with server tags..."
             tailscale logout 2>/dev/null || true
             sleep 5
             
-            if tailscale up --authkey="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --advertise-tags=tag:server --timeout=180s; then
+            if tailscale up --authkey="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --advertise-routes="$DOCKER_SUBNETS" --advertise-tags=tag:server --timeout=180s; then
               TAILSCALE_CONNECTED=true
-              echo "✅ Tailscale connected on second attempt"
+              echo "✅ Tailscale connected on second attempt with Docker subnets"
             else
               echo "⚠️ Second attempt failed, trying without hostname..."
               
-              # Attempt 3: Without custom hostname
-              echo "🔄 Attempt 3: Connection without custom hostname..."
-              if tailscale up --authkey="$AUTH_KEY" --accept-routes --timeout=180s; then
+              # Attempt 3: Without custom hostname but with subnets
+              echo "🔄 Attempt 3: Connection without custom hostname but with Docker subnets..."
+              if tailscale up --authkey="$AUTH_KEY" --accept-routes --advertise-routes="$DOCKER_SUBNETS" --timeout=180s; then
                 TAILSCALE_CONNECTED=true
-                echo "✅ Tailscale connected without custom hostname"
+                echo "✅ Tailscale connected without custom hostname but with Docker subnets"
               else
-                echo "❌ All Tailscale connection attempts failed"
-                echo "🔍 Tailscale status:"
-                tailscale status 2>&1 || echo "Status command failed"
-                echo "🔍 Tailscaled logs:"
-                journalctl -u tailscaled --no-pager -l --since='5 minutes ago' | tail -20 || echo "No logs available"
+                echo "⚠️ Third attempt failed, trying basic connection without subnets..."
+                
+                # Attempt 4: Basic connection without subnets as last resort
+                echo "🔄 Attempt 4: Basic connection without Docker subnets..."
+                if tailscale up --authkey="$AUTH_KEY" --accept-routes --timeout=180s; then
+                  TAILSCALE_CONNECTED=true
+                  echo "✅ Tailscale connected with basic configuration (subnets can be added later)"
+                else
+                  echo "❌ All Tailscale connection attempts failed"
+                  echo "🔍 Tailscale status:"
+                  tailscale status 2>&1 || echo "Status command failed"
+                  echo "🔍 Tailscaled logs:"
+                  journalctl -u tailscaled --no-pager -l --since='5 minutes ago' | tail -20 || echo "No logs available"
+                fi
               fi
             fi
           fi
@@ -1849,10 +2213,10 @@ jobs:
           fi
           
           # Wait for Stage 2 systemd service to complete
-          echo "⏳ Waiting for nginx-stage2.service to complete..."
+          echo "⏳ Waiting for stage2-setup.service to complete..."
           for i in {1..12}; do  # Wait up to 3 minutes (12 * 15s)
             SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-              "systemctl is-active nginx-stage2.service 2>/dev/null || echo 'inactive'")
+              "systemctl is-active stage2-setup.service 2>/dev/null || echo 'inactive'")
             
             echo "Attempt $i/12: Stage 2 service status: $SERVICE_STATUS"
             
@@ -1860,7 +2224,7 @@ jobs:
             if [[ "$SERVICE_STATUS" == "inactive" ]]; then
               # Check if it completed successfully
               EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-                "systemctl show nginx-stage2.service --property=ExecMainStatus --value 2>/dev/null || echo 'unknown'")
+                "systemctl show stage2-setup.service --property=ExecMainStatus --value 2>/dev/null || echo 'unknown'")
               
               if [[ "$EXIT_STATUS" == "0" ]]; then
                 echo "✅ Stage 2 service completed successfully"
@@ -1869,7 +2233,7 @@ jobs:
                 echo "⚠️ Stage 2 service completed with exit status: $EXIT_STATUS"
                 # Show logs for debugging
                 ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-                  "journalctl -u nginx-stage2.service --no-pager -l --since='5 minutes ago'" || true
+                  "journalctl -u stage2-setup.service --no-pager -l --since='5 minutes ago'" || true
                 break
               fi
             fi
@@ -2031,31 +2395,58 @@ jobs:
             sshpass -e ssh -o StrictHostKeyChecking=no actions_user@$SERVER_IP "sudo chmod +x /tmp/deploy-script.sh && sudo /tmp/deploy-script.sh"
           fi
 
-      - name: 🌐 Update DNS Records with Tailscale IP
+      - name: 🌐 Update DNS Records with Service IPs
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           TAILSCALE_IP: ${{ needs.setup-infrastructure.outputs.tailscale_ip }}
-        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ZONE_ID != '' && env.TAILSCALE_IP != ''
+          PUBLIC_IP: ${{ needs.setup-infrastructure.outputs.server_ip }}
+          CUSTOM_DOMAINS: ${{ inputs.custom_domains }}
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ZONE_ID != ''
         run: |
-          echo "🌐 Updating DNS records to use Tailscale IP instead of public IP..."
+          echo "🌐 Updating DNS records for ${{ env.SERVICE_NAME }}..."
           
           # Install dependencies
           sudo apt-get update && sudo apt-get install -y curl jq >/dev/null 2>&1 || true
           
-          # Set variables
-          TAILSCALE_IP="${{ needs.setup-infrastructure.outputs.tailscale_ip }}"
-          SERVICE_NAME="${{ env.SERVICE_NAME }}"
-          DOMAIN_NAME="${SERVICE_NAME}.7gram.xyz"
+          # Determine which IP to use (prefer Tailscale, fallback to public)
+          if [[ "$TAILSCALE_IP" != "pending" && -n "$TAILSCALE_IP" ]]; then
+            UPDATE_IP="$TAILSCALE_IP"
+            echo "🔗 Using Tailscale IP: $UPDATE_IP"
+          else
+            UPDATE_IP="$PUBLIC_IP"
+            echo "🌐 Using public IP: $UPDATE_IP"
+          fi
           
-          echo "🔍 Service: $SERVICE_NAME"
-          echo "🔗 Tailscale IP: $TAILSCALE_IP"
-          echo "🌐 Domain: $DOMAIN_NAME"
-          
-          # Validate inputs
-          if [[ "$TAILSCALE_IP" == "pending" || -z "$TAILSCALE_IP" ]]; then
-            echo "⚠️ Tailscale IP not available, skipping DNS update"
-            exit 0
+          # Dynamic domain configuration based on service
+          declare -a DOMAINS
+          if [[ -n "$CUSTOM_DOMAINS" ]]; then
+            # Use custom domains if provided
+            IFS=',' read -ra DOMAINS <<< "$CUSTOM_DOMAINS"
+            echo "� Using custom domains: ${DOMAINS[*]}"
+          else
+            # Auto-detect domains based on service name
+            case "${{ env.SERVICE_NAME }}" in
+              "nginx")
+                DOMAINS=("7gram.xyz" "www.7gram.xyz" "fkstrading.xyz" "admin.7gram.xyz" "monitor.7gram.xyz" "nodes.7gram.xyz")
+                ;;
+              "fks-auth")
+                DOMAINS=("auth.7gram.xyz" "identity.7gram.xyz")
+                ;;
+              "fks-api")
+                DOMAINS=("api.7gram.xyz" "data.7gram.xyz" "worker.7gram.xyz")
+                ;;
+              "fks-web")
+                DOMAINS=("fkstrading.xyz" "www.7gram.xyz")
+                ;;
+              "ats")
+                DOMAINS=("ats.7gram.xyz" "game.7gram.xyz")
+                ;;
+              *)
+                DOMAINS=("${{ env.SERVICE_NAME }}.${{ inputs.domain_suffix }}")
+                ;;
+            esac
+            echo "🏷️ Auto-detected domains for ${{ env.SERVICE_NAME }}: ${DOMAINS[*]}"
           fi
           
           # Test Cloudflare API connectivity
@@ -2074,63 +2465,87 @@ jobs:
           ZONE_NAME=$(echo "$API_TEST_RESPONSE" | jq -r '.result.name')
           echo "✅ API connection successful - Zone: $ZONE_NAME"
           
-          # Check for existing DNS record
-          echo "🔍 Checking for existing DNS record: $DOMAIN_NAME"
-          EXISTING_RESPONSE=$(curl -s -X GET \
-            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$DOMAIN_NAME&type=A" \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            -H "Content-Type: application/json")
+          # Update DNS records for all domains
+          UPDATED_COUNT=0
+          FAILED_COUNT=0
           
-          RECORD_ID=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].id // empty')
-          CURRENT_IP=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].content // empty')
-          
-          echo "🔍 Current record ID: $RECORD_ID"
-          echo "🔍 Current IP: $CURRENT_IP"
-          
-          # Update or create DNS record with Tailscale IP
-          if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
-            # Update existing record
-            echo "📝 Updating existing DNS record: $DOMAIN_NAME → $TAILSCALE_IP"
-            UPDATE_RESPONSE=$(curl -s -X PUT \
-              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$RECORD_ID" \
-              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "{
-                \"type\": \"A\",
-                \"name\": \"$DOMAIN_NAME\",
-                \"content\": \"$TAILSCALE_IP\",
-                \"ttl\": 120,
-                \"proxied\": false,
-                \"comment\": \"Updated by GitHub Actions - Tailscale IP\"
-              }")
-          else
-            # Create new record
-            echo "➕ Creating new DNS record: $DOMAIN_NAME → $TAILSCALE_IP"
-            UPDATE_RESPONSE=$(curl -s -X POST \
-              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
-              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "{
-                \"type\": \"A\",
-                \"name\": \"$DOMAIN_NAME\",
-                \"content\": \"$TAILSCALE_IP\",
-                \"ttl\": 120,
-                \"proxied\": false,
-                \"comment\": \"Created by GitHub Actions - Tailscale IP\"
-              }")
-          fi
-          
-          # Check result
-          UPDATE_SUCCESS=$(echo "$UPDATE_RESPONSE" | jq -r '.success')
-          if [[ "$UPDATE_SUCCESS" == "true" ]]; then
-            NEW_RECORD_ID=$(echo "$UPDATE_RESPONSE" | jq -r '.result.id')
-            echo "✅ DNS record updated successfully!"
-            echo "   🔗 Domain: $DOMAIN_NAME"
-            echo "   🌐 Tailscale IP: $TAILSCALE_IP"
-            echo "   🆔 Record ID: $NEW_RECORD_ID"
-            echo "   ⏱️ TTL: 120 seconds (fast propagation)"
+          for DOMAIN_NAME in "${DOMAINS[@]}"; do
             echo ""
-            echo "🎯 Access your service via Tailscale VPN:"
+            echo "� Processing domain: $DOMAIN_NAME"
+            
+            # Check for existing DNS record
+            EXISTING_RESPONSE=$(curl -s -X GET \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$DOMAIN_NAME&type=A" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json")
+            
+            RECORD_ID=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].id // empty')
+            CURRENT_IP=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].content // empty')
+            
+            if [[ "$CURRENT_IP" == "$UPDATE_IP" ]]; then
+              echo "✅ $DOMAIN_NAME already points to $UPDATE_IP (no update needed)"
+              ((UPDATED_COUNT++))
+              continue
+            fi
+            
+            # Update or create DNS record
+            if [[ -n "$RECORD_ID" && "$RECORD_ID" != "null" ]]; then
+              # Update existing record
+              echo "📝 Updating existing DNS record: $DOMAIN_NAME ($CURRENT_IP → $UPDATE_IP)"
+              UPDATE_RESPONSE=$(curl -s -X PUT \
+                "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$RECORD_ID" \
+                -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "{
+                  \"type\": \"A\",
+                  \"name\": \"$DOMAIN_NAME\",
+                  \"content\": \"$UPDATE_IP\",
+                  \"ttl\": 120,
+                  \"proxied\": false,
+                  \"comment\": \"Updated by GitHub Actions for ${{ env.SERVICE_NAME }}\"
+                }")
+            else
+              # Create new record
+              echo "➕ Creating new DNS record: $DOMAIN_NAME → $UPDATE_IP"
+              UPDATE_RESPONSE=$(curl -s -X POST \
+                "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+                -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "{
+                  \"type\": \"A\",
+                  \"name\": \"$DOMAIN_NAME\",
+                  \"content\": \"$UPDATE_IP\",
+                  \"ttl\": 120,
+                  \"proxied\": false,
+                  \"comment\": \"Created by GitHub Actions for ${{ env.SERVICE_NAME }}\"
+                }")
+            fi
+            
+            # Check result
+            UPDATE_SUCCESS=$(echo "$UPDATE_RESPONSE" | jq -r '.success')
+            if [[ "$UPDATE_SUCCESS" == "true" ]]; then
+              NEW_RECORD_ID=$(echo "$UPDATE_RESPONSE" | jq -r '.result.id')
+              echo "✅ $DOMAIN_NAME updated successfully (Record ID: $NEW_RECORD_ID)"
+              ((UPDATED_COUNT++))
+            else
+              echo "❌ Failed to update $DOMAIN_NAME:"
+              echo "$UPDATE_RESPONSE" | jq -r '.errors[]?.message // "Unknown error"'
+              ((FAILED_COUNT++))
+            fi
+            
+            sleep 1  # Rate limiting
+          done
+          
+          echo ""
+          echo "📊 DNS Update Summary for ${{ env.SERVICE_NAME }}:"
+          echo "   ✅ Successfully updated: $UPDATED_COUNT domains"
+          echo "   ❌ Failed to update: $FAILED_COUNT domains"
+          echo "   🔗 Target IP: $UPDATE_IP"
+          echo "   ⏱️ TTL: 120 seconds (fast propagation)"
+          
+          if [[ $FAILED_COUNT -gt 0 ]]; then
+            echo "⚠️ Some DNS updates failed - check logs above"
+          fi
             echo "   • Direct: http://$TAILSCALE_IP"
             echo "   • Domain: http://$DOMAIN_NAME (after DNS propagation)"
             echo ""
