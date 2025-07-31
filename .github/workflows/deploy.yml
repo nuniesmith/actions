@@ -1910,11 +1910,22 @@ jobs:
           
           SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
           
-          # Create the SSH private key file
-          echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/linode_deployment_key
-          chmod 600 ~/.ssh/linode_deployment_key
+          # Ensure SSH directory exists
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           
-          # Install sshpass for password authentication as backup
+          # Try to create the SSH private key file if the key is available
+          if [[ -n "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" ]]; then
+            echo "🔑 Setting up SSH key authentication..."
+            echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/linode_deployment_key
+            chmod 600 ~/.ssh/linode_deployment_key
+            SSH_KEY_AVAILABLE=true
+          else
+            echo "⚠️ SSH key not available, will use password authentication"
+            SSH_KEY_AVAILABLE=false
+          fi
+          
+          # Install sshpass for password authentication fallback
           sudo apt-get update && sudo apt-get install -y sshpass >/dev/null 2>&1 || true
           
           # Create deployment script
@@ -2007,9 +2018,18 @@ jobs:
           echo "✅ Service deployment completed successfully"
           EOF
           
-          # Transfer and execute deployment script
-          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no deploy-script.sh root@$SERVER_IP:/tmp/
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/deploy-script.sh && /tmp/deploy-script.sh"
+          # Transfer and execute deployment script using the best available method
+          if [[ "$SSH_KEY_AVAILABLE" == "true" ]]; then
+            echo "🔑 Using SSH key authentication..."
+            scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no deploy-script.sh root@$SERVER_IP:/tmp/
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/deploy-script.sh && /tmp/deploy-script.sh"
+          else
+            echo "🔑 Using password authentication with actions_user..."
+            # Connect as actions_user which was set up in Stage 1
+            export SSHPASS="${{ secrets.ACTIONS_USER_PASSWORD }}"
+            sshpass -e scp -o StrictHostKeyChecking=no deploy-script.sh actions_user@$SERVER_IP:/tmp/
+            sshpass -e ssh -o StrictHostKeyChecking=no actions_user@$SERVER_IP "sudo chmod +x /tmp/deploy-script.sh && sudo /tmp/deploy-script.sh"
+          fi
 
       - name: 🌐 Update DNS Records with Tailscale IP
         env:
