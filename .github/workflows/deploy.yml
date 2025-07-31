@@ -1620,56 +1620,17 @@ jobs:
           echo "✅ Stage 1 complete - system ready for reboot"
           echo "NEEDS_REBOOT" > /tmp/stage1_status
           EOF
-          
-          # Use faster mirrors and optimize pacman configuration
-          {
-            echo "## United States"
-            echo "Server = https://america.mirror.pkgbuild.com/\$repo/os/\$arch"
-            echo "Server = https://mirror.arizona.edu/archlinux/\$repo/os/\$arch"
-            echo "Server = https://mirrors.ocf.berkeley.edu/archlinux/\$repo/os/\$arch"
-            echo "Server = https://mirror.cs.pitt.edu/archlinux/\$repo/os/\$arch"
-            echo "Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch"
-            echo ""
-            echo "## Global CDN"
-            echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"
-          } > /etc/pacman.d/mirrorlist
-          
-          # Optimize pacman for faster downloads
-          sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf || true
-          
-          # Handle NVIDIA firmware conflicts with comprehensive approach
-          echo "🔧 Removing conflicting NVIDIA firmware files..."
-          rm -rf /usr/lib/firmware/nvidia/ad103* 2>/dev/null || true
-          rm -rf /usr/lib/firmware/nvidia/ad104* 2>/dev/null || true  
-          rm -rf /usr/lib/firmware/nvidia/ad106* 2>/dev/null || true
-          rm -rf /usr/lib/firmware/nvidia/ad107* 2>/dev/null || true
-          
-          # Remove symlinks and directories that cause conflicts
-          find /usr/lib/firmware/nvidia -type l -delete 2>/dev/null || true
-          find /usr/lib/firmware/nvidia -name "*.zst" -delete 2>/dev/null || true
-          
-          # Force upgrade with multiple overwrite patterns and retry logic
-          echo "🔄 Performing system upgrade with retry logic..."
-          UPGRADE_SUCCESS=false
-          for attempt in {1..3}; do
-            echo "Upgrade attempt $attempt/3..."
-            if pacman -Su --noconfirm --overwrite='*' --overwrite='/usr/lib/firmware/nvidia/*' 2>/dev/null; then
-              UPGRADE_SUCCESS=true
-              break
-            else
-              echo "⚠️ Upgrade attempt $attempt failed, trying alternative approach..."
-              # Clean up and try again
-              rm -rf /usr/lib/firmware/nvidia || true
-              rm -f /var/lib/pacman/db.lck || true
-              sleep 5
-            fi
-          done
-          
-          if [[ "$UPGRADE_SUCCESS" != "true" ]]; then
-            echo "⚠️ System upgrade failed after 3 attempts, proceeding with package installation..."
-          else
-            echo "✅ System upgrade completed successfully"
           fi
+          
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/stage1-setup.sh && /tmp/stage1-setup.sh"
+          
+          STAGE1_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/stage1_status" || echo "unknown")
+          echo "stage1_status=$STAGE1_STATUS" >> $GITHUB_OUTPUT
+
+      - name: 🔄 Reboot Server for Kernel Updates
+        run: |
+          echo "🔄 Rebooting server for kernel updates and service initialization..."
           
           echo "📦 Installing core packages with retry logic..."
           # Install essential packages first (most important ones) - using modern Docker with Compose plugin
