@@ -1631,15 +1631,20 @@ jobs:
       - name: 🔄 Reboot Server for Kernel Updates
         run: |
           echo "🔄 Rebooting server for kernel updates and service initialization..."
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "reboot" || true
           
-          echo "📦 Installing core packages with retry logic..."
-          # Install essential packages first (most important ones) - using modern Docker with Compose plugin
-          CORE_PACKAGES="curl wget git docker docker-compose tailscale fail2ban sudo rsync"
+          echo "⏳ Waiting for server to come back online..."
+          sleep 45  # Give more time for reboot
           
-          echo "🔄 Installing essential packages: $CORE_PACKAGES"
-          INSTALL_SUCCESS=false
-          for attempt in {1..3}; do
-            echo "Package install attempt $attempt/3..."
+          # Wait for SSH to be available again
+          for i in {1..20}; do
+            if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready after reboot'"; then
+              echo "✅ Server is back online after reboot"
+              break
+            fi
+            echo "Attempt $i/20: Waiting for server to come back online..."
+            sleep 15
+          done
             if timeout 300 pacman -S --noconfirm $CORE_PACKAGES; then
               INSTALL_SUCCESS=true
               echo "✅ Essential packages installed successfully"
