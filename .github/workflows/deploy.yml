@@ -1148,6 +1148,26 @@ jobs:
           # Update package databases first
           pacman -Sy --noconfirm
           
+          echo "🔧 Optimizing package mirrors for better download speeds..."
+          # Backup original mirrorlist
+          cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup || true
+          
+          # Use faster mirrors and optimize pacman configuration
+          cat > /etc/pacman.d/mirrorlist << 'MIRROREOF'
+## United States
+Server = https://america.mirror.pkgbuild.com/$repo/os/$arch
+Server = https://mirror.arizona.edu/archlinux/$repo/os/$arch
+Server = https://mirrors.ocf.berkeley.edu/archlinux/$repo/os/$arch
+Server = https://mirror.cs.pitt.edu/archlinux/$repo/os/$arch
+Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
+
+## Global CDN
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+MIRROREOF
+          
+          # Optimize pacman for faster downloads
+          sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf || true
+          
           # Handle NVIDIA firmware conflicts with comprehensive approach
           echo "🔧 Removing conflicting NVIDIA firmware files..."
           rm -rf /usr/lib/firmware/nvidia/ad103* 2>/dev/null || true
@@ -1159,31 +1179,103 @@ jobs:
           find /usr/lib/firmware/nvidia -type l -delete 2>/dev/null || true
           find /usr/lib/firmware/nvidia -name "*.zst" -delete 2>/dev/null || true
           
-          # Force upgrade with multiple overwrite patterns
-          pacman -Su --noconfirm --overwrite='*' --overwrite='/usr/lib/firmware/nvidia/*' || {
-            echo "🔄 First upgrade failed, trying more aggressive approach..."
-            # Remove entire nvidia firmware directory and try again
-            rm -rf /usr/lib/firmware/nvidia || true
-            # Also handle pacman database conflicts
-            rm -f /var/lib/pacman/db.lck || true
-            pacman -Su --noconfirm --overwrite='*' || {
-              echo "🔄 Still failing, trying with force overwrite..."
-              pacman -Su --noconfirm --overwrite='*' --force || true
-            }
+          # Force upgrade with multiple overwrite patterns and retry logic
+          echo "🔄 Performing system upgrade with retry logic..."
+          UPGRADE_SUCCESS=false
+          for attempt in {1..3}; do
+            echo "Upgrade attempt $attempt/3..."
+            if pacman -Su --noconfirm --overwrite='*' --overwrite='/usr/lib/firmware/nvidia/*' 2>/dev/null; then
+              UPGRADE_SUCCESS=true
+              break
+            else
+              echo "⚠️ Upgrade attempt $attempt failed, trying alternative approach..."
+              # Clean up and try again
+              rm -rf /usr/lib/firmware/nvidia || true
+              rm -f /var/lib/pacman/db.lck || true
+              sleep 5
+            fi
+          done
+          
+          if [[ "$UPGRADE_SUCCESS" != "true" ]]; then
+            echo "⚠️ System upgrade failed after 3 attempts, proceeding with package installation..."
+          else
+            echo "✅ System upgrade completed successfully"
+          fi
+          
+          echo "📦 Installing core packages with retry logic..."
+          # Install essential packages first (most important ones)
+          CORE_PACKAGES="curl wget git docker docker-compose tailscale fail2ban sudo"
+          
+          echo "🔄 Installing essential packages: $CORE_PACKAGES"
+          INSTALL_SUCCESS=false
+          for attempt in {1..3}; do
+            echo "Package install attempt $attempt/3..."
+            if timeout 300 pacman -S --noconfirm $CORE_PACKAGES; then
+              INSTALL_SUCCESS=true
+              echo "✅ Essential packages installed successfully"
+              break
+            else
+              echo "⚠️ Package install attempt $attempt failed, retrying..."
+              # Clear any locks and try again
+              rm -f /var/lib/pacman/db.lck || true
+              sleep 10
+            fi
+          done
+          
+          if [[ "$INSTALL_SUCCESS" != "true" ]]; then
+            echo "❌ Failed to install essential packages after 3 attempts"
+            echo "🔄 Trying to install packages individually..."
+            
+            # Try installing packages one by one
+            for pkg in $CORE_PACKAGES; do
+              echo "Installing $pkg..."
+              timeout 120 pacman -S --noconfirm "$pkg" || echo "⚠️ Failed to install $pkg, continuing..."
+            done
+          fi
+          
+          # Try to install base-devel (development tools) - optional
+          echo "📦 Installing development tools (optional)..."
+          timeout 240 pacman -S --noconfirm base-devel || {
+            echo "⚠️ Failed to install base-devel, continuing without development tools..."
           }
           
-          echo "📦 Installing core packages (excluding iptables and netdata for now)..."
-          # Install everything except iptables-related packages to avoid conflicts
-          # Note: We'll install Netdata separately with cloud support
-          pacman -S --noconfirm curl wget git docker docker-compose \
-            tailscale fail2ban sudo base-devel
+          echo "📊 Installing Netdata monitoring (optional)..."
+          # Try multiple methods to install Netdata, but don't fail if it doesn't work
+          NETDATA_INSTALLED=false
           
-          echo "📊 Installing Netdata with cloud support..."
-          # Install Netdata using official installer which includes claim script
-          bash <(curl -Ss https://my-netdata.io/kickstart.sh) --dont-wait --disable-telemetry || {
-            echo "⚠️ Official Netdata installer failed, falling back to package manager..."
-            pacman -S --noconfirm netdata
-          }
+          # Method 1: Try official installer (most reliable for cloud features)
+          echo "🔄 Attempting Netdata installation via official installer..."
+          if timeout 180 bash -c "curl -Ss https://my-netdata.io/kickstart.sh | bash -s -- --dont-wait --disable-telemetry --non-interactive" 2>/dev/null; then
+            NETDATA_INSTALLED=true
+            echo "✅ Netdata installed via official installer"
+          else
+            echo "⚠️ Official Netdata installer failed or timed out"
+            
+            # Method 2: Try package manager (simpler, fewer dependencies)
+            echo "🔄 Attempting Netdata installation via package manager..."
+            if timeout 120 pacman -S --noconfirm netdata 2>/dev/null; then
+              NETDATA_INSTALLED=true
+              echo "✅ Netdata installed via package manager"
+            else
+              echo "⚠️ Package manager Netdata installation also failed"
+              
+              # Method 3: Try minimal installation (fallback)
+              echo "🔄 Attempting minimal Netdata installation..."
+              if timeout 60 bash -c "curl -Ss https://my-netdata.io/kickstart-static64.sh | sh -s -- --dont-wait --disable-telemetry" 2>/dev/null; then
+                NETDATA_INSTALLED=true
+                echo "✅ Netdata installed via static binary"
+              else
+                echo "⚠️ All Netdata installation methods failed"
+                echo "ℹ️ Server will continue without monitoring - can be added later"
+              fi
+            fi
+          fi
+          
+          if [[ "$NETDATA_INSTALLED" == "true" ]]; then
+            echo "📊 Netdata installation completed successfully"
+          else
+            echo "📊 Netdata installation skipped - monitoring will be disabled"
+          fi
           
           echo "👥 Creating users..."
           useradd -m -s /bin/bash jordan || true
@@ -1216,7 +1308,14 @@ jobs:
           echo "⚙️ Enabling services for post-reboot..."
           systemctl enable docker
           systemctl enable tailscaled
-          systemctl enable netdata
+          
+          # Enable Netdata only if it was successfully installed
+          if [[ "$NETDATA_INSTALLED" == "true" ]] && systemctl list-unit-files | grep -q netdata; then
+            systemctl enable netdata
+            echo "✅ Netdata service enabled"
+          else
+            echo "ℹ️ Netdata not available - monitoring service skipped"
+          fi
           
           echo "� Creating post-reboot script..."
           cat > /usr/local/bin/stage2-post-reboot.sh << 'STAGE2EOF'
@@ -1351,8 +1450,22 @@ jobs:
           id ${{ env.SERVICE_NAME }}_user || echo "⚠️ Service user not found"
           ls -la /home/${{ env.SERVICE_NAME }}_user/.ssh 2>/dev/null || echo "ℹ️ SSH directory not found for service user"
           
-          echo "📊 Starting monitoring..."
-          systemctl start netdata
+          echo "📊 Starting monitoring services..."
+          if systemctl list-unit-files | grep -q netdata && systemctl is-enabled netdata >/dev/null 2>&1; then
+            echo "🔄 Starting Netdata monitoring..."
+            systemctl start netdata || {
+              echo "⚠️ Failed to start Netdata, but continuing deployment..."
+            }
+            
+            # Verify Netdata is running
+            if systemctl is-active netdata >/dev/null 2>&1; then
+              echo "✅ Netdata monitoring active"
+            else
+              echo "⚠️ Netdata failed to start properly"
+            fi
+          else
+            echo "ℹ️ Netdata not installed - monitoring disabled"
+          fi
           
           echo "✅ Stage 2 complete - server ready for service deployment"
           STAGE2EOF
@@ -1563,14 +1676,36 @@ jobs:
           #!/bin/bash
           set -euo pipefail
           
-          echo "🔍 Setting up Netdata monitoring..."
+          echo "🔍 Checking for Netdata monitoring availability..."
           
-          # Start Netdata first
-          systemctl enable netdata
-          systemctl start netdata
+          # Check if Netdata is installed
+          if ! command -v netdata >/dev/null 2>&1 && ! systemctl list-unit-files | grep -q netdata; then
+            echo "ℹ️ Netdata is not installed - monitoring setup skipped"
+            echo "💡 Tip: Netdata can be installed later for monitoring capabilities"
+            exit 0
+          fi
           
-          # Wait for Netdata to start
-          sleep 10
+          echo "📊 Setting up Netdata monitoring..."
+          
+          # Enable and start Netdata if available
+          if systemctl list-unit-files | grep -q netdata; then
+            echo "🔄 Enabling and starting Netdata service..."
+            systemctl enable netdata || echo "⚠️ Failed to enable Netdata"
+            systemctl start netdata || echo "⚠️ Failed to start Netdata"
+            
+            # Wait for Netdata to start
+            sleep 10
+            
+            # Check if Netdata is actually running
+            if ! systemctl is-active netdata >/dev/null 2>&1; then
+              echo "⚠️ Netdata service failed to start properly"
+              echo "📊 Monitoring setup incomplete - check service logs later"
+              exit 0
+            fi
+          else
+            echo "⚠️ Netdata service not found - monitoring setup skipped"
+            exit 0
+          fi
           
           # Configure Netdata to bind to all interfaces
           NETDATA_CONF="/etc/netdata/netdata.conf"
