@@ -1908,6 +1908,62 @@ jobs:
             fi
           fi
           
+          # Special handling for FKS service (SSL setup)
+          if [[ "${{ env.SERVICE_NAME }}" == "fks" ]]; then
+            echo "🔐 Setting up SSL certificate management for FKS..."
+            
+            # Install SSL management system
+            if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
+              chmod +x scripts/*.sh
+              ./scripts/install-ssl-systemd.sh install
+              
+              # Configure environment for SSL
+              cat >> /opt/fks/.env << SSL_ENV
+          DOMAIN_NAME=fkstrading.xyz
+          LETSENCRYPT_EMAIL=admin@7gram.xyz
+          SSL_ENV
+              
+              # Add Cloudflare credentials if available
+              if [[ -n "${{ secrets.CLOUDFLARE_EMAIL || '' }}" ]]; then
+                echo "CLOUDFLARE_EMAIL=${{ secrets.CLOUDFLARE_EMAIL }}" >> /opt/fks/.env
+                echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> /opt/fks/.env
+              fi
+              
+              # Run initial SSL setup
+              fks-ssl setup || echo "⚠️ FKS SSL setup completed with warnings"
+            else
+              echo "⚠️ FKS SSL management scripts not found, continuing without SSL automation"
+            fi
+          fi
+          
+          # Special handling for ATS service (SSL setup)
+          if [[ "${{ env.SERVICE_NAME }}" == "ats" ]]; then
+            echo "🔐 Setting up SSL certificate management for ATS..."
+            
+            # Install SSL management system
+            if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
+              chmod +x scripts/*.sh
+              ./scripts/install-ssl-systemd.sh install
+              
+              # Configure environment for SSL
+              cat >> /opt/ats/.env << SSL_ENV
+          DOMAIN_NAME=ats.7gram.xyz
+          LETSENCRYPT_EMAIL=admin@7gram.xyz
+          SSL_ENV
+              
+              # Add Cloudflare credentials if available
+              if [[ -n "${{ secrets.CLOUDFLARE_EMAIL || '' }}" ]]; then
+                echo "CLOUDFLARE_EMAIL=${{ secrets.CLOUDFLARE_EMAIL }}" >> /opt/ats/.env
+                echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> /opt/ats/.env
+              fi
+              
+              # Run initial SSL setup
+              ats-ssl setup || echo "⚠️ ATS SSL setup completed with warnings"
+            else
+              echo "⚠️ ATS SSL management scripts not found, continuing without SSL automation"
+            fi
+          fi
+          
           # Deploy based on what's available
           if [[ -f "docker-compose.yml" ]]; then
             echo "🐳 Starting Docker Compose services..."
@@ -1915,9 +1971,9 @@ jobs:
             sudo -u ${{ env.SERVICE_NAME }}_user docker compose pull || echo "Pull failed, using local images"
             sudo -u ${{ env.SERVICE_NAME }}_user docker compose up -d
             
-            # Special post-deployment steps for nginx
+            # Special post-deployment steps for services with SSL
             if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
-              echo "🔍 Verifying SSL setup..."
+              echo "🔍 Verifying nginx SSL setup..."
               sleep 10  # Wait for nginx to start
               
               # Test HTTP endpoint
@@ -1928,6 +1984,28 @@ jobs:
               
               # Show SSL certificate status
               nginx-ssl status || echo "⚠️ Could not get SSL status"
+            elif [[ "${{ env.SERVICE_NAME }}" == "fks" ]]; then
+              echo "🔍 Verifying FKS SSL setup..."
+              sleep 15  # Wait for FKS services to start
+              
+              # Test HTTPS endpoints (allow self-signed)
+              curl -k -f https://fkstrading.xyz/health || echo "⚠️ FKS web health check failed"
+              curl -k -f https://api.fkstrading.xyz/health || echo "⚠️ FKS API health check failed"
+              
+              # Show SSL certificate status
+              fks-ssl status || echo "⚠️ Could not get FKS SSL status"
+            elif [[ "${{ env.SERVICE_NAME }}" == "ats" ]]; then
+              echo "🔍 Verifying ATS SSL setup..."
+              sleep 15  # Wait for ATS services to start
+              
+              # Test HTTPS endpoint (allow self-signed)
+              curl -k -f https://ats.7gram.xyz/health || echo "⚠️ ATS health check failed"
+              
+              # Test game server connectivity
+              curl -f http://ats.7gram.xyz:27015 2>/dev/null || echo "ℹ️  Game server port not HTTP accessible (normal)"
+              
+              # Show SSL certificate status
+              ats-ssl status || echo "⚠️ Could not get ATS SSL status"
             fi
           elif [[ -f "start.sh" ]]; then
             echo "🚀 Running start script..."
