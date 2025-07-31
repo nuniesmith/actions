@@ -107,9 +107,7 @@ on:
       # VPN & Networking
       TAILSCALE_AUTH_KEY:
         required: true
-      TAILSCALE_OAUTH_CLIENT_ID:
-        required: false
-      TAILSCALE_OAUTH_SECRET:
+      TAILSCALE_TAILNET:
         required: false
       
       # Monitoring (Optional)
@@ -557,17 +555,6 @@ jobs:
           # Test CLI access
           linode-cli --version
 
-      - name: 🔗 Setup Cleanup Connection (Tailscale)
-        env:
-          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != ''
-        uses: tailscale/github-action@v2
-        with:
-          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-        continue-on-error: true
-
       - name: 🧹 Cleanup Services Before Destruction
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
@@ -698,18 +685,7 @@ jobs:
           # Test CLI access
           linode-cli --version
 
-      - name: � Setup Cleanup Connection (Tailscale)
-        env:
-          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-        if: env.TAILSCALE_OAUTH_CLIENT_ID != '' && env.TAILSCALE_OAUTH_SECRET != '' && inputs.destroy_scope == 'full-server'
-        uses: tailscale/github-action@v2
-        with:
-          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-        continue-on-error: true
-
-      - name: �🗑️ Execute Destruction
+      - name: 🗑️ Execute Destruction
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
