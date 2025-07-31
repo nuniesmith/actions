@@ -335,7 +335,7 @@ ssh user@server "cd fks && docker compose logs -f"
 ## 📊 Monitoring & Maintenance
 
 ### Automated Monitoring
-- Netdata integration with cloud dashboard
+- Docker-based monitoring with cloud dashboard
 - Service health endpoint monitoring
 - Resource usage tracking
 - Automated alert notifications

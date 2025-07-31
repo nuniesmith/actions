@@ -19,7 +19,6 @@ deployment:
   health_check: /health
   
 monitoring:
-  netdata_enabled: true
   nginx_monitoring: true
   
 networking:

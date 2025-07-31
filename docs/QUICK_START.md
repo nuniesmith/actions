@@ -33,7 +33,7 @@ You now have a **centralized GitHub Actions repository** that can deploy and man
    - ✅ User setup (root, jordan, actions_user, service_user)
    - ✅ Tailscale VPN connection
    - ✅ Docker Compose deployment
-   - ✅ Netdata monitoring setup
+   - ✅ Docker-based monitoring setup
    - ✅ SSL certificates and DNS
    - ✅ Health checks and notifications
 
@@ -78,7 +78,7 @@ your-ats-repo/
 - **Consistent deployments:** Same process for all services
 - **Easy troubleshooting:** Standardized patterns and logging
 - **Security:** Proper user separation and access controls
-- **Monitoring:** Netdata setup included by default
+- **Monitoring:** Docker-based setup included by default
 - **Scalability:** Easy to add new services
 
 ## 🎯 Next Steps

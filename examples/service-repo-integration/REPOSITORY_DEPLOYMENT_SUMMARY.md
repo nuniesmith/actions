@@ -66,7 +66,6 @@ Successfully enhanced all service deployments to use real GitHub repositories in
 4. **Repository Cloning**: Git clone of actual service repositories
 5. **Service Deployment**: Docker image pulling and service startup
 6. **Verification**: Comprehensive testing and status reporting
-7. **Monitoring**: Netdata setup for ongoing service monitoring
 
 ## Access Methods
 

@@ -304,7 +304,7 @@ pacman -Syu --noconfirm
 
 echo "📦 Installing essential packages..."
 pacman -S --noconfirm curl wget git docker docker-compose \
-  tailscale netdata ufw fail2ban sudo base-devel
+  tailscale ufw fail2ban sudo base-devel
 
 echo "👥 Creating user accounts..."
 # Users will be created by the main deployment workflow

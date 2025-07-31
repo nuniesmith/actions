@@ -20,7 +20,7 @@ deployment:
   startup_script: start.sh
   
 monitoring:
-  netdata_enabled: true
+  ai_service_monitoring: true
   custom_dashboards:
     - "trading-dashboard.json"
   

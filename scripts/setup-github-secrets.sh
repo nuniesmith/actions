@@ -153,28 +153,6 @@ main() {
         fi
     fi
     
-    # Monitoring (Optional)
-    echo
-    echo "📊 Monitoring Secrets (Optional)"
-    echo "================================"
-    
-    read -p "Do you have Netdata Cloud credentials? (y/n): " -r
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        read -p "Enter Netdata Claim Token: " -s NETDATA_TOKEN
-        echo
-        read -p "Enter Netdata Room ID: " NETDATA_ROOM
-        
-        if [[ -n "$NETDATA_TOKEN" ]]; then
-            set_secret "NETDATA_CLAIM_TOKEN" "$NETDATA_TOKEN"
-            success "NETDATA_CLAIM_TOKEN set"
-        fi
-        
-        if [[ -n "$NETDATA_ROOM" ]]; then
-            set_secret "NETDATA_CLAIM_ROOM" "$NETDATA_ROOM"
-            success "NETDATA_CLAIM_ROOM set"
-        fi
-    fi
-    
     # DNS Management (Optional)
     echo
     echo "🌐 DNS Management Secrets (Optional)"

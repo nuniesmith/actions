@@ -20,7 +20,6 @@ deployment:
   startup_script: start.sh
   
 monitoring:
-  netdata_enabled: true
   game_server_monitoring: true
   
 networking:

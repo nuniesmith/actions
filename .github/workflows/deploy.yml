@@ -67,12 +67,6 @@ on:
         default: '7gram.xyz'
       
       # Feature Toggles
-      enable_monitoring:
-        description: 'Enable Netdata monitoring'
-        required: false
-        type: boolean
-        default: true
-      
       enable_backups:
         description: 'Enable Linode backups'
         required: false
@@ -109,12 +103,6 @@ on:
         required: true
       TAILSCALE_TAILNET:
         description: 'Tailscale tailnet name (optional)'
-        required: false
-      
-      # Monitoring (Optional)
-      NETDATA_CLAIM_TOKEN:
-        required: false
-      NETDATA_CLAIM_ROOM:
         required: false
       
       # DNS Management (Optional)
@@ -1217,6 +1205,7 @@ jobs:
       server_ip: ${{ steps.create-server.outputs.server_ip }}
       server_id: ${{ steps.create-server.outputs.server_id }}
       tailscale_ip: ${{ steps.stage2-setup.outputs.tailscale_ip }}
+      ssh_private_key: ${{ steps.create-server.outputs.ssh_private_key }}
     
     steps:
       - name: 📥 Checkout repository
@@ -1576,9 +1565,6 @@ jobs:
             echo "⚠️ Failed to install base-devel, continuing without development tools..."
           }
           
-          echo "ℹ️ Skipping Netdata installation - using Docker-based monitoring"
-          # Netdata is now handled via Docker compose in the application deployment
-          
           echo "👥 Creating users..."
           useradd -m -s /bin/bash jordan || true
           echo "jordan:${{ secrets.JORDAN_PASSWORD }}" | chpasswd
@@ -1611,9 +1597,7 @@ jobs:
           systemctl enable docker
           systemctl enable tailscaled
           
-          # Enable Netdata only if it was successfully installed
-          # Netdata is now handled via Docker - skipping service enable
-          echo "ℹ️ Netdata monitoring handled via Docker - system service skipped"
+
           
           echo "� Creating post-reboot script..."
           cat > /usr/local/bin/stage2-post-reboot.sh << 'STAGE2EOF'
@@ -1784,8 +1768,6 @@ jobs:
           ls -la /home/${{ env.SERVICE_NAME }}_user/.ssh 2>/dev/null || echo "ℹ️ SSH directory not found for service user"
           
           echo "📊 Starting monitoring services..."
-          echo "ℹ️ Netdata monitoring handled via Docker - system service skipped"
-          
           echo "✅ Stage 2 complete - server ready for service deployment"
           STAGE2EOF
           
@@ -1823,13 +1805,12 @@ jobs:
           echo "stage1_status=$STAGE1_STATUS" >> $GITHUB_OUTPUT
 
       - name: 🔄 Reboot Server for Kernel Updates
-        if: steps.stage1-setup.outputs.stage1_status == 'NEEDS_REBOOT'
         run: |
           echo "🔄 Rebooting server for kernel updates and service initialization..."
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "reboot" || true
           
           echo "⏳ Waiting for server to come back online..."
-          sleep 30
+          sleep 45  # Give more time for reboot
           
           # Wait for SSH to be available again
           for i in {1..20}; do
@@ -1850,102 +1831,64 @@ jobs:
           echo "⏳ Waiting for server to come back online after reboot..."
           SSH_READY=false
           
-          # Give server more time to reboot and be ready
-          sleep 30  # Initial wait for reboot to complete
-          
           for i in {1..20}; do
             echo "Attempt $i/20: Testing SSH connection after reboot..."
             
-            # Test basic connectivity first
-            if timeout 5 nc -zv ${{ steps.create-server.outputs.server_ip }} 22 2>/dev/null; then
-              # Now test SSH authentication
-              if timeout 10 ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-                 root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready after reboot'" 2>/dev/null; then
-                echo "✅ SSH ready after reboot (attempt $i)"
-                SSH_READY=true
-                break
-              else
-                echo "SSH connection failed, retrying..."
-              fi
-            else
-              echo "Port 22 not ready, server may still be rebooting..."
+            if timeout 10 ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+               root@${{ steps.create-server.outputs.server_ip }} "echo 'SSH ready after reboot'" 2>/dev/null; then
+              echo "✅ SSH ready after reboot (attempt $i)"
+              SSH_READY=true
+              break
             fi
-            
             sleep 15  # Wait longer between attempts for reboot
           done
           
           if [[ "$SSH_READY" != "true" ]]; then
             echo "❌ SSH failed to become ready after reboot"
-            echo "🔍 Attempting one final connection attempt with debug info..."
-            timeout 10 ssh -i ~/.ssh/linode_deployment_key -v -o StrictHostKeyChecking=no \
-              root@${{ steps.create-server.outputs.server_ip }} "echo 'Final attempt'" || true
             exit 1
           fi
           
-          # Wait for stage2 service to complete - should be fast (30-60 seconds)
-          echo "⏳ Waiting for stage2-setup service to complete (optimized timing)..."
-          STAGE2_COMPLETED=false
-          
-          # Check more frequently and for less time since stage2 is fast
-          for i in {1..8}; do
-            SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active stage2-setup.service 2>/dev/null || echo 'inactive'")
-            SERVICE_EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl show stage2-setup.service --property=ExecMainStatus --value 2>/dev/null || echo 'unknown'")
+          # Wait for Stage 2 systemd service to complete
+          echo "⏳ Waiting for nginx-stage2.service to complete..."
+          for i in {1..12}; do  # Wait up to 3 minutes (12 * 15s)
+            SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "systemctl is-active nginx-stage2.service 2>/dev/null || echo 'inactive'")
             
-            echo "Attempt $i/8: Service status='$SERVICE_STATUS', Exit status='$SERVICE_EXIT_STATUS'"
+            echo "Attempt $i/12: Stage 2 service status: $SERVICE_STATUS"
             
-            # For oneshot services: inactive + exit status 0 = completed successfully
-            if [[ "$SERVICE_STATUS" == "inactive" && "$SERVICE_EXIT_STATUS" == "0" ]]; then
-              echo "✅ Stage 2 setup service completed successfully"
-              STAGE2_COMPLETED=true
-              break
+            # For oneshot services: inactive means it completed (successfully or failed)
+            if [[ "$SERVICE_STATUS" == "inactive" ]]; then
+              # Check if it completed successfully
+              EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "systemctl show nginx-stage2.service --property=ExecMainStatus --value 2>/dev/null || echo 'unknown'")
+              
+              if [[ "$EXIT_STATUS" == "0" ]]; then
+                echo "✅ Stage 2 service completed successfully"
+                break
+              else
+                echo "⚠️ Stage 2 service completed with exit status: $EXIT_STATUS"
+                # Show logs for debugging
+                ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                  "journalctl -u nginx-stage2.service --no-pager -l --since='5 minutes ago'" || true
+                break
+              fi
             fi
             
-            # Still running/activating - wait a bit
-            if [[ "$SERVICE_STATUS" == "activating" || "$SERVICE_STATUS" == "active" ]]; then
-              echo "Service still running, waiting..."
-              sleep 5
-              continue
-            fi
-            
-            # If it failed, show logs and break
-            if [[ "$SERVICE_EXIT_STATUS" != "0" && "$SERVICE_EXIT_STATUS" != "unknown" && "$SERVICE_EXIT_STATUS" != "" ]]; then
-              echo "⚠️ Stage 2 service failed (exit status: $SERVICE_EXIT_STATUS), checking logs..."
-              ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "journalctl -u stage2-setup.service --no-pager -l --since='1 minute ago'" || true
-              break
-            fi
-            
-            sleep 5
+            sleep 15
           done
           
-          # Quick verification that essential services are working
-          echo "🔍 Quick verification of essential services..."
-          
-          # Check Docker (most important for deployment)
-          if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl is-active docker" >/dev/null 2>&1; then
-            echo "✅ Docker is active"
-          else
-            echo "⚠️ Docker is not active, attempting to start..."
-            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "systemctl start docker && sleep 3"
-          fi
-          
-          # Check Tailscale (important for VPN access)
-          if ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "tailscale status --peers=false" >/dev/null 2>&1; then
-            echo "✅ Tailscale is connected"
-          else
-            echo "⚠️ Tailscale may still be connecting..."
-          fi
-          
           # Get Tailscale IP (multiple methods)
-          TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "tailscale ip -4 2>/dev/null || cat /tmp/tailscale_ip 2>/dev/null || echo 'pending'")
+          TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+            "tailscale ip -4 2>/dev/null || cat /tmp/tailscale_ip 2>/dev/null || echo 'pending'")
           echo "🔗 Tailscale IP: $TAILSCALE_IP"
           echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
           
-          # Final status
-          if [[ "$STAGE2_COMPLETED" == "true" ]]; then
-            echo "✅ Stage 2 verification complete - server ready for service deployment"
-          else
-            echo "⚠️ Stage 2 service may still be running, but proceeding with deployment"
-          fi
+          # Verify essential services
+          echo "🔍 Verifying essential services..."
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+            "systemctl is-active docker && echo '✅ Docker is active'" || echo "⚠️ Docker may not be active"
+          
+          echo "✅ Stage 2 verification complete - server ready for service deployment"
 
   # ============================================================================
   # Service Deployment
@@ -1967,411 +1910,106 @@ jobs:
           
           SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
           
-          # Install sshpass for password authentication
+          # Create the SSH private key file
+          echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/linode_deployment_key
+          chmod 600 ~/.ssh/linode_deployment_key
+          
+          # Install sshpass for password authentication as backup
           sudo apt-get update && sudo apt-get install -y sshpass >/dev/null 2>&1 || true
           
           # Create deployment script
-          if [[ -f "services/${{ env.SERVICE_NAME }}/deploy.sh" ]]; then
-            cp "services/${{ env.SERVICE_NAME }}/deploy.sh" deploy-script.sh
-          else
-            cat > deploy-script.sh << 'EOF'
+          cat > deploy-script.sh << 'EOF'
           #!/bin/bash
           set -euo pipefail
           
-          echo "🚢 Deploying ${{ env.SERVICE_NAME }}..."
+          echo "🚢 Deploying ${{ env.SERVICE_NAME }} service..."
           
           # Setup service directory
-          SERVICE_DIR="/home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }}"
+          SERVICE_USER="${{ env.SERVICE_NAME }}_user"
+          SERVICE_DIR="/home/$SERVICE_USER/${{ env.SERVICE_NAME }}"
           
+          echo "📁 Setting up service directory..."
+          
+          # Clone or update repository
           if [[ -d "$SERVICE_DIR" ]]; then
-            echo "Updating existing service..."
+            echo "📂 Repository exists, updating..."
             cd "$SERVICE_DIR"
-            git pull origin main || git pull origin master || echo "Git pull failed, continuing..."
+            sudo -u $SERVICE_USER git pull origin main || sudo -u $SERVICE_USER git pull origin master || echo "Git pull failed, continuing..."
           else
-            echo "Cloning service repository..."
-            git clone "https://github.com/${{ github.repository_owner }}/${{ env.SERVICE_NAME }}.git" "$SERVICE_DIR" || {
-              echo "Git clone failed, creating service directory manually..."
-              mkdir -p "$SERVICE_DIR"
-            }
-            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "$SERVICE_DIR"
+            echo "📥 Cloning repository..."
+            sudo -u $SERVICE_USER git clone "https://github.com/nuniesmith/${{ env.SERVICE_NAME }}.git" "$SERVICE_DIR"
+            cd "$SERVICE_DIR"
           fi
           
-          cd "$SERVICE_DIR"
+          # Ensure proper ownership
+          chown -R $SERVICE_USER:$SERVICE_USER "$SERVICE_DIR"
           
-          # Special handling for nginx service (SSL setup)
-          if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
-            echo "🔐 Setting up SSL certificate management for nginx..."
-            
-            # Run pre-deployment cleanup for nginx
-            if [[ -f "scripts/cleanup-development-resources.sh" ]]; then
-              echo "🧹 Running pre-deployment cleanup..."
-              chmod +x scripts/cleanup-development-resources.sh
-              ./scripts/cleanup-development-resources.sh || echo "⚠️ Cleanup completed with warnings"
-            fi
-            
-            # Install SSL management system
-            if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
-              chmod +x scripts/*.sh
-              ./scripts/install-ssl-systemd.sh install
-              
-              # Configure environment for SSL
-              cat >> /opt/nginx/.env << SSL_ENV
-          DOMAIN_NAME=${{ env.FULL_DOMAIN }}
-          LETSENCRYPT_EMAIL=admin@${{ inputs.domain_suffix || '7gram.xyz' }}
-          SSL_ENV
-              
-              # Add Cloudflare credentials if available
-              if [[ -n "${{ secrets.CLOUDFLARE_EMAIL || '' }}" ]]; then
-                echo "CLOUDFLARE_EMAIL=${{ secrets.CLOUDFLARE_EMAIL }}" >> /opt/nginx/.env
-                echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> /opt/nginx/.env
-              fi
-              
-              # Run initial SSL setup
-              nginx-ssl setup || echo "⚠️ SSL setup completed with warnings"
-            else
-              echo "⚠️ SSL management scripts not found, continuing without SSL automation"
-            fi
+          echo "� Setting up environment..."
+          
+          # Copy any environment files if they exist
+          if [[ -f ".env.example" ]]; then
+            echo "📋 Setting up environment from example..."
+            sudo -u $SERVICE_USER cp .env.example .env 2>/dev/null || true
           fi
           
-          # Special handling for FKS service (SSL setup)
-          if [[ "${{ env.SERVICE_NAME }}" == "fks" ]]; then
-            echo "🔐 Setting up SSL certificate management for FKS..."
-            
-            # Install SSL management system
-            if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
-              chmod +x scripts/*.sh
-              ./scripts/install-ssl-systemd.sh install
-              
-              # Configure environment for SSL
-              cat >> /opt/fks/.env << SSL_ENV
-          DOMAIN_NAME=fkstrading.xyz
-          LETSENCRYPT_EMAIL=admin@7gram.xyz
-          SSL_ENV
-              
-              # Add Cloudflare credentials if available
-              if [[ -n "${{ secrets.CLOUDFLARE_EMAIL || '' }}" ]]; then
-                echo "CLOUDFLARE_EMAIL=${{ secrets.CLOUDFLARE_EMAIL }}" >> /opt/fks/.env
-                echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> /opt/fks/.env
-              fi
-              
-              # Run initial SSL setup
-              fks-ssl setup || echo "⚠️ FKS SSL setup completed with warnings"
-            else
-              echo "⚠️ FKS SSL management scripts not found, continuing without SSL automation"
-            fi
-          fi
+          # Ensure service user can access Docker
+          usermod -aG docker $SERVICE_USER 2>/dev/null || true
           
-          # Special handling for ATS service (SSL setup)
-          if [[ "${{ env.SERVICE_NAME }}" == "ats" ]]; then
-            echo "🔐 Setting up SSL certificate management for ATS..."
-            
-            # Create ATS directory and initial environment file
-            mkdir -p /opt/ats
-            touch /opt/ats/.env
-            
-            # Install SSL management system
-            if [[ -f "scripts/install-ssl-systemd.sh" ]]; then
-              chmod +x scripts/*.sh
-              ./scripts/install-ssl-systemd.sh install
-              
-              # Configure environment for SSL
-              cat >> /opt/ats/.env << SSL_ENV
-          DOMAIN_NAME=ats.7gram.xyz
-          LETSENCRYPT_EMAIL=admin@7gram.xyz
-          SSL_ENV
-              
-              # Add Cloudflare credentials if available
-              if [[ -n "${{ secrets.CLOUDFLARE_EMAIL || '' }}" ]]; then
-                echo "CLOUDFLARE_EMAIL=${{ secrets.CLOUDFLARE_EMAIL }}" >> /opt/ats/.env
-                echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> /opt/ats/.env
-              fi
-              
-              # Run initial SSL setup
-              ats-ssl setup || echo "⚠️ ATS SSL setup completed with warnings"
-            else
-              echo "⚠️ ATS SSL management scripts not found, continuing without SSL automation"
-            fi
-          fi
-          
-          # Deploy based on what's available
-          if [[ -f "docker-compose.yml" ]]; then
-            echo "🐳 Starting Docker Compose services..."
-            
-            # Detect which Docker Compose command to use
-            if docker compose version &> /dev/null 2>&1; then
-              COMPOSE_CMD="docker compose"
-              echo "✅ Using modern Docker Compose (docker compose)"
-            elif command -v docker-compose &> /dev/null; then
-              COMPOSE_CMD="docker-compose"
-              echo "✅ Using legacy Docker Compose (docker-compose)"
-            else
-              echo "❌ No Docker Compose found! Installing manually..."
-              
-              # Emergency Docker Compose installation
-              curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
-                -o /usr/local/bin/docker-compose
-              chmod +x /usr/local/bin/docker-compose
-              
-              if command -v docker-compose &> /dev/null; then
-                COMPOSE_CMD="docker-compose"
-                echo "✅ Emergency Docker Compose installation successful"
-              else
-                echo "❌ Failed to install Docker Compose"
-                exit 1
-              fi
-            fi
-            
-            echo "🐳 Using compose command: $COMPOSE_CMD"
-            
-            # Ensure Docker daemon is accessible and service user has permissions
-            echo "🔧 Setting up Docker permissions..."
-            
-            # Add service user to docker group (ensure it's effective)
-            usermod -aG docker ${{ env.SERVICE_NAME }}_user 2>/dev/null || true
-            
-            # Create a docker group if it doesn't exist
-            groupadd -f docker
-            
-            # Ensure docker socket has proper permissions
-            chown root:docker /var/run/docker.sock 2>/dev/null || true
-            chmod 660 /var/run/docker.sock 2>/dev/null || true
-            
-            # Restart Docker service to ensure clean state
+          # Test Docker access for service user
+          echo "🐳 Testing Docker access for service user..."
+          if sudo -u $SERVICE_USER docker info >/dev/null 2>&1; then
+            echo "✅ Service user has Docker access"
+          else
+            echo "⚠️ Service user may not have Docker access, fixing..."
+            # Force add user to docker group and restart Docker
+            usermod -aG docker $SERVICE_USER
             systemctl restart docker
             sleep 5
-            
-            # Test Docker access
-            if ! docker info >/dev/null 2>&1; then
-                echo "❌ Docker daemon is not accessible"
-                exit 1
-            fi
-            
-            # Change to service directory
-            cd "$SERVICE_DIR"
-            
-            # Run Docker Compose commands as root (since we're already root in the script)
-            echo "🐳 Stopping existing services..."
-            $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
-            
-            echo "🐳 Pulling latest images..."
-            $COMPOSE_CMD pull --ignore-pull-failures 2>/dev/null || echo "Pull failed, using local images"
-            
-            echo "🐳 Starting services..."
-            $COMPOSE_CMD up -d
-            
-            # Verify services started
-            echo "🔍 Checking service status..."
-            $COMPOSE_CMD ps
-            
-            # Fix ownership of any created files to service user
-            echo "🔧 Fixing file ownership..."
-            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "$SERVICE_DIR" 2>/dev/null || true
-            
-            # Special post-deployment steps for services with SSL
-            if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
-              echo "🔍 Verifying nginx SSL setup..."
-              sleep 10  # Wait for nginx to start
-              
-              # Test HTTP endpoint
-              curl -f http://localhost/health || echo "⚠️ HTTP health check failed"
-              
-              # Test HTTPS endpoint (allow self-signed)
-              curl -k -f https://localhost/health || echo "⚠️ HTTPS health check failed"
-              
-              # Show SSL certificate status
-              nginx-ssl status || echo "⚠️ Could not get SSL status"
-            elif [[ "${{ env.SERVICE_NAME }}" == "fks" ]]; then
-              echo "🔍 Verifying FKS SSL setup..."
-              sleep 15  # Wait for FKS services to start
-              
-              # Test HTTPS endpoints (allow self-signed)
-              curl -k -f https://fkstrading.xyz/health || echo "⚠️ FKS web health check failed"
-              curl -k -f https://api.fkstrading.xyz/health || echo "⚠️ FKS API health check failed"
-              
-              # Show SSL certificate status
-              fks-ssl status || echo "⚠️ Could not get FKS SSL status"
-            elif [[ "${{ env.SERVICE_NAME }}" == "ats" ]]; then
-              echo "🔍 Verifying ATS SSL setup..."
-              sleep 15  # Wait for ATS services to start
-              
-              # Test HTTPS endpoint (allow self-signed)
-              curl -k -f https://ats.7gram.xyz/health || echo "⚠️ ATS health check failed"
-              
-              # Test game server connectivity
-              curl -f http://ats.7gram.xyz:27015 2>/dev/null || echo "ℹ️  Game server port not HTTP accessible (normal)"
-              
-              # Show SSL certificate status
-              ats-ssl status || echo "⚠️ Could not get ATS SSL status"
-            fi
-          elif [[ -f "start.sh" ]]; then
-            echo "🚀 Running start script..."
+          fi
+          
+          echo "🚀 Starting service using start.sh script..."
+          
+          # Check if start.sh exists and is executable
+          if [[ -f "start.sh" ]]; then
             chmod +x start.sh
-            sudo -u ${{ env.SERVICE_NAME }}_user ./start.sh
+            echo "📋 Found start.sh script, executing as service user..."
+            
+            # Execute start.sh as the service user
+            sudo -u $SERVICE_USER ./start.sh
+            
+            echo "✅ Service deployment completed"
           else
-            echo "⚠️ No deployment method found (docker-compose.yml or start.sh)"
-          fi
-          
-          echo "✅ Service deployment complete"
-          EOF
-          fi
-          
-          # Run deployment using password authentication (more reliable for this stage)
-          export SSHPASS="${{ secrets.SERVICE_ROOT_PASSWORD }}"
-          sshpass -e scp -o StrictHostKeyChecking=no deploy-script.sh root@$SERVER_IP:/tmp/
-          sshpass -e ssh -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/deploy-script.sh && /tmp/deploy-script.sh"
-
-      - name: 🔍 Setup Monitoring
-        if: inputs.enable_monitoring
-        run: |
-          echo "🔍 Setting up monitoring..."
-          
-          SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
-          
-          cat > monitoring-setup.sh << 'MONITORING_EOF'
-          #!/bin/bash
-          set -euo pipefail
-          
-          echo "🔍 Checking for Netdata monitoring availability..."
-          
-          # Check if Netdata is installed
-          if ! command -v netdata >/dev/null 2>&1 && ! systemctl list-unit-files | grep -q netdata; then
-            echo "ℹ️ Netdata is not installed - monitoring setup skipped"
-            echo "💡 Tip: Netdata can be installed later for monitoring capabilities"
-            exit 0
-          fi
-          
-          echo "📊 Setting up Netdata monitoring..."
-          
-          # Enable and start Netdata if available
-          if systemctl list-unit-files | grep -q netdata; then
-            echo "🔄 Enabling and starting Netdata service..."
-            systemctl enable netdata || echo "⚠️ Failed to enable Netdata"
-            systemctl start netdata || echo "⚠️ Failed to start Netdata"
+            echo "⚠️ No start.sh script found, attempting Docker Compose deployment..."
             
-            # Wait for Netdata to start
-            sleep 10
-            
-            # Check if Netdata is actually running
-            if ! systemctl is-active netdata >/dev/null 2>&1; then
-              echo "⚠️ Netdata service failed to start properly"
-              echo "📊 Monitoring setup incomplete - check service logs later"
-              exit 0
-            fi
-          else
-            echo "⚠️ Netdata service not found - monitoring setup skipped"
-            exit 0
-          fi
-          
-          # Configure Netdata to bind to all interfaces
-          NETDATA_CONF="/etc/netdata/netdata.conf"
-          if [[ -f "$NETDATA_CONF" ]]; then
-            echo "Configuring Netdata to allow external connections..."
-            sed -i 's/^.*bind socket to IP.*=.*$/\tbind socket to IP = 0.0.0.0/' "$NETDATA_CONF"
-          else
-            echo "Creating basic Netdata configuration..."
-            mkdir -p /etc/netdata
-            echo "[global]" > "$NETDATA_CONF"
-            echo "        bind socket to IP = 0.0.0.0" >> "$NETDATA_CONF"
-            echo "        default port = 19999" >> "$NETDATA_CONF"
-            echo "" >> "$NETDATA_CONF"
-            echo "[web]" >> "$NETDATA_CONF"
-            echo "        allow connections from = *" >> "$NETDATA_CONF"
-          fi
-          
-          # Configure firewall
-          echo "Opening firewall for Netdata on Tailscale..."
-          ufw allow in on tailscale0 to any port 19999
-          
-          # Restart Netdata with new config
-          systemctl restart netdata
-          sleep 5
-          
-          # Test if Netdata is responding
-          echo "Testing Netdata connectivity..."
-          if curl -f http://localhost:19999/api/v1/info 2>/dev/null >/dev/null; then
-            echo "✅ Netdata is responding on port 19999"
-          else
-            echo "⚠️ Netdata may not be responding on port 19999"
-          fi
-          
-          # Claim to Netdata Cloud if credentials provided
-          if [[ -n "${{ secrets.NETDATA_CLAIM_TOKEN }}" && -n "${{ secrets.NETDATA_CLAIM_ROOM }}" ]]; then
-            echo "🔗 Claiming Netdata to cloud..."
-            
-            # Multiple methods to find and run claim script
-            CLAIM_SCRIPT=""
-            
-            # Method 1: Check common locations for claim script
-            for script_path in "/usr/sbin/netdata-claim.sh" "/opt/netdata/bin/netdata-claim.sh" "/usr/libexec/netdata/netdata-claim.sh" "/usr/lib/netdata/netdata-claim.sh"; do
-              if [[ -f "$script_path" ]]; then
-                CLAIM_SCRIPT="$script_path"
-                echo "Found claim script at: $script_path"
-                break
-              fi
-            done
-            
-            # Method 2: Search for the script
-            if [[ -z "$CLAIM_SCRIPT" ]]; then
-              CLAIM_SCRIPT=$(find /usr /opt -name "netdata-claim.sh" 2>/dev/null | head -1)
-              if [[ -n "$CLAIM_SCRIPT" ]]; then
-                echo "Found claim script via search: $CLAIM_SCRIPT"
-              fi
-            fi
-            
-            # Method 3: Check if it's in PATH
-            if [[ -z "$CLAIM_SCRIPT" ]] && command -v netdata-claim.sh >/dev/null 2>&1; then
-              CLAIM_SCRIPT="netdata-claim.sh"
-              echo "Found claim script in PATH"
-            fi
-            
-            # Method 4: Download claim script directly if not found
-            if [[ -z "$CLAIM_SCRIPT" ]]; then
-              echo "Claim script not found locally, downloading..."
-              wget -O /tmp/netdata-claim.sh https://raw.githubusercontent.com/netdata/netdata/master/claim/netdata-claim.sh
-              chmod +x /tmp/netdata-claim.sh
-              CLAIM_SCRIPT="/tmp/netdata-claim.sh"
-            fi
-            
-            # Attempt to claim
-            if [[ -n "$CLAIM_SCRIPT" ]]; then
-              echo "Attempting to claim with script: $CLAIM_SCRIPT"
-              "$CLAIM_SCRIPT" -token="${{ secrets.NETDATA_CLAIM_TOKEN }}" \
-                -rooms="${{ secrets.NETDATA_CLAIM_ROOM }}" \
-                -url=https://app.netdata.cloud \
-                -hostname="${{ env.SERVICE_NAME }}" || {
-                echo "⚠️ Netdata cloud claim failed with script - trying alternative method..."
-                
-                # Alternative method: Manual claiming via API
-                echo "Trying manual claim via Netdata API..."
-                curl -X POST "http://localhost:19999/api/v1/registry" \
-                  -H "Content-Type: application/json" \
-                  -d '{
-                    "action": "claim",
-                    "token": "${{ secrets.NETDATA_CLAIM_TOKEN }}",
-                    "rooms": "${{ secrets.NETDATA_CLAIM_ROOM }}",
-                    "url": "https://app.netdata.cloud",
-                    "hostname": "${{ env.SERVICE_NAME }}"
-                  }' || echo "Manual claim also failed"
-              }
-              
-              # Restart Netdata after claiming
-              systemctl restart netdata
-              sleep 5
-              
-              echo "✅ Netdata claim process completed"
+            # Fallback to docker compose if start.sh doesn't exist
+            if [[ -f "docker-compose.yml" ]]; then
+              echo "📋 Found docker-compose.yml, starting services..."
+              sudo -u $SERVICE_USER docker compose up -d
+              echo "✅ Docker Compose deployment completed"
             else
-              echo "⚠️ Could not find or download claim script - skipping cloud integration"
+              echo "❌ Neither start.sh nor docker-compose.yml found!"
+              exit 1
             fi
-          else
-            echo "ℹ️ No Netdata cloud credentials provided - running locally only"
           fi
           
-          echo "✅ Netdata monitoring setup complete"
-          MONITORING_EOF
+          # Wait for services to be ready
+          echo "⏳ Waiting for services to start..."
+          sleep 10
           
-          export SSHPASS="${{ secrets.SERVICE_ROOT_PASSWORD }}"
-          sshpass -e scp -o StrictHostKeyChecking=no monitoring-setup.sh root@$SERVER_IP:/tmp/
-          sshpass -e ssh -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/monitoring-setup.sh && /tmp/monitoring-setup.sh"
+          # Basic health check
+          echo "🏥 Performing basic health check..."
+          if docker ps --format "table {{.Names}}\t{{.Status}}" | grep -v "NAMES"; then
+            echo "✅ Services are running"
+          else
+            echo "⚠️ No containers found running"
+          fi
+          
+          echo "✅ Service deployment completed successfully"
+          EOF
+          
+          # Transfer and execute deployment script
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no deploy-script.sh root@$SERVER_IP:/tmp/
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "chmod +x /tmp/deploy-script.sh && /tmp/deploy-script.sh"
 
       - name: 🌐 Update DNS Records with Tailscale IP
         env:

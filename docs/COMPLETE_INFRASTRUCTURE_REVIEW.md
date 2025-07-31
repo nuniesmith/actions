@@ -21,8 +21,7 @@ Your infrastructure has evolved into a sophisticated, production-ready system wi
 #### **1.2 Infrastructure Capabilities**
 - **🌐 DNS Integration**: Automatic Cloudflare DNS updates with Tailscale IPs
 - **🔐 Security**: Tailscale VPN, SSH key management, proper user isolation
-- **📊 Monitoring**: Optional Netdata integration with cloud claiming
-- **🔧 Server Management**: Full lifecycle (create, configure, deploy, destroy)
+- ** Server Management**: Full lifecycle (create, configure, deploy, destroy)
 
 #### **1.3 Deployment Flexibility**
 ```yaml
@@ -209,7 +208,7 @@ upstream fks-web {
 | **Documentation** | A | Excellent inline docs and README files |
 | **Security** | A- | Tailscale + SSH keys, needs cert automation |
 | **Cost Optimization** | A+ | Perfect server sizing for workloads |
-| **Monitoring** | B+ | Netdata integration, needs custom metrics |
+| **Monitoring** | B+ | Docker-based monitoring, customizable metrics |
 
 ### 🚀 **Best Practices Implemented**
 
@@ -314,7 +313,7 @@ backup-databases:
 
 #### **6.6 Performance Monitoring**
 ```yaml
-# Add custom metrics to Netdata
+# Add custom metrics to monitoring system
 - name: 📊 Setup Custom Metrics
   run: |
     # Configure application-specific metrics
