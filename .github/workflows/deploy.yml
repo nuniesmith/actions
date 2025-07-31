@@ -640,62 +640,78 @@ jobs:
               TAILNET="${TAILSCALE_TAILNET}"
               if [[ -z "$TAILNET" ]]; then
                 echo "⚠️ TAILSCALE_TAILNET not set, using default discovery"
-                # Try to discover tailnet from API
-                DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                  "https://api.tailscale.com/api/v2/devices" 2>/dev/null || echo '{"devices":[]}')
+                # For personal accounts, use the default endpoint without tailnet
+                DEVICES_URL="https://api.tailscale.com/api/v2/devices"
               else
                 echo "🔍 Using tailnet: $TAILNET"
-                DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                  "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>/dev/null || echo '{"devices":[]}')
+                DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
               fi
               
-              if echo "$DEVICES_RESPONSE" | jq -e '.devices' >/dev/null 2>&1; then
+              echo "🌐 Fetching devices from: $DEVICES_URL"
+              DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
+              
+              # Extract HTTP status code
+              HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+              DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+              
+              echo "🔍 API Response Code: $HTTP_CODE"
+              
+              if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
                 # Find ALL devices matching our service name (including numbered variants like service-1, service-2, etc.)
                 SERVICE_PATTERN="^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
                 
                 echo "🔍 Searching for devices matching pattern: $SERVICE_PATTERN"
                 
-                DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg pattern "$SERVICE_PATTERN" '
+                DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$SERVICE_PATTERN" '
                   .devices[]? | 
                   select(
-                    (.hostname | test($pattern)) or 
-                    (.name | test($pattern)) or
-                    (.clientConnectivity.endpoints[]? | contains("${{ env.SERVICE_NAME }}"))
+                    (.hostname // .name | test($pattern; "i")) or 
+                    (.name // .hostname | test($pattern; "i"))
                   ) | 
-                  .id // empty' | grep -v '^$')
+                  .id // empty' | grep -v '^$' | head -20)  # Limit to prevent excessive API calls
                 
                 if [[ -n "$DEVICES" ]]; then
                   echo "Found Tailscale devices to remove:"
+                  REMOVED_COUNT=0
                   for device_id in $DEVICES; do
                     if [[ -n "$device_id" ]]; then
                       # Get device details before removal
-                      DEVICE_INFO=$(echo "$DEVICES_RESPONSE" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name) (\(.addresses[0] // "no-ip"))"')
+                      DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
                       echo "🗑️ Removing Tailscale device: $device_id - $DEVICE_INFO"
                       
-                      if [[ -z "$TAILNET" ]]; then
-                        REMOVE_RESULT=$(curl -s -X DELETE \
-                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                          "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "FAILED")
+                      # Use the correct API endpoint for device removal
+                      DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
+                      REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                        -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                        "$DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
+                      
+                      REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                      
+                      if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
+                        echo "   ✅ Successfully removed"
+                        ((REMOVED_COUNT++))
                       else
-                        REMOVE_RESULT=$(curl -s -X DELETE \
-                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                          "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id" 2>/dev/null || echo "FAILED")
+                        echo "   ❌ Failed to remove device $device_id (HTTP: $REMOVE_CODE)"
                       fi
                       
-                      if [[ "$REMOVE_RESULT" != "FAILED" ]]; then
-                        echo "   ✅ Successfully removed"
-                      else
-                        echo "   ❌ Failed to remove device $device_id"
-                      fi
+                      # Rate limiting: small delay between deletions
+                      sleep 1
                     fi
                   done
-                  echo "✅ Tailscale device cleanup completed"
+                  echo "✅ Tailscale device cleanup completed - removed $REMOVED_COUNT devices"
                 else
                   echo "ℹ️ No Tailscale devices found matching service name pattern: $SERVICE_PATTERN"
                 fi
+              elif [[ "$HTTP_CODE" == "401" ]]; then
+                echo "❌ Tailscale API authentication failed - check TAILSCALE_AUTH_KEY"
+              elif [[ "$HTTP_CODE" == "403" ]]; then
+                echo "❌ Tailscale API access forbidden - check API key permissions"
+              elif [[ "$HTTP_CODE" == "404" ]]; then
+                echo "❌ Tailscale tailnet not found - check TAILSCALE_TAILNET value"
               else
-                echo "⚠️ Could not retrieve Tailscale devices list - API response may be invalid"
-                echo "Response: $DEVICES_RESPONSE"
+                echo "⚠️ Could not retrieve Tailscale devices list"
+                echo "HTTP Code: $HTTP_CODE"
+                echo "Response: $DEVICES_JSON" | head -200
               fi
             else
               echo "⚠️ Tailscale API key not available"
@@ -830,56 +846,68 @@ jobs:
                   TAILNET="${TAILSCALE_TAILNET}"
                   if [[ -z "$TAILNET" ]]; then
                     echo "⚠️ TAILSCALE_TAILNET not set, using default discovery"
-                    DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                      "https://api.tailscale.com/api/v2/devices" 2>/dev/null || echo '{"devices":[]}')
+                    DEVICES_URL="https://api.tailscale.com/api/v2/devices"
                   else
                     echo "🔍 Using tailnet: $TAILNET"
-                    DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                      "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>/dev/null || echo '{"devices":[]}')
+                    DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
                   fi
                   
-                  if echo "$DEVICES_RESPONSE" | jq -e '.devices' >/dev/null 2>&1; then
+                  echo "🌐 Fetching devices from: $DEVICES_URL"
+                  DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
+                  
+                  # Extract HTTP status code
+                  HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                  DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+                  
+                  echo "🔍 API Response Code: $HTTP_CODE"
+                  
+                  if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
                     # Find ALL devices matching our service name (including numbered variants)
                     SERVICE_PATTERN="^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
                     
                     echo "🔍 Searching for orphaned devices matching pattern: $SERVICE_PATTERN"
                     
-                    DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg pattern "$SERVICE_PATTERN" '
+                    DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$SERVICE_PATTERN" '
                       .devices[]? | 
                       select(
-                        (.hostname | test($pattern)) or 
-                        (.name | test($pattern))
+                        (.hostname // .name | test($pattern; "i")) or 
+                        (.name // .hostname | test($pattern; "i"))
                       ) | 
-                      .id // empty' | grep -v '^$')
+                      .id // empty' | grep -v '^$' | head -20)
                     
                     if [[ -n "$DEVICES" ]]; then
                       echo "Found orphaned Tailscale devices to remove:"
+                      REMOVED_COUNT=0
                       for device_id in $DEVICES; do
                         if [[ -n "$device_id" ]]; then
                           # Get device details before removal
-                          DEVICE_INFO=$(echo "$DEVICES_RESPONSE" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name) (\(.addresses[0] // "no-ip"))"')
+                          DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
                           echo "🗑️ Removing orphaned Tailscale device: $device_id - $DEVICE_INFO"
                           
-                          if [[ -z "$TAILNET" ]]; then
-                            REMOVE_RESULT=$(curl -s -X DELETE \
-                              -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                              "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "FAILED")
+                          DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
+                          REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                            -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                            "$DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
+                          
+                          REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                          
+                          if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
+                            echo "   ✅ Successfully removed"
+                            ((REMOVED_COUNT++))
                           else
-                            REMOVE_RESULT=$(curl -s -X DELETE \
-                              -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                              "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id" 2>/dev/null || echo "FAILED")
+                            echo "   ❌ Failed to remove device $device_id (HTTP: $REMOVE_CODE)"
                           fi
                           
-                          if [[ "$REMOVE_RESULT" != "FAILED" ]]; then
-                            echo "   ✅ Successfully removed"
-                          else
-                            echo "   ❌ Failed to remove device $device_id"
-                          fi
+                          # Rate limiting
+                          sleep 1
                         fi
                       done
+                      echo "✅ Orphaned device cleanup completed - removed $REMOVED_COUNT devices"
                     else
                       echo "ℹ️ No orphaned Tailscale devices found matching pattern: $SERVICE_PATTERN"
                     fi
+                  else
+                    echo "⚠️ Could not retrieve Tailscale devices for cleanup - HTTP: $HTTP_CODE"
                   fi
                 fi
               else
@@ -1213,24 +1241,95 @@ jobs:
           
           echo "🔗 Starting and authenticating Tailscale..."
           systemctl start tailscaled
-          sleep 5
-          # Hostname was already set in Stage 1 - using it for Tailscale auth
-          tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --timeout=120s
           
-          # Wait for Tailscale to be ready
-          echo "⏳ Waiting for Tailscale connection..."
-          for i in {1..30}; do
-            if tailscale status | grep -q "Logged in"; then
-              echo "✅ Tailscale connected successfully"
+          # Wait for tailscaled to be ready
+          echo "⏳ Waiting for tailscaled daemon to start..."
+          for i in {1..10}; do
+            if systemctl is-active tailscaled >/dev/null 2>&1; then
+              echo "✅ Tailscaled daemon is active"
               break
             fi
-            echo "Attempt $i/30: Waiting for Tailscale..."
-            sleep 10
+            echo "Attempt $i/10: Waiting for tailscaled..."
+            sleep 3
           done
           
-          TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
-          echo "🔗 Tailscale IP: $TAILSCALE_IP"
-          echo "$TAILSCALE_IP" > /tmp/tailscale_ip
+          # Validate auth key format before attempting connection
+          AUTH_KEY="${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if [[ -z "$AUTH_KEY" ]]; then
+            echo "❌ TAILSCALE_AUTH_KEY is empty"
+            exit 1
+          fi
+          
+          if [[ ! "$AUTH_KEY" =~ ^tskey- ]]; then
+            echo "⚠️ Warning: Auth key doesn't start with 'tskey-' - this may not be a valid key"
+          fi
+          
+          echo "🔗 Authenticating with Tailscale..."
+          # Multiple authentication attempts with different strategies
+          TAILSCALE_CONNECTED=false
+          
+          # Attempt 1: Standard connection
+          echo "🔄 Attempt 1: Standard Tailscale connection..."
+          if tailscale up --authkey="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --timeout=180s; then
+            TAILSCALE_CONNECTED=true
+            echo "✅ Tailscale connected on first attempt"
+          else
+            echo "⚠️ First attempt failed, trying alternative methods..."
+            
+            # Attempt 2: Reset and reconnect
+            echo "🔄 Attempt 2: Reset and reconnect..."
+            tailscale logout 2>/dev/null || true
+            sleep 5
+            
+            if tailscale up --authkey="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes --advertise-tags=tag:server --timeout=180s; then
+              TAILSCALE_CONNECTED=true
+              echo "✅ Tailscale connected on second attempt"
+            else
+              echo "⚠️ Second attempt failed, trying without hostname..."
+              
+              # Attempt 3: Without custom hostname
+              echo "🔄 Attempt 3: Connection without custom hostname..."
+              if tailscale up --authkey="$AUTH_KEY" --accept-routes --timeout=180s; then
+                TAILSCALE_CONNECTED=true
+                echo "✅ Tailscale connected without custom hostname"
+              else
+                echo "❌ All Tailscale connection attempts failed"
+                echo "🔍 Tailscale status:"
+                tailscale status 2>&1 || echo "Status command failed"
+                echo "🔍 Tailscaled logs:"
+                journalctl -u tailscaled --no-pager -l --since='5 minutes ago' | tail -20 || echo "No logs available"
+              fi
+            fi
+          fi
+          
+          # Wait for Tailscale to be ready and get IP
+          if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
+            echo "⏳ Waiting for Tailscale network to be ready..."
+            TAILSCALE_IP="pending"
+            
+            for i in {1..30}; do
+              if tailscale status | grep -q "Logged in"; then
+                # Try to get IP address
+                CURRENT_IP=$(tailscale ip -4 2>/dev/null || echo "")
+                if [[ -n "$CURRENT_IP" && "$CURRENT_IP" != "" ]]; then
+                  TAILSCALE_IP="$CURRENT_IP"
+                  echo "✅ Tailscale fully connected - IP: $TAILSCALE_IP"
+                  break
+                fi
+              fi
+              echo "Attempt $i/30: Waiting for Tailscale IP assignment..."
+              sleep 10
+            done
+            
+            echo "$TAILSCALE_IP" > /tmp/tailscale_ip
+            
+            if [[ "$TAILSCALE_IP" == "pending" ]]; then
+              echo "⚠️ Tailscale connected but IP not assigned yet - this may resolve shortly"
+            fi
+          else
+            echo "❌ Tailscale connection failed - proceeding without VPN"
+            echo "pending" > /tmp/tailscale_ip
+          fi
           
           echo "🔥 Configuring firewall after reboot..."
           ufw --force reset
