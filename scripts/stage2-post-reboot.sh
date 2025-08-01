@@ -3,6 +3,38 @@ set -euo pipefail
 
 echo "🚀 Stage 2: Post-reboot setup starting..."
 
+# Get configuration variables (should be replaced by the workflow)
+AUTH_KEY="TAILSCALE_AUTH_KEY_PLACEHOLDER"
+SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
+DOMAIN_NAME="DOMAIN_NAME_PLACEHOLDER"
+CLOUDFLARE_EMAIL="CLOUDFLARE_EMAIL_PLACEHOLDER"
+CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_PLACEHOLDER"
+
+# Validate that placeholders were replaced, or try environment variables as fallback
+if [[ "$AUTH_KEY" == "TAILSCALE_AUTH_KEY_PLACEHOLDER" ]]; then
+  echo "⚠️ TAILSCALE_AUTH_KEY placeholder was not replaced by workflow"
+  if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
+    echo "🔄 Using TAILSCALE_AUTH_KEY from environment variable"
+    AUTH_KEY="$TAILSCALE_AUTH_KEY"
+  else
+    echo "❌ No TAILSCALE_AUTH_KEY found in environment either!"
+    exit 1
+  fi
+fi
+
+if [[ "$SERVICE_NAME" == "SERVICE_NAME_PLACEHOLDER" ]]; then
+  echo "⚠️ SERVICE_NAME placeholder was not replaced by workflow"
+  if [[ -n "${SERVICE_NAME_ENV:-}" ]]; then
+    echo "🔄 Using SERVICE_NAME from environment variable"
+    SERVICE_NAME="$SERVICE_NAME_ENV"
+  else
+    echo "❌ No SERVICE_NAME found in environment either!"
+    exit 1
+  fi
+fi
+
+echo "✅ Configuration loaded: SERVICE_NAME=$SERVICE_NAME"
+
 echo "📦 Installing firewall packages after reboot..."
 # First, remove old iptables if it exists to avoid conflicts
 echo "🔧 Resolving iptables conflicts..."
@@ -137,10 +169,6 @@ for i in {1..15}; do
   echo "Attempt $i/15: Waiting for tailscaled..."
   sleep 3
 done
-
-# Get the auth key (should be replaced by the workflow)
-AUTH_KEY="TAILSCALE_AUTH_KEY_PLACEHOLDER"
-SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
 
 # Validate that placeholders were replaced, or try environment variables as fallback
 if [[ "$AUTH_KEY" == "TAILSCALE_AUTH_KEY_PLACEHOLDER" ]]; then
@@ -301,10 +329,8 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
   if [[ "$TAILSCALE_IP" != "pending" && -n "$TAILSCALE_IP" ]]; then
     echo "🌐 Updating Cloudflare DNS records with Tailscale IP..."
     
-    # These will be replaced by the workflow
-    CLOUDFLARE_EMAIL="CLOUDFLARE_EMAIL_PLACEHOLDER"
-    CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_PLACEHOLDER"
-    FULL_DOMAIN_NAME="DOMAIN_NAME_PLACEHOLDER"
+    # Use variables already defined at the top of the script
+    FULL_DOMAIN_NAME="$DOMAIN_NAME"
     
     # Validate that placeholders were replaced (allow empty for optional Cloudflare config)
     CLOUDFLARE_CONFIGURED="false"
