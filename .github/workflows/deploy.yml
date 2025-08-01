@@ -117,7 +117,11 @@ on:
         required: true
       
       # VPN & Networking
-      TAILSCALE_AUTH_KEY:
+      TS_OAUTH_CLIENT_ID:
+        description: 'Tailscale OAuth client ID'
+        required: true
+      TS_OAUTH_SECRET:
+        description: 'Tailscale OAuth client secret'
         required: true
       TAILSCALE_TAILNET:
         description: 'Tailscale tailnet name (optional)'
@@ -400,7 +404,8 @@ jobs:
           SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
           ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           # SSL-related secrets (optional for nginx)
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -412,7 +417,8 @@ jobs:
           [[ -z "$SERVICE_ROOT_PASSWORD" ]] && MISSING_SECRETS+=("SERVICE_ROOT_PASSWORD")
           [[ -z "$JORDAN_PASSWORD" ]] && MISSING_SECRETS+=("JORDAN_PASSWORD")
           [[ -z "$ACTIONS_USER_PASSWORD" ]] && MISSING_SECRETS+=("ACTIONS_USER_PASSWORD")
-          [[ -z "$TAILSCALE_AUTH_KEY" ]] && MISSING_SECRETS+=("TAILSCALE_AUTH_KEY")
+          [[ -z "$TS_OAUTH_CLIENT_ID" ]] && MISSING_SECRETS+=("TS_OAUTH_CLIENT_ID")
+          [[ -z "$TS_OAUTH_SECRET" ]] && MISSING_SECRETS+=("TS_OAUTH_SECRET")
           
           if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
             echo "❌ Missing required secrets:"
@@ -452,13 +458,40 @@ jobs:
       (github.event_name == 'push' || inputs.overwrite_server == true)
     
     steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔗 Set up Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: 📦 Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: 🧹 Cleanup Tailscale and Linode Resources
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
           echo "🧹 Cleaning up old ${{ env.SERVICE_NAME }} resources..."
+          
+          # Get Tailscale access token using OAuth
+          echo "🔑 Getting Tailscale access token..."
+          TOKEN=$(curl -s -X POST https://api.tailscale.com/oauth/token \
+            -d "grant_type=client_credentials" \
+            -d "client_id=$TS_OAUTH_CLIENT_ID" \
+            -d "client_secret=$TS_OAUTH_SECRET" | jq -r .access_token)
+          
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "❌ Failed to get Tailscale access token"
+            exit 1
+          fi
+          echo "✅ Successfully obtained access token"
           
           # Function to clean up Tailscale devices by hostname pattern
           cleanup_tailscale_devices() {
@@ -467,8 +500,14 @@ jobs:
             
             echo "🔗 Tailscale cleanup for pattern: $hostname_pattern ($cleanup_reason)"
             
-            DEVICES_RESPONSE=$(curl -s "https://api.tailscale.com/api/v2/tailnet/${{ secrets.TAILSCALE_TAILNET }}/devices" \
-              -u "${{ secrets.TAILSCALE_API_KEY }}:" \
+            # Use OAuth token and correct tailnet reference
+            TAILNET="${TAILSCALE_TAILNET:-${{ secrets.TAILSCALE_TAILNET }}}"
+            if [[ -z "$TAILNET" ]]; then
+              TAILNET="-"  # Use default tailnet
+            fi
+            
+            DEVICES_RESPONSE=$(curl -s "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" \
+              -H "Authorization: Bearer $TOKEN" \
               -H "Accept: application/json" 2>/dev/null || echo '{"devices":[]}')
             
             MATCHING_DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg pattern "$hostname_pattern" '
@@ -479,16 +518,18 @@ jobs:
                 (.hostname | test("^" + $pattern + "(-[0-9]+)?$")) or
                 (.hostname == $pattern)
               ) | 
-              .nodeId' 2>/dev/null || echo "")
+              .id' 2>/dev/null || echo "")
             
             local removed_count=0
             for device_id in $MATCHING_DEVICES; do
               if [[ -n "$device_id" && "$device_id" != "null" ]]; then
                 echo "🗑️ Removing Tailscale device: $device_id"
-                curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
-                  -u "${{ secrets.TAILSCALE_API_KEY }}:" >/dev/null 2>&1
+                RESPONSE=$(curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
                 
-                if [[ $? -eq 0 ]]; then
+                HTTP_STATUS=$(echo "$RESPONSE" | grep -o "HTTP_STATUS:[0-9]*" | cut -d: -f2)
+                if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]]; then
                   echo "✅ Removed Tailscale device $device_id"
                   removed_count=$((removed_count + 1))
                 else
@@ -1849,7 +1890,9 @@ jobs:
       - name: 🏗️ Stage 1 - Pre-Reboot Setup
         id: stage1-setup
         env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
@@ -1865,145 +1908,181 @@ jobs:
           # Replace placeholders in setup script
           echo "🔄 Replacing placeholders in stage1 setup script..."
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage1-setup.sh
-          sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/${TAILSCALE_AUTH_KEY}/g" stage1-setup.sh
           sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${ACTIONS_USER_PASSWORD}/g" stage1-setup.sh
           sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${JORDAN_PASSWORD}/g" stage1-setup.sh
           
-          # Download and prepare the stage 2 script with proper placeholders replaced
-          curl -o stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
+          # Create a new OAuth-based stage2 script
+          echo "🔄 Creating OAuth-based stage2 script..."
+          cat > stage2-post-reboot.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          
+          echo "🚀 Stage 2: Post-reboot setup starting..."
+          
+          # Configuration variables (to be replaced by workflow)
+          TS_OAUTH_CLIENT_ID="TS_OAUTH_CLIENT_ID_PLACEHOLDER"
+          TS_OAUTH_SECRET="TS_OAUTH_SECRET_PLACEHOLDER"
+          TAILSCALE_TAILNET="TAILSCALE_TAILNET_PLACEHOLDER"
+          SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
+          DOMAIN_NAME="DOMAIN_NAME_PLACEHOLDER"
+          CLOUDFLARE_EMAIL="CLOUDFLARE_EMAIL_PLACEHOLDER"
+          CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_PLACEHOLDER"
+          
+          # Validate OAuth credentials
+          if [[ "$TS_OAUTH_CLIENT_ID" == "TS_OAUTH_CLIENT_ID_PLACEHOLDER" ]]; then
+            echo "❌ TS_OAUTH_CLIENT_ID placeholder was not replaced"
+            exit 1
+          fi
+          
+          if [[ "$TS_OAUTH_SECRET" == "TS_OAUTH_SECRET_PLACEHOLDER" ]]; then
+            echo "❌ TS_OAUTH_SECRET placeholder was not replaced"
+            exit 1
+          fi
+          
+          echo "✅ OAuth configuration loaded: SERVICE_NAME=$SERVICE_NAME"
+          
+          # Install required packages
+          echo "� Installing required packages..."
+          pacman -Rdd --noconfirm iptables 2>/dev/null || true
+          pacman -S --noconfirm iptables-nft ufw jq curl || {
+            echo "⚠️ Package installation failed, trying individually..."
+            pacman -S --noconfirm iptables-nft || true
+            pacman -S --noconfirm ufw || true
+            pacman -S --noconfirm jq || true
+            pacman -S --noconfirm curl || true
+          }
+          
+          # Configure firewall
+          echo "🔥 Configuring firewall..."
+          ufw --force reset
+          ufw default deny incoming
+          ufw default allow outgoing
+          ufw allow ssh
+          
+          # Start Docker
+          echo "🐳 Starting Docker..."
+          systemctl start docker
+          
+          # Wait for Docker
+          for i in {1..10}; do
+            if docker info >/dev/null 2>&1; then
+              echo "✅ Docker is ready"
+              break
+            fi
+            sleep 5
+          done
+          
+          # Create Docker network
+          echo "🌐 Creating Docker network for $SERVICE_NAME..."
+          docker network rm ${SERVICE_NAME}-network 2>/dev/null || true
+          
+          case "$SERVICE_NAME" in
+            "nginx")
+              docker network create --driver bridge --subnet=172.22.0.0/16 nginx-network
+              ;;
+            "fks")
+              docker network create --driver bridge --subnet=172.20.0.0/16 fks-network
+              ;;
+            "ats")
+              docker network create --driver bridge --subnet=172.21.0.0/16 ats-network
+              ;;
+            *)
+              docker network create --driver bridge --subnet=172.23.0.0/16 ${SERVICE_NAME}-network
+              ;;
+          esac
+          
+          # Start Tailscale
+          echo "🔗 Starting Tailscale with OAuth..."
+          systemctl start tailscaled
+          
+          # Wait for tailscaled
+          for i in {1..15}; do
+            if systemctl is-active tailscaled >/dev/null 2>&1; then
+              echo "✅ Tailscaled daemon is active"
+              break
+            fi
+            sleep 3
+          done
+          
+          # Get OAuth token
+          echo "🔑 Getting OAuth access token..."
+          OAUTH_TOKEN=$(curl -s -X POST https://api.tailscale.com/oauth/token \
+            -d "grant_type=client_credentials" \
+            -d "client_id=$TS_OAUTH_CLIENT_ID" \
+            -d "client_secret=$TS_OAUTH_SECRET" | jq -r .access_token 2>/dev/null || echo "")
+          
+          if [[ -z "$OAUTH_TOKEN" || "$OAUTH_TOKEN" == "null" ]]; then
+            echo "❌ Failed to get OAuth access token"
+            exit 1
+          fi
+          
+          # Create ephemeral auth key
+          echo "🔑 Creating ephemeral auth key..."
+          TAILNET="${TAILSCALE_TAILNET:-"-"}"
+          
+          AUTH_KEY_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/$TAILNET/keys" \
+            -H "Authorization: Bearer $OAUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:ci"]}}},"expirySeconds":3600}')
+          
+          AUTH_KEY=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.key // empty' 2>/dev/null || echo "")
+          
+          if [[ -z "$AUTH_KEY" || "$AUTH_KEY" == "empty" ]]; then
+            echo "❌ Failed to create ephemeral auth key"
+            exit 1
+          fi
+          
+          # Connect to Tailscale
+          echo "🔗 Connecting to Tailscale..."
+          if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes; then
+            echo "✅ Tailscale connected successfully"
+            
+            # Get IP
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+            echo "$TAILSCALE_IP" > /tmp/tailscale_ip
+            echo "✅ Tailscale IP: $TAILSCALE_IP"
+          else
+            echo "❌ Tailscale connection failed"
+            exit 1
+          fi
+          
+          # Complete firewall setup
+          ufw allow in on tailscale0
+          ufw --force enable
+          
+          echo "✅ Stage 2 complete - server ready"
+          EOF
+          
           chmod +x stage2-post-reboot.sh
           
-          # Replace placeholders directly in stage2 script using environment variables
-          echo "🔍 Debug: Checking secrets availability..."
-          echo "Service name: ${{ env.SERVICE_NAME }}"
-          echo "Full domain: ${{ env.FULL_DOMAIN }}"
-          echo "Tailscale key starts with: ${{ secrets.TAILSCALE_AUTH_KEY != '' && 'SET' || 'EMPTY' }}"
-          echo "Cloudflare email set: ${{ secrets.CLOUDFLARE_EMAIL != '' && 'SET' || 'EMPTY' }}"
-          echo "Cloudflare token set: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && 'SET' || 'EMPTY' }}"
-          
-          # Fail early if required secrets are missing
-          if [[ -z "$TAILSCALE_AUTH_KEY" ]]; then
-            echo "❌ TAILSCALE_AUTH_KEY secret is empty or not set!"
-            echo "🔍 Please check repository secrets in GitHub settings"
-            exit 1
-          fi
-          
-          # Debug: Show the actual auth key format (safely)
-          echo "🔍 Auth key format check:"
-          echo "  Length: ${#TAILSCALE_AUTH_KEY}"
-          echo "  First 10 chars: ${TAILSCALE_AUTH_KEY:0:10}..."
-          echo "  Contains 'tskey': $(echo "$TAILSCALE_AUTH_KEY" | grep -q 'tskey' && echo 'yes' || echo 'no')"
-          
-          # Replace placeholders using direct sed with environment variables
+          # Replace placeholders in stage2 script
           echo "🔄 Replacing placeholders in stage2 script..."
-          echo "TAILSCALE_AUTH_KEY length: ${#TAILSCALE_AUTH_KEY}"
-          echo "SERVICE_NAME: ${{ env.SERVICE_NAME }}"
+          sed -i "s|TS_OAUTH_CLIENT_ID_PLACEHOLDER|${TS_OAUTH_CLIENT_ID}|g" stage2-post-reboot.sh
+          sed -i "s|TS_OAUTH_SECRET_PLACEHOLDER|${TS_OAUTH_SECRET}|g" stage2-post-reboot.sh
+          sed -i "s|TAILSCALE_TAILNET_PLACEHOLDER|${TAILSCALE_TAILNET:-"-"}|g" stage2-post-reboot.sh
+          sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" stage2-post-reboot.sh
+          sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" stage2-post-reboot.sh
           
-          # Use environment variables directly in sed for more reliable replacement
-          export SERVICE_NAME="${{ env.SERVICE_NAME }}"
-          export FULL_DOMAIN="${{ env.FULL_DOMAIN }}"
-          
-          # Replace each placeholder one by one with verification
-          echo "Replacing SERVICE_NAME..."
-          sed -i "s|SERVICE_NAME_PLACEHOLDER|${SERVICE_NAME}|g" stage2-post-reboot.sh
-          
-          echo "Replacing TAILSCALE_AUTH_KEY..."
-          # Use a different delimiter to avoid conflicts
-          sed -i "s~TAILSCALE_AUTH_KEY_PLACEHOLDER~${TAILSCALE_AUTH_KEY}~g" stage2-post-reboot.sh
-          
-          echo "Replacing CLOUDFLARE_EMAIL..."
-          sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|${CLOUDFLARE_EMAIL:-}|g" stage2-post-reboot.sh
-          
-          echo "Replacing CLOUDFLARE_API_TOKEN..."  
-          sed -i "s~CLOUDFLARE_API_TOKEN_PLACEHOLDER~${CLOUDFLARE_API_TOKEN:-}~g" stage2-post-reboot.sh
-          
-          echo "Replacing DOMAIN_NAME..."
-          sed -i "s|DOMAIN_NAME_PLACEHOLDER|${FULL_DOMAIN}|g" stage2-post-reboot.sh
-          
-          # Verify replacements worked
-          echo "🔍 Verifying placeholder replacement..."
-          echo "🔍 Secrets check:"
-          echo "  TAILSCALE_AUTH_KEY length: ${#TAILSCALE_AUTH_KEY}"
-          echo "  TAILSCALE_AUTH_KEY starts with: ${TAILSCALE_AUTH_KEY:0:20}..."
-          echo "  TAILSCALE_AUTH_KEY ends with: ...${TAILSCALE_AUTH_KEY: -10}"
-          
-          # Check each placeholder individually
-          if grep -q "SERVICE_NAME_PLACEHOLDER" stage2-post-reboot.sh; then
-            echo "❌ SERVICE_NAME_PLACEHOLDER still exists!"
-          else
-            echo "✅ SERVICE_NAME_PLACEHOLDER replaced"
-          fi
-          
-          if grep -q "TAILSCALE_AUTH_KEY_PLACEHOLDER" stage2-post-reboot.sh; then
-            echo "❌ TAILSCALE_AUTH_KEY_PLACEHOLDER still exists!"
-            echo "🔍 Lines containing AUTH_KEY:"
-            grep -n "AUTH_KEY" stage2-post-reboot.sh | head -5
-            echo "🔍 Raw content around line 8:"
-            sed -n '5,12p' stage2-post-reboot.sh
+          # Verify OAuth placeholders were replaced
+          echo "🔍 Verifying OAuth placeholder replacement..."
+          if grep -q "TS_OAUTH_CLIENT_ID_PLACEHOLDER\|TS_OAUTH_SECRET_PLACEHOLDER" stage2-post-reboot.sh; then
+            echo "❌ OAuth placeholders still exist in stage2 script!"
+            grep -n "PLACEHOLDER" stage2-post-reboot.sh | head -5
             exit 1
-          else
-            echo "✅ TAILSCALE_AUTH_KEY_PLACEHOLDER replaced successfully"
           fi
+          echo "✅ OAuth placeholders replaced successfully"
           
-          if grep -q "PLACEHOLDER" stage2-post-reboot.sh; then
-            echo "⚠️ Some placeholders remain:"
-            grep -n "PLACEHOLDER" stage2-post-reboot.sh
-          else
-            echo "✅ All placeholders appear to be replaced"
-          fi
-          
-          # Show first 20 lines of the processed script for debugging
-          echo "🔍 Stage2 script first 20 lines (with replacements):"
-          head -20 stage2-post-reboot.sh
-          
-          # Show the exact lines where AUTH_KEY should be
-          echo "🔍 Checking AUTH_KEY lines in stage2 script:"
-          grep -n "AUTH_KEY" stage2-post-reboot.sh | head -5
-          
-          # Also verify stage1 replacements
-          if grep -q "TAILSCALE_AUTH_KEY_PLACEHOLDER" stage1-setup.sh; then
-            echo "❌ TAILSCALE_AUTH_KEY placeholder not replaced in stage1!"
-            exit 1
-          else
-            echo "✅ Stage1 script placeholders replaced successfully"
-          fi
-          
-          # Upload both scripts
-          echo "📤 Uploading stage1-setup.sh to /tmp/"
+          # Upload scripts to server
+          echo "📤 Uploading scripts to server..."
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
-          
-          echo "📤 Uploading stage2-post-reboot.sh to /usr/local/bin/"
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-post-reboot.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
-          
-          # Verify the uploaded script on server
-          echo "🔍 Verifying uploaded stage2 script on server:"
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "
-            echo 'First 20 lines of uploaded stage2 script:'
-            head -20 /usr/local/bin/stage2-post-reboot.sh
-            echo ''
-            echo 'AUTH_KEY lines in uploaded script:'
-            grep -n 'AUTH_KEY' /usr/local/bin/stage2-post-reboot.sh | head -5
-          "
           
           # Execute stage 1 setup
           echo "🚀 Executing stage1 setup..."
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/stage1-setup.sh && chmod +x /usr/local/bin/stage2-post-reboot.sh && /tmp/stage1-setup.sh"
-          
-          # Verify stage2 script after stage1 execution
-          echo "🔍 Final verification of stage2 script after stage1 execution:"
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "
-            echo 'Checking if stage2 script still has correct content:'
-            if grep -q 'TAILSCALE_AUTH_KEY_PLACEHOLDER' /usr/local/bin/stage2-post-reboot.sh; then
-              echo '❌ PLACEHOLDER STILL EXISTS after stage1!'
-              echo 'First 10 lines of stage2 script:'
-              head -10 /usr/local/bin/stage2-post-reboot.sh
-              echo 'AUTH_KEY lines:'
-              grep -n AUTH_KEY /usr/local/bin/stage2-post-reboot.sh | head -3
-            else
-              echo '✅ Placeholders appear to be replaced'
-              echo 'AUTH_KEY lines:'
-              grep -n AUTH_KEY /usr/local/bin/stage2-post-reboot.sh | head -3
-            fi
+            chmod +x /tmp/stage1-setup.sh
+            chmod +x /usr/local/bin/stage2-post-reboot.sh
+            /tmp/stage1-setup.sh
           "
           
           STAGE1_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/stage1_status" || echo "unknown")
