@@ -1863,10 +1863,11 @@ jobs:
           chmod +x stage1-setup.sh
           
           # Replace placeholders in setup script
+          echo "🔄 Replacing placeholders in stage1 setup script..."
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage1-setup.sh
-          sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/${{ secrets.TAILSCALE_AUTH_KEY }}/g" stage1-setup.sh
-          sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${{ secrets.ACTIONS_USER_PASSWORD }}/g" stage1-setup.sh
-          sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${{ secrets.JORDAN_PASSWORD }}/g" stage1-setup.sh
+          sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/${TAILSCALE_AUTH_KEY}/g" stage1-setup.sh
+          sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${ACTIONS_USER_PASSWORD}/g" stage1-setup.sh
+          sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${JORDAN_PASSWORD}/g" stage1-setup.sh
           
           # Download and prepare the stage 2 script with proper placeholders replaced
           curl -o stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
@@ -1887,12 +1888,23 @@ jobs:
             exit 1
           fi
           
-          # Replace placeholders directly (more reliable than heredoc)
-          sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" stage2-post-reboot.sh
-          sed -i "s|TAILSCALE_AUTH_KEY_PLACEHOLDER|${TAILSCALE_AUTH_KEY}|g" stage2-post-reboot.sh
-          sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|${CLOUDFLARE_EMAIL}|g" stage2-post-reboot.sh
-          sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|${CLOUDFLARE_API_TOKEN}|g" stage2-post-reboot.sh
-          sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" stage2-post-reboot.sh
+          # Replace placeholders using environment variables for safety
+          echo "🔄 Replacing placeholders in stage2 script..."
+          echo "TAILSCALE_AUTH_KEY length: ${#TAILSCALE_AUTH_KEY}"
+          echo "SERVICE_NAME: ${{ env.SERVICE_NAME }}"
+          
+          # Create replacement script to handle special characters safely
+          {
+            echo '#!/bin/bash'
+            echo 'sed -i "s|SERVICE_NAME_PLACEHOLDER|'"${{ env.SERVICE_NAME }}"'|g" stage2-post-reboot.sh'
+            echo 'sed -i "s|TAILSCALE_AUTH_KEY_PLACEHOLDER|'"${TAILSCALE_AUTH_KEY}"'|g" stage2-post-reboot.sh'
+            echo 'sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|'"${CLOUDFLARE_EMAIL:-}"'|g" stage2-post-reboot.sh'
+            echo 'sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|'"${CLOUDFLARE_API_TOKEN:-}"'|g" stage2-post-reboot.sh'
+            echo 'sed -i "s|DOMAIN_NAME_PLACEHOLDER|'"${{ env.FULL_DOMAIN }}"'|g" stage2-post-reboot.sh'
+          } > replace.sh
+          
+          chmod +x replace.sh
+          ./replace.sh
           
           # Verify replacements worked
           echo "🔍 Verifying placeholder replacement..."
@@ -1915,6 +1927,10 @@ jobs:
           echo "🔍 Stage2 script first 20 lines (with replacements):"
           head -20 stage2-post-reboot.sh
           
+          # Show the exact lines where AUTH_KEY should be
+          echo "🔍 Checking AUTH_KEY lines in stage2 script:"
+          grep -n "AUTH_KEY" stage2-post-reboot.sh | head -5
+          
           # Also verify stage1 replacements
           if grep -q "TAILSCALE_AUTH_KEY_PLACEHOLDER" stage1-setup.sh; then
             echo "❌ TAILSCALE_AUTH_KEY placeholder not replaced in stage1!"
@@ -1924,11 +1940,42 @@ jobs:
           fi
           
           # Upload both scripts
+          echo "📤 Uploading stage1-setup.sh to /tmp/"
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
+          
+          echo "📤 Uploading stage2-post-reboot.sh to /usr/local/bin/"
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-post-reboot.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
           
+          # Verify the uploaded script on server
+          echo "🔍 Verifying uploaded stage2 script on server:"
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "
+            echo 'First 20 lines of uploaded stage2 script:'
+            head -20 /usr/local/bin/stage2-post-reboot.sh
+            echo ''
+            echo 'AUTH_KEY lines in uploaded script:'
+            grep -n 'AUTH_KEY' /usr/local/bin/stage2-post-reboot.sh | head -5
+          "
+          
           # Execute stage 1 setup
+          echo "🚀 Executing stage1 setup..."
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/stage1-setup.sh && chmod +x /usr/local/bin/stage2-post-reboot.sh && /tmp/stage1-setup.sh"
+          
+          # Verify stage2 script after stage1 execution
+          echo "🔍 Final verification of stage2 script after stage1 execution:"
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "
+            echo 'Checking if stage2 script still has correct content:'
+            if grep -q 'TAILSCALE_AUTH_KEY_PLACEHOLDER' /usr/local/bin/stage2-post-reboot.sh; then
+              echo '❌ PLACEHOLDER STILL EXISTS after stage1!'
+              echo 'First 10 lines of stage2 script:'
+              head -10 /usr/local/bin/stage2-post-reboot.sh
+              echo 'AUTH_KEY lines:'
+              grep -n AUTH_KEY /usr/local/bin/stage2-post-reboot.sh | head -3
+            else
+              echo '✅ Placeholders appear to be replaced'
+              echo 'AUTH_KEY lines:'
+              grep -n AUTH_KEY /usr/local/bin/stage2-post-reboot.sh | head -3
+            fi
+          "
           
           STAGE1_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/stage1_status" || echo "unknown")
           echo "stage1_status=$STAGE1_STATUS" >> $GITHUB_OUTPUT
