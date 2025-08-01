@@ -1848,6 +1848,13 @@ jobs:
 
       - name: 🏗️ Stage 1 - Pre-Reboot Setup
         id: stage1-setup
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
+          ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
+          JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
         run: |
           echo "🏗️ Stage 1: Pre-reboot foundation setup..."
           
@@ -1865,7 +1872,7 @@ jobs:
           curl -o stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
           chmod +x stage2-post-reboot.sh
           
-          # Debug: Show what secrets we have
+          # Replace placeholders directly in stage2 script using environment variables
           echo "🔍 Debug: Checking secrets availability..."
           echo "Service name: ${{ env.SERVICE_NAME }}"
           echo "Full domain: ${{ env.FULL_DOMAIN }}"
@@ -1874,58 +1881,39 @@ jobs:
           echo "Cloudflare token set: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && 'SET' || 'EMPTY' }}"
           
           # Fail early if required secrets are missing
-          if [[ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]]; then
+          if [[ -z "$TAILSCALE_AUTH_KEY" ]]; then
             echo "❌ TAILSCALE_AUTH_KEY secret is empty or not set!"
             echo "🔍 Please check repository secrets in GitHub settings"
             exit 1
           fi
           
-          # Create a temporary script to do the replacements more safely
-          cat > replace_placeholders.sh << 'EOF'
-          #!/bin/bash
-          
-          # Replace SERVICE_NAME_PLACEHOLDER
-          sed -i "s|SERVICE_NAME_PLACEHOLDER|${SERVICE_NAME}|g" stage2-post-reboot.sh
-          
-          # Replace TAILSCALE_AUTH_KEY_PLACEHOLDER  
+          # Replace placeholders directly (more reliable than heredoc)
+          sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" stage2-post-reboot.sh
           sed -i "s|TAILSCALE_AUTH_KEY_PLACEHOLDER|${TAILSCALE_AUTH_KEY}|g" stage2-post-reboot.sh
-          
-          # Replace CLOUDFLARE_EMAIL_PLACEHOLDER
           sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|${CLOUDFLARE_EMAIL}|g" stage2-post-reboot.sh
-          
-          # Replace CLOUDFLARE_API_TOKEN_PLACEHOLDER
           sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|${CLOUDFLARE_API_TOKEN}|g" stage2-post-reboot.sh
-          
-          # Replace DOMAIN_NAME_PLACEHOLDER
-          sed -i "s|DOMAIN_NAME_PLACEHOLDER|${FULL_DOMAIN}|g" stage2-post-reboot.sh
-          EOF
-          
-          chmod +x replace_placeholders.sh
-          
-          # Set environment variables and run replacement script
-          export SERVICE_NAME="${{ env.SERVICE_NAME }}"
-          export TAILSCALE_AUTH_KEY="${{ secrets.TAILSCALE_AUTH_KEY }}"
-          export CLOUDFLARE_EMAIL="${{ secrets.CLOUDFLARE_EMAIL || '' }}"
-          export CLOUDFLARE_API_TOKEN="${{ secrets.CLOUDFLARE_API_TOKEN || '' }}"
-          export FULL_DOMAIN="${{ env.FULL_DOMAIN }}"
-          
-          ./replace_placeholders.sh
+          sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" stage2-post-reboot.sh
           
           # Verify replacements worked
           echo "🔍 Verifying placeholder replacement..."
+          echo "🔍 Secrets check:"
+          echo "  TAILSCALE_AUTH_KEY length: ${#TAILSCALE_AUTH_KEY}"
+          echo "  TAILSCALE_AUTH_KEY starts with: ${TAILSCALE_AUTH_KEY:0:20}..."
+          
           if grep -q "TAILSCALE_AUTH_KEY_PLACEHOLDER" stage2-post-reboot.sh; then
             echo "❌ TAILSCALE_AUTH_KEY placeholder not replaced!"
             echo "🔍 Checking what's in the script around the auth key:"
             grep -n -A2 -B2 "AUTH_KEY" stage2-post-reboot.sh || true
-            echo "🔍 Environment variable contents:"
-            echo "TAILSCALE_AUTH_KEY length: ${#TAILSCALE_AUTH_KEY}"
-            echo "TAILSCALE_AUTH_KEY starts with: ${TAILSCALE_AUTH_KEY:0:20}..."
             echo "🔍 Full script content around placeholders:"
             grep -n "PLACEHOLDER" stage2-post-reboot.sh || echo "No remaining placeholders found"
             exit 1
           else
             echo "✅ Tailscale auth key placeholder replaced successfully"
           fi
+          
+          # Show first 20 lines of the processed script for debugging
+          echo "🔍 Stage2 script first 20 lines (with replacements):"
+          head -20 stage2-post-reboot.sh
           
           # Also verify stage1 replacements
           if grep -q "TAILSCALE_AUTH_KEY_PLACEHOLDER" stage1-setup.sh; then
