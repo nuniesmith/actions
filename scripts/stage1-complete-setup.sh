@@ -1,0 +1,107 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "🏗️ Starting Stage 1 complete setup..."
+
+# Arch Linux package update and installation
+echo "📦 Updating package database..."
+pacman -Sy
+
+echo "📦 Installing essential packages..."
+CORE_PACKAGES="curl wget git openssh docker docker-compose tailscale ufw iptables-nft base-devel"
+
+for attempt in {1..3}; do
+  echo "Package install attempt $attempt..."
+  if timeout 300 pacman -S --noconfirm $CORE_PACKAGES; then
+    echo "✅ Essential packages installed successfully"
+    INSTALL_SUCCESS=true
+    break
+  else
+    echo "⚠️ Package install attempt $attempt failed, retrying..."
+    rm -f /var/lib/pacman/db.lck || true
+    sleep 10
+  fi
+done
+
+if [[ "${INSTALL_SUCCESS:-false}" != "true" ]]; then
+  echo "❌ Failed to install essential packages after 3 attempts"
+  echo "🔄 Trying to install packages individually..."
+  for pkg in $CORE_PACKAGES; do
+    echo "Installing $pkg..."
+    timeout 120 pacman -S --noconfirm "$pkg" || echo "⚠️ Failed to install $pkg, continuing..."
+  done
+fi
+
+echo "🐳 Setting up Docker and networks..."
+systemctl enable docker
+systemctl start docker
+sleep 5
+
+# Create service-specific networks with static IP ranges
+echo "🔧 Creating service networks..."
+docker network rm fks-network ats-network nginx-network 2>/dev/null || true
+
+docker network create --driver bridge --subnet=172.20.0.0/16 --ip-range=172.20.1.0/24 --gateway=172.20.0.1 fks-network
+docker network create --driver bridge --subnet=172.21.0.0/16 --ip-range=172.21.1.0/24 --gateway=172.21.0.1 ats-network  
+docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network
+
+systemctl stop docker
+
+echo "👥 Creating users..."
+useradd -m -s /bin/bash jordan || true
+echo "jordan:JORDAN_PASSWORD_PLACEHOLDER" | chpasswd
+usermod -aG wheel,docker jordan
+
+useradd -m -s /bin/bash actions_user || true
+echo "actions_user:ACTIONS_USER_PASSWORD_PLACEHOLDER" | chpasswd
+usermod -aG wheel,docker actions_user
+
+useradd -m -s /bin/bash SERVICE_NAME_PLACEHOLDER_user || true
+usermod -aG docker SERVICE_NAME_PLACEHOLDER_user
+echo "SERVICE_NAME_PLACEHOLDER_user:ACTIONS_USER_PASSWORD_PLACEHOLDER" | chpasswd
+
+mkdir -p /home/SERVICE_NAME_PLACEHOLDER_user/.ssh
+chmod 700 /home/SERVICE_NAME_PLACEHOLDER_user/.ssh
+chown SERVICE_NAME_PLACEHOLDER_user:SERVICE_NAME_PLACEHOLDER_user /home/SERVICE_NAME_PLACEHOLDER_user/.ssh
+
+echo "🔐 Configuring SSH..."
+sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+echo "🏷️ Setting hostname..."
+hostnamectl set-hostname "SERVICE_NAME_PLACEHOLDER"
+
+echo "⚙️ Enabling services for post-reboot..."
+systemctl enable docker
+systemctl enable tailscaled
+
+echo "📝 Creating stage2 post-reboot script..."
+curl -o /usr/local/bin/stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
+chmod +x /usr/local/bin/stage2-post-reboot.sh
+
+# Replace placeholders in stage2 script
+sed -i "s/SERVICE_NAME_PLACEHOLDER/SERVICE_NAME_PLACEHOLDER/g" /usr/local/bin/stage2-post-reboot.sh
+sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/TAILSCALE_AUTH_KEY_PLACEHOLDER/g" /usr/local/bin/stage2-post-reboot.sh
+
+echo "🔄 Creating systemd service for post-reboot setup..."
+cat > /etc/systemd/system/stage2-setup.service << 'SERVICEEOF'
+[Unit]
+Description=Stage 2 Post-Reboot Setup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/stage2-post-reboot.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+systemctl enable stage2-setup.service
+
+echo "✅ Stage 1 complete - system ready for reboot"
+echo "NEEDS_REBOOT" > /tmp/stage1_status
