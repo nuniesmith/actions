@@ -124,6 +124,8 @@ on:
         required: false
       
       # DNS Management (Optional)
+      CLOUDFLARE_EMAIL:
+        required: false
       CLOUDFLARE_API_TOKEN:
         required: false
       CLOUDFLARE_ZONE_ID:
@@ -1672,11 +1674,11 @@ jobs:
           curl -o stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
           chmod +x stage2-post-reboot.sh
           
-          # Replace placeholders in stage2 script
+          # Replace placeholders in stage2 script (handle empty/optional secrets gracefully)
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage2-post-reboot.sh
           sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/${{ secrets.TAILSCALE_AUTH_KEY }}/g" stage2-post-reboot.sh
-          sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${{ secrets.CLOUDFLARE_EMAIL }}/g" stage2-post-reboot.sh
-          sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${{ secrets.CLOUDFLARE_API_TOKEN }}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${{ secrets.CLOUDFLARE_EMAIL || '' }}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${{ secrets.CLOUDFLARE_API_TOKEN || '' }}/g" stage2-post-reboot.sh
           sed -i "s/DOMAIN_NAME_PLACEHOLDER/${{ env.FULL_DOMAIN }}/g" stage2-post-reboot.sh
           
           # Upload both scripts

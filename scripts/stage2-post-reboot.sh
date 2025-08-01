@@ -1,4 +1,4 @@
-#!/biecho "📦 I#!/bin/bash
+#!/bin/bash
 set -euo pipefail
 
 echo "🚀 Stage 2: Post-reboot setup starting..."
@@ -14,31 +14,6 @@ if ! pacman -S --noconfirm iptables-nft ufw jq; then
   pacman -S --noconfirm iptables-nft || echo "Failed to install iptables-nft"
   pacman -S --noconfirm ufw || echo "Failed to install ufw"
   pacman -S --noconfirm jq || echo "Failed to install jq"
-fiirewall packages after reboot..."
-# First, remove old iptables if it exists to avoid conflicts
-echo "� Resolving iptables conflicts..."
-pacman -Rdd --noconfirm iptables 2>/dev/null || true
-
-# Now install iptables-nft, ufw, and jq (for DNS updates)
-if ! pacman -S --noconfirm iptables-nft ufw jq; then
-  echo "⚠️ First attempt failed, trying individually..."
-  pacman -S --noconfirm iptables-nft || echo "Failed to install iptables-nft"
-  pacman -S --noconfirm ufw || echo "Failed to install ufw"
-  pacman -S --noconfirm jq || echo "Failed to install jq"
-fi-euo pipefail
-
-echo "🚀 Stage 2: Post-reboot setup starting..."
-
-echo "📦 Installing firewall packages after reboot..."
-# First, remove old iptables if it exists to avoid conflicts
-echo "� Resolving iptables conflicts..."
-pacman -Rdd --noconfirm iptables 2>/dev/null || true
-
-# Now install iptables-nft and ufw
-if ! pacman -S --noconfirm iptables-nft ufw; then
-  echo "⚠️ First attempt failed, trying individually..."
-  pacman -S --noconfirm iptables-nft || echo "Failed to install iptables-nft"
-  pacman -S --noconfirm ufw || echo "Failed to install ufw"
 fi
 
 echo "✅ Firewall packages installed successfully"
@@ -147,31 +122,77 @@ echo "Using hostname: $SERVICE_NAME"
 TAILSCALE_CONNECTED=false
 DOCKER_SUBNETS="172.17.0.0/16,172.20.0.0/16,172.21.0.0/16,172.22.0.0/16"
 
-# First attempt: Full configuration with Docker subnets
-echo "🌐 Attempting Tailscale connection with Docker subnet advertisement..."
-if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --advertise-routes="$DOCKER_SUBNETS" --reset; then
-  TAILSCALE_CONNECTED=true
-  echo "✅ Tailscale connected with Docker subnets advertised"
-else
-  echo "⚠️ Full configuration failed, trying basic connection..."
-  # Second attempt: Basic connection without subnet advertisement
-  if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --reset; then
-    TAILSCALE_CONNECTED=true
-    echo "✅ Tailscale connected with basic configuration"
-    
-    # Try to add subnet advertisement after connection
-    echo "🔄 Attempting to add Docker subnet advertisement..."
-    sleep 10
-    if timeout 60 tailscale up --advertise-routes="$DOCKER_SUBNETS"; then
-      echo "✅ Docker subnets advertised successfully"
-    else
-      echo "⚠️ Failed to advertise Docker subnets, but connection is established"
-    fi
-  else
-    echo "❌ Tailscale connection failed completely"
-    echo "🔍 Checking tailscale logs..."
-    journalctl -u tailscaled --no-pager -l --since="5 minutes ago" || true
-  fi
+# Enhanced connection attempts with better error handling
+CONNECTION_METHODS=(
+  "full-with-reset"
+  "full-no-reset" 
+  "basic-with-reset"
+  "basic-no-reset"
+  "minimal"
+)
+
+for method in "${CONNECTION_METHODS[@]}"; do
+  echo "🌐 Attempting Tailscale connection method: $method"
+  
+  case "$method" in
+    "full-with-reset")
+      if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --advertise-routes="$DOCKER_SUBNETS" --reset; then
+        TAILSCALE_CONNECTED=true
+        echo "✅ Tailscale connected with full configuration and reset"
+        break
+      fi
+      ;;
+    "full-no-reset")
+      if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --advertise-routes="$DOCKER_SUBNETS"; then
+        TAILSCALE_CONNECTED=true
+        echo "✅ Tailscale connected with full configuration"
+        break
+      fi
+      ;;
+    "basic-with-reset")
+      if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --reset; then
+        TAILSCALE_CONNECTED=true
+        echo "✅ Tailscale connected with basic configuration and reset"
+        
+        # Try to add subnet advertisement after connection
+        echo "🔄 Attempting to add Docker subnet advertisement..."
+        sleep 10
+        timeout 60 tailscale up --advertise-routes="$DOCKER_SUBNETS" || echo "⚠️ Failed to advertise subnets, but connection established"
+        break
+      fi
+      ;;
+    "basic-no-reset")
+      if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes; then
+        TAILSCALE_CONNECTED=true
+        echo "✅ Tailscale connected with basic configuration"
+        
+        # Try to add subnet advertisement after connection
+        echo "🔄 Attempting to add Docker subnet advertisement..."
+        sleep 10
+        timeout 60 tailscale up --advertise-routes="$DOCKER_SUBNETS" || echo "⚠️ Failed to advertise subnets, but connection established"
+        break
+      fi
+      ;;
+    "minimal")
+      if timeout 300 tailscale up --authkey="$AUTH_KEY"; then
+        TAILSCALE_CONNECTED=true
+        echo "✅ Tailscale connected with minimal configuration"
+        echo "⚠️ No route acceptance or subnet advertisement - manual configuration may be needed"
+        break
+      fi
+      ;;
+  esac
+  
+  echo "⚠️ Method $method failed, trying next approach..."
+  sleep 10
+done
+
+if [[ "$TAILSCALE_CONNECTED" != "true" ]]; then
+  echo "❌ All Tailscale connection methods failed"
+  echo "🔍 Checking tailscale logs..."
+  journalctl -u tailscaled --no-pager -l --since="10 minutes ago" || true
+  echo "🔍 Tailscale status output:"
+  tailscale status || true
 fi
 
 if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
@@ -202,11 +223,22 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
     CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_PLACEHOLDER"
     FULL_DOMAIN_NAME="DOMAIN_NAME_PLACEHOLDER"
     
-    # Extract base domain (e.g., from "nginx.example.com" get "example.com")
-    DOMAIN_NAME=$(echo "$FULL_DOMAIN_NAME" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF; else print $0}')
-    
-    # Validate that placeholders were replaced
+    # Validate that placeholders were replaced (allow empty for optional Cloudflare config)
+    CLOUDFLARE_CONFIGURED="false"
     if [[ "$CLOUDFLARE_EMAIL" != "CLOUDFLARE_EMAIL_PLACEHOLDER" && "$CLOUDFLARE_API_TOKEN" != "CLOUDFLARE_API_TOKEN_PLACEHOLDER" && "$FULL_DOMAIN_NAME" != "DOMAIN_NAME_PLACEHOLDER" ]]; then
+      if [[ -n "$CLOUDFLARE_EMAIL" && -n "$CLOUDFLARE_API_TOKEN" && -n "$FULL_DOMAIN_NAME" ]]; then
+        CLOUDFLARE_CONFIGURED="true"
+        echo "✅ Cloudflare DNS configuration detected"
+      else
+        echo "⚠️ Cloudflare secrets present but some are empty"
+      fi
+    else
+      echo "ℹ️ Cloudflare DNS not configured - skipping DNS updates"
+    fi
+    
+    if [[ "$CLOUDFLARE_CONFIGURED" == "true" ]]; then
+      # Extract base domain (e.g., from "nginx.example.com" get "example.com")
+      DOMAIN_NAME=$(echo "$FULL_DOMAIN_NAME" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF; else print $0}')
       
       echo "🔍 Using domain: $DOMAIN_NAME for zone lookup"
       echo "🔍 Full domain to update: $FULL_DOMAIN_NAME"
@@ -271,10 +303,7 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
         echo "Zone response: $ZONE_RESPONSE"
       fi
     else
-      echo "ℹ️ Cloudflare credentials not configured - skipping DNS update"
-      echo "Email configured: $([[ "$CLOUDFLARE_EMAIL" != "CLOUDFLARE_EMAIL_PLACEHOLDER" ]] && echo "YES" || echo "NO")"
-      echo "Token configured: $([[ "$CLOUDFLARE_API_TOKEN" != "CLOUDFLARE_API_TOKEN_PLACEHOLDER" ]] && echo "YES" || echo "NO")"
-      echo "Domain configured: $([[ "$FULL_DOMAIN_NAME" != "DOMAIN_NAME_PLACEHOLDER" ]] && echo "YES ($FULL_DOMAIN_NAME)" || echo "NO")"
+      echo "ℹ️ Cloudflare DNS updates skipped - not configured or missing credentials"
     fi
   else
     echo "⚠️ Tailscale IP not available - skipping DNS update"
