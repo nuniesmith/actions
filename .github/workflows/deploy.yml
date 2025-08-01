@@ -1796,14 +1796,32 @@ jobs:
           echo "Server IP: ${{ needs.setup-infrastructure.outputs.server_ip }}"
           echo "Tailscale IP: ${{ needs.setup-infrastructure.outputs.tailscale_ip }}"
           
-          # Decode SSH private key for deployment
+          # Debug: Check if SSH key output exists
+          if [[ -z "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" ]]; then
+            echo "❌ SSH private key output is empty"
+            echo "🔍 Available outputs from setup-infrastructure:"
+            echo "  server_ip: ${{ needs.setup-infrastructure.outputs.server_ip }}"
+            echo "  server_id: ${{ needs.setup-infrastructure.outputs.server_id }}"
+            echo "  tailscale_ip: ${{ needs.setup-infrastructure.outputs.tailscale_ip }}"
+            exit 1
+          fi
+          
+          # Ensure .ssh directory exists and decode SSH private key for deployment
+          mkdir -p ~/.ssh
           echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/deployment_key
           chmod 600 ~/.ssh/deployment_key
+          
+          # Verify the key was created successfully
+          if [[ ! -f ~/.ssh/deployment_key ]]; then
+            echo "❌ Failed to create SSH deployment key"
+            exit 1
+          fi
+          echo "✅ SSH deployment key created successfully"
           
           # Clone service repository to server
           echo "📥 Cloning ${{ env.SERVICE_NAME }} repository..."
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@${{ needs.setup-infrastructure.outputs.server_ip }} "
-            cd /home/${SERVICE_NAME}_user || cd /home
+            cd /home/${{ env.SERVICE_NAME }}_user || cd /home
             
             # Clone the service repository
             if [[ ! -d '${{ env.SERVICE_NAME }}' ]]; then
@@ -1832,13 +1850,13 @@ jobs:
             git pull origin main 2>/dev/null || echo 'No updates available'
             
             # Set ownership to service user
-            chown -R ${SERVICE_NAME}_user:${SERVICE_NAME}_user /home/${SERVICE_NAME}_user/${{ env.SERVICE_NAME }} 2>/dev/null || true
+            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }} 2>/dev/null || true
           "
           
           # Deploy the service based on its type
           echo "🐳 Starting service deployment..."
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@${{ needs.setup-infrastructure.outputs.server_ip }} "
-            cd /home/${SERVICE_NAME}_user/${{ env.SERVICE_NAME }} || cd /home/${{ env.SERVICE_NAME }}
+            cd /home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }} || cd /home/${{ env.SERVICE_NAME }}
             
             # Determine deployment method
             if [[ -f 'docker-compose.yml' ]]; then
@@ -1920,9 +1938,17 @@ jobs:
             SERVER_IP="${{ needs.setup-infrastructure.outputs.server_ip }}"
             TAILSCALE_IP="${{ needs.setup-infrastructure.outputs.tailscale_ip }}"
             
-            # Decode SSH key for health checks
+            # Ensure .ssh directory exists and decode SSH key for health checks
+            mkdir -p ~/.ssh
             echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/deployment_key
             chmod 600 ~/.ssh/deployment_key
+            
+            # Verify the key was created successfully
+            if [[ ! -f ~/.ssh/deployment_key ]]; then
+              echo "❌ Failed to create SSH deployment key for health checks"
+              exit 1
+            fi
+            echo "✅ SSH deployment key created successfully for health checks"
             
             echo "🔍 1. Basic connectivity tests..."
             # Basic connectivity test
