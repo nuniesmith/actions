@@ -460,6 +460,48 @@ jobs:
         run: |
           echo "🧹 Cleaning up old ${{ env.SERVICE_NAME }} resources..."
           
+          # Function to clean up Tailscale devices by hostname pattern
+          cleanup_tailscale_devices() {
+            local hostname_pattern="$1"
+            local cleanup_reason="${2:-old server cleanup}"
+            
+            echo "🔗 Tailscale cleanup for pattern: $hostname_pattern ($cleanup_reason)"
+            
+            DEVICES_RESPONSE=$(curl -s "https://api.tailscale.com/api/v2/tailnet/${{ secrets.TAILSCALE_TAILNET }}/devices" \
+              -u "${{ secrets.TAILSCALE_API_KEY }}:" \
+              -H "Accept: application/json" 2>/dev/null || echo '{"devices":[]}')
+            
+            MATCHING_DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg pattern "$hostname_pattern" '
+              .devices[]? | 
+              select(
+                (.name | test("^" + $pattern + "(-[0-9]+)?$")) or
+                (.name == $pattern) or
+                (.hostname | test("^" + $pattern + "(-[0-9]+)?$")) or
+                (.hostname == $pattern)
+              ) | 
+              .nodeId' 2>/dev/null || echo "")
+            
+            local removed_count=0
+            for device_id in $MATCHING_DEVICES; do
+              if [[ -n "$device_id" && "$device_id" != "null" ]]; then
+                echo "🗑️ Removing Tailscale device: $device_id"
+                curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
+                  -u "${{ secrets.TAILSCALE_API_KEY }}:" >/dev/null 2>&1
+                
+                if [[ $? -eq 0 ]]; then
+                  echo "✅ Removed Tailscale device $device_id"
+                  removed_count=$((removed_count + 1))
+                else
+                  echo "⚠️ Failed to remove Tailscale device $device_id"
+                fi
+                sleep 2
+              fi
+            done
+            
+            echo "✅ Removed $removed_count Tailscale devices for pattern: $hostname_pattern"
+            return $removed_count
+          }
+          
           # For nginx deployments, do minimal cleanup to speed up deployment
           if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
             echo "⚡ Fast cleanup mode for nginx deployment"
@@ -613,20 +655,35 @@ jobs:
             echo "[DEFAULT]
           token = $LINODE_CLI_TOKEN" > ~/.linode-cli
             
-            # Remove old service servers
+            # Remove old service servers with Tailscale cleanup
             echo "🔍 Looking for old ${{ env.SERVICE_NAME }} servers..."
-            OLD_SERVERS=$(linode-cli linodes list --json | jq -r --arg service "${{ env.SERVICE_NAME }}" '.[] | select(.label | startswith($service)) | .id')
+            OLD_SERVERS=$(linode-cli linodes list --json | jq -r --arg service "${{ env.SERVICE_NAME }}" '.[] | select(.label | startswith($service)) | "\(.id):\(.label)"')
             
-            for server_id in $OLD_SERVERS; do
-              if [[ -n "$server_id" ]]; then
-                echo "🗑️ Removing old Linode server: $server_id (${{ env.SERVICE_NAME }})"
-                linode-cli linodes delete "$server_id" --json || echo "Failed to remove server $server_id"
+            for server_entry in $OLD_SERVERS; do
+              if [[ -n "$server_entry" && "$server_entry" != ":" ]]; then
+                server_id="${server_entry%%:*}"
+                server_label="${server_entry#*:}"
+                
+                echo "🗑️ Preparing to remove old server: $server_id ($server_label)"
+                
+                # Clean up Tailscale devices for this server first
+                if [[ -n "$server_label" ]]; then
+                  cleanup_tailscale_devices "$server_label" "server removal"
+                fi
+                
+                # Now remove the Linode server
+                echo "🗑️ Removing Linode server: $server_id"
+                linode-cli linodes delete "$server_id" --json || echo "⚠️ Failed to remove server $server_id"
                 sleep 10
               fi
             done
           else
             echo "⚠️ Linode CLI token not available"
           fi
+          
+          # Final Tailscale cleanup to catch any remaining devices
+          echo "🔗 Final Tailscale cleanup for service ${{ env.SERVICE_NAME }}..."
+          cleanup_tailscale_devices "${{ env.SERVICE_NAME }}" "final cleanup"
           
           echo "✅ Cleanup completed for ${{ env.SERVICE_NAME }}"
 
