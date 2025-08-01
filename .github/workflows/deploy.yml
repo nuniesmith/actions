@@ -1183,13 +1183,26 @@ jobs:
               echo "🔍 API Response Code: $HTTP_CODE"
               
               if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                # Multiple cleanup patterns to catch all variants
+                # Debug: Show all devices before cleanup
+                echo "🔍 All devices in Tailscale network:"
+                echo "$DEVICES_JSON" | jq -r '.devices[]? | "\(.id) - \(.hostname // .name // "unknown") - \(.addresses[0] // "no-ip")"' || true
+                
+                # Multiple cleanup patterns to catch all variants for nginx
                 CLEANUP_PATTERNS=(
-                  "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
-                  "^${{ env.SERVICE_NAME }}$" 
-                  "^${{ env.SERVICE_NAME }}-"
-                  "${{ env.SERVICE_NAME }}"
+                  "^${{ env.SERVICE_NAME }}$"              # Exact match: "nginx" 
+                  "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"     # With optional number: "nginx-1"
+                  "^${{ env.SERVICE_NAME }}-"               # Starts with service name: "nginx-*"
+                  "${{ env.SERVICE_NAME }}"                 # Contains service name anywhere
                 )
+                
+                # Add nginx-specific patterns
+                if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
+                  CLEANUP_PATTERNS+=(
+                    "^nginx$"
+                    "^nginx-.*"
+                    "nginx"
+                  )
+                fi
                 
                 TOTAL_REMOVED=0
                 ALL_FOUND_DEVICES=""
@@ -1202,12 +1215,20 @@ jobs:
                     .devices[]? | 
                     select(
                       (.hostname // .name | test($pattern; "i")) or 
-                      (.name // .hostname | test($pattern; "i"))
+                      (.name // .hostname | test($pattern; "i")) or
+                      (.clientConnectivity.endpoints[]? | test($pattern; "i"))
                     ) | 
                     .id // empty' | grep -v '^$')
                   
                   if [[ -n "$DEVICES" ]]; then
+                    echo "   Found devices with pattern '$pattern':"
+                    for device_id in $DEVICES; do
+                      DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown")"')
+                      echo "      $device_id ($DEVICE_INFO)"
+                    done
                     ALL_FOUND_DEVICES="$ALL_FOUND_DEVICES $DEVICES"
+                  else
+                    echo "   No devices found for pattern '$pattern'"
                   fi
                 done
                 
@@ -1301,6 +1322,49 @@ jobs:
             sleep 30
             
             echo "✅ Server destroyed successfully"
+            
+            # Post-destruction Tailscale cleanup (in case any devices were missed)
+            echo "🧹 Final Tailscale cleanup after server destruction..."
+            if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
+              TAILNET="${TAILSCALE_TAILNET}"
+              if [[ -z "$TAILNET" ]]; then
+                DEVICES_URL="https://api.tailscale.com/api/v2/devices"
+              else
+                DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
+              fi
+              
+              DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
+              HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+              DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+              
+              if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
+                echo "🔍 Searching for remaining ${{ env.SERVICE_NAME }} devices..."
+                
+                # Find any remaining devices with nginx patterns
+                REMAINING_DEVICES=$(echo "$DEVICES_JSON" | jq -r '
+                  .devices[]? | 
+                  select(
+                    (.hostname // .name | test("^${{ env.SERVICE_NAME }}$"; "i")) or
+                    (.hostname // .name | test("^${{ env.SERVICE_NAME }}-"; "i")) or
+                    (.hostname // .name | test("${{ env.SERVICE_NAME }}"; "i"))
+                  ) | 
+                  .id // empty' | grep -v '^$' || true)
+                
+                if [[ -n "$REMAINING_DEVICES" ]]; then
+                  echo "🗑️ Found remaining devices to clean up:"
+                  for device_id in $REMAINING_DEVICES; do
+                    DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown")"')
+                    echo "   Removing: $device_id ($DEVICE_INFO)"
+                    
+                    curl -s -X DELETE -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                      "https://api.tailscale.com/api/v2/device/$device_id" >/dev/null 2>&1 || true
+                  done
+                  echo "✅ Final cleanup completed"
+                else
+                  echo "✅ No remaining ${{ env.SERVICE_NAME }} devices found"
+                fi
+              fi
+            fi
           else
             echo "ℹ️ No existing server found for ${{ env.SERVICE_NAME }}"
           fi
