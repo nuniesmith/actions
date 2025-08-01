@@ -100,15 +100,37 @@ done
 AUTH_KEY="TAILSCALE_AUTH_KEY_PLACEHOLDER"
 SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
 
-# Validate that placeholders were replaced
+# Validate that placeholders were replaced, or try environment variables as fallback
 if [[ "$AUTH_KEY" == "TAILSCALE_AUTH_KEY_PLACEHOLDER" ]]; then
-  echo "❌ TAILSCALE_AUTH_KEY placeholder was not replaced!"
-  exit 1
+  echo "⚠️ TAILSCALE_AUTH_KEY placeholder was not replaced by workflow"
+  if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
+    echo "🔄 Using TAILSCALE_AUTH_KEY from environment variable"
+    AUTH_KEY="$TAILSCALE_AUTH_KEY"
+  else
+    echo "❌ TAILSCALE_AUTH_KEY not available in environment either!"
+    echo "🔍 Available environment variables starting with TAILSCALE:"
+    env | grep -i tailscale || echo "None found"
+    echo "🔍 Checking for auth key file..."
+    if [[ -f "/root/tailscale_auth_key" ]]; then
+      AUTH_KEY=$(cat /root/tailscale_auth_key)
+      echo "✅ Found auth key in file"
+    else
+      echo "❌ No auth key file found either"
+      exit 1
+    fi
+  fi
 fi
 
 if [[ "$SERVICE_NAME" == "SERVICE_NAME_PLACEHOLDER" ]]; then
-  echo "❌ SERVICE_NAME placeholder was not replaced!"
-  exit 1
+  echo "⚠️ SERVICE_NAME placeholder was not replaced by workflow"
+  if [[ -n "${SERVICE_NAME_ENV:-}" ]]; then
+    echo "🔄 Using SERVICE_NAME_ENV from environment variable"
+    SERVICE_NAME="$SERVICE_NAME_ENV"
+  else
+    # Try to get from hostname as fallback
+    SERVICE_NAME=$(hostname)
+    echo "🔄 Using hostname as service name: $SERVICE_NAME"
+  fi
 fi
 
 if [[ -z "$AUTH_KEY" ]]; then

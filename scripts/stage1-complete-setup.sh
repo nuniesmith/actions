@@ -102,5 +102,10 @@ SERVICEEOF
 
 systemctl enable stage2-setup.service
 
+echo "🔑 Creating backup auth key file for Stage 2..."
+# This will be replaced by the workflow with the actual auth key
+echo "TAILSCALE_AUTH_KEY_PLACEHOLDER" > /root/tailscale_auth_key
+chmod 600 /root/tailscale_auth_key
+
 echo "✅ Stage 1 complete - system ready for reboot"
 echo "NEEDS_REBOOT" > /tmp/stage1_status
