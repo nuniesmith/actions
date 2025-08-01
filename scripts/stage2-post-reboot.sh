@@ -1,4 +1,20 @@
-#!/biecho "📦 Installing firewall packages after reboot..."
+#!/biecho "📦 I#!/bin/bash
+set -euo pipefail
+
+echo "🚀 Stage 2: Post-reboot setup starting..."
+
+echo "📦 Installing firewall packages after reboot..."
+# First, remove old iptables if it exists to avoid conflicts
+echo "🔧 Resolving iptables conflicts..."
+pacman -Rdd --noconfirm iptables 2>/dev/null || true
+
+# Now install iptables-nft, ufw, and jq (for DNS updates)
+if ! pacman -S --noconfirm iptables-nft ufw jq; then
+  echo "⚠️ First attempt failed, trying individually..."
+  pacman -S --noconfirm iptables-nft || echo "Failed to install iptables-nft"
+  pacman -S --noconfirm ufw || echo "Failed to install ufw"
+  pacman -S --noconfirm jq || echo "Failed to install jq"
+fiirewall packages after reboot..."
 # First, remove old iptables if it exists to avoid conflicts
 echo "� Resolving iptables conflicts..."
 pacman -Rdd --noconfirm iptables 2>/dev/null || true
