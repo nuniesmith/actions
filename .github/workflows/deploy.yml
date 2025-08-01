@@ -1675,6 +1675,9 @@ jobs:
           # Replace placeholders in stage2 script
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage2-post-reboot.sh
           sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/${{ secrets.TAILSCALE_AUTH_KEY }}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${{ secrets.CLOUDFLARE_EMAIL }}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${{ secrets.CLOUDFLARE_API_TOKEN }}/g" stage2-post-reboot.sh
+          sed -i "s/DOMAIN_NAME_PLACEHOLDER/${{ env.FULL_DOMAIN }}/g" stage2-post-reboot.sh
           
           # Upload both scripts
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
@@ -1992,6 +1995,27 @@ jobs:
             ")
             echo "📊 System resources:"
             echo "$SYSTEM_INFO"
+            
+            echo "🔍 6. DNS verification checks..."
+            # Check if DNS record was updated correctly
+            if [[ -n "${{ secrets.CLOUDFLARE_EMAIL }}" && -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]]; then
+              echo "🌐 Verifying DNS record for ${{ env.FULL_DOMAIN }}..."
+              
+              # Check DNS resolution
+              DNS_RESULT=$(dig +short "${{ env.FULL_DOMAIN }}" A 2>/dev/null | head -1 || echo "")
+              if [[ -n "$DNS_RESULT" ]]; then
+                if [[ "$DNS_RESULT" == "$TAILSCALE_IP" ]]; then
+                  echo "✅ DNS record correct: ${{ env.FULL_DOMAIN }} -> $DNS_RESULT"
+                else
+                  echo "⚠️ DNS record mismatch: ${{ env.FULL_DOMAIN }} -> $DNS_RESULT (expected: $TAILSCALE_IP)"
+                  echo "ℹ️ DNS propagation may still be in progress"
+                fi
+              else
+                echo "⚠️ DNS record not found for ${{ env.FULL_DOMAIN }}"
+              fi
+            else
+              echo "ℹ️ Cloudflare credentials not available - skipping DNS verification"
+            fi
             
             echo "✅ Health checks completed for ${{ env.SERVICE_NAME }}"
           else
