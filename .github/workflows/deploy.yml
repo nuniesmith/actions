@@ -1888,39 +1888,68 @@ jobs:
             exit 1
           fi
           
-          # Replace placeholders using environment variables for safety
+          # Debug: Show the actual auth key format (safely)
+          echo "🔍 Auth key format check:"
+          echo "  Length: ${#TAILSCALE_AUTH_KEY}"
+          echo "  First 10 chars: ${TAILSCALE_AUTH_KEY:0:10}..."
+          echo "  Contains 'tskey': $(echo "$TAILSCALE_AUTH_KEY" | grep -q 'tskey' && echo 'yes' || echo 'no')"
+          
+          # Replace placeholders using direct sed with environment variables
           echo "🔄 Replacing placeholders in stage2 script..."
           echo "TAILSCALE_AUTH_KEY length: ${#TAILSCALE_AUTH_KEY}"
           echo "SERVICE_NAME: ${{ env.SERVICE_NAME }}"
           
-          # Create replacement script to handle special characters safely
-          {
-            echo '#!/bin/bash'
-            echo 'sed -i "s|SERVICE_NAME_PLACEHOLDER|'"${{ env.SERVICE_NAME }}"'|g" stage2-post-reboot.sh'
-            echo 'sed -i "s|TAILSCALE_AUTH_KEY_PLACEHOLDER|'"${TAILSCALE_AUTH_KEY}"'|g" stage2-post-reboot.sh'
-            echo 'sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|'"${CLOUDFLARE_EMAIL:-}"'|g" stage2-post-reboot.sh'
-            echo 'sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|'"${CLOUDFLARE_API_TOKEN:-}"'|g" stage2-post-reboot.sh'
-            echo 'sed -i "s|DOMAIN_NAME_PLACEHOLDER|'"${{ env.FULL_DOMAIN }}"'|g" stage2-post-reboot.sh'
-          } > replace.sh
+          # Use environment variables directly in sed for more reliable replacement
+          export SERVICE_NAME="${{ env.SERVICE_NAME }}"
+          export FULL_DOMAIN="${{ env.FULL_DOMAIN }}"
           
-          chmod +x replace.sh
-          ./replace.sh
+          # Replace each placeholder one by one with verification
+          echo "Replacing SERVICE_NAME..."
+          sed -i "s|SERVICE_NAME_PLACEHOLDER|${SERVICE_NAME}|g" stage2-post-reboot.sh
+          
+          echo "Replacing TAILSCALE_AUTH_KEY..."
+          # Use a different delimiter to avoid conflicts
+          sed -i "s~TAILSCALE_AUTH_KEY_PLACEHOLDER~${TAILSCALE_AUTH_KEY}~g" stage2-post-reboot.sh
+          
+          echo "Replacing CLOUDFLARE_EMAIL..."
+          sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|${CLOUDFLARE_EMAIL:-}|g" stage2-post-reboot.sh
+          
+          echo "Replacing CLOUDFLARE_API_TOKEN..."  
+          sed -i "s~CLOUDFLARE_API_TOKEN_PLACEHOLDER~${CLOUDFLARE_API_TOKEN:-}~g" stage2-post-reboot.sh
+          
+          echo "Replacing DOMAIN_NAME..."
+          sed -i "s|DOMAIN_NAME_PLACEHOLDER|${FULL_DOMAIN}|g" stage2-post-reboot.sh
           
           # Verify replacements worked
           echo "🔍 Verifying placeholder replacement..."
           echo "🔍 Secrets check:"
           echo "  TAILSCALE_AUTH_KEY length: ${#TAILSCALE_AUTH_KEY}"
           echo "  TAILSCALE_AUTH_KEY starts with: ${TAILSCALE_AUTH_KEY:0:20}..."
+          echo "  TAILSCALE_AUTH_KEY ends with: ...${TAILSCALE_AUTH_KEY: -10}"
+          
+          # Check each placeholder individually
+          if grep -q "SERVICE_NAME_PLACEHOLDER" stage2-post-reboot.sh; then
+            echo "❌ SERVICE_NAME_PLACEHOLDER still exists!"
+          else
+            echo "✅ SERVICE_NAME_PLACEHOLDER replaced"
+          fi
           
           if grep -q "TAILSCALE_AUTH_KEY_PLACEHOLDER" stage2-post-reboot.sh; then
-            echo "❌ TAILSCALE_AUTH_KEY placeholder not replaced!"
-            echo "🔍 Checking what's in the script around the auth key:"
-            grep -n -A2 -B2 "AUTH_KEY" stage2-post-reboot.sh || true
-            echo "🔍 Full script content around placeholders:"
-            grep -n "PLACEHOLDER" stage2-post-reboot.sh || echo "No remaining placeholders found"
+            echo "❌ TAILSCALE_AUTH_KEY_PLACEHOLDER still exists!"
+            echo "🔍 Lines containing AUTH_KEY:"
+            grep -n "AUTH_KEY" stage2-post-reboot.sh | head -5
+            echo "🔍 Raw content around line 8:"
+            sed -n '5,12p' stage2-post-reboot.sh
             exit 1
           else
-            echo "✅ Tailscale auth key placeholder replaced successfully"
+            echo "✅ TAILSCALE_AUTH_KEY_PLACEHOLDER replaced successfully"
+          fi
+          
+          if grep -q "PLACEHOLDER" stage2-post-reboot.sh; then
+            echo "⚠️ Some placeholders remain:"
+            grep -n "PLACEHOLDER" stage2-post-reboot.sh
+          else
+            echo "✅ All placeholders appear to be replaced"
           fi
           
           # Show first 20 lines of the processed script for debugging
