@@ -4,11 +4,18 @@ set -euo pipefail
 echo "🚀 Stage 2: Post-reboot setup starting..."
 
 echo "📦 Installing firewall packages after reboot..."
-pacman -S --noconfirm ufw iptables-nft || {
-  echo "🔄 Resolving iptables conflicts..."
-  pacman -Rdd --noconfirm iptables 2>/dev/null || true
-  pacman -S --noconfirm iptables-nft ufw
-}
+# First, remove old iptables if it exists to avoid conflicts
+echo "� Resolving iptables conflicts..."
+pacman -Rdd --noconfirm iptables 2>/dev/null || true
+
+# Now install iptables-nft and ufw
+if ! pacman -S --noconfirm iptables-nft ufw; then
+  echo "⚠️ First attempt failed, trying individually..."
+  pacman -S --noconfirm iptables-nft || echo "Failed to install iptables-nft"
+  pacman -S --noconfirm ufw || echo "Failed to install ufw"
+fi
+
+echo "✅ Firewall packages installed successfully"
 
 echo "🔥 Configuring firewall before starting services..."
 ufw --force reset

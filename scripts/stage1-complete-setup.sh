@@ -8,7 +8,8 @@ echo "📦 Updating package database..."
 pacman -Sy
 
 echo "📦 Installing essential packages..."
-CORE_PACKAGES="curl wget git openssh docker docker-compose tailscale ufw iptables-nft base-devel"
+# Install core packages first (without iptables to avoid conflicts)
+CORE_PACKAGES="curl wget git openssh docker docker-compose tailscale base-devel"
 
 for attempt in {1..3}; do
   echo "Package install attempt $attempt..."
@@ -31,6 +32,11 @@ if [[ "${INSTALL_SUCCESS:-false}" != "true" ]]; then
     timeout 120 pacman -S --noconfirm "$pkg" || echo "⚠️ Failed to install $pkg, continuing..."
   done
 fi
+
+echo "🔥 Handling iptables conflict (will be resolved in Stage 2 after reboot)..."
+# Remove conflicting iptables package and install iptables-nft after reboot
+# This avoids the interactive prompt during stage1
+echo "ℹ️ Deferring iptables-nft and ufw installation to Stage 2 (post-reboot)"
 
 echo "🐳 Setting up Docker and networks..."
 systemctl enable docker
