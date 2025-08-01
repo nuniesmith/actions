@@ -1478,6 +1478,12 @@ jobs:
               echo "✅ Using existing server: $SERVER_IP (ID: $SERVER_ID)"
               echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
               echo "server_id=$SERVER_ID" >> $GITHUB_OUTPUT
+              
+              # Create a placeholder SSH key for consistency (will use password auth for existing servers)
+              ssh-keygen -t rsa -b 4096 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-${{ env.SERVICE_NAME }}" 2>/dev/null || true
+              SSH_PRIVATE_KEY=$(base64 -w 0 ~/.ssh/linode_deployment_key 2>/dev/null || echo "")
+              echo "ssh_private_key=$SSH_PRIVATE_KEY" >> $GITHUB_OUTPUT
+              
               exit 0
             fi
           fi
@@ -1499,6 +1505,10 @@ jobs:
           echo "ssh_private_key=$SSH_PRIVATE_KEY" >> $GITHUB_OUTPUT
           
           echo "🚀 Creating server with SSH key authentication..."
+          echo "Using server type: ${{ env.SERVER_TYPE }}"
+          echo "Using region: ${{ env.TARGET_REGION }}"
+          echo "Using backup setting: ${{ inputs.enable_backups || 'false' }}"
+          
           RESULT=$(linode-cli linodes create \
             --type "${{ env.SERVER_TYPE }}" \
             --region "${{ env.TARGET_REGION }}" \
@@ -1509,7 +1519,24 @@ jobs:
             --backups_enabled=${{ inputs.enable_backups || 'false' }} \
             --text --no-headers)
           
+          echo "🔍 Server creation result:"
+          echo "$RESULT"
+          
+          if [[ -z "$RESULT" ]] || [[ "$RESULT" == *"error"* ]] || [[ "$RESULT" == *"Error"* ]]; then
+            echo "❌ Server creation failed!"
+            echo "Result: $RESULT"
+            exit 1
+          fi
+          
           SERVER_ID=$(echo "$RESULT" | cut -f1)
+          
+          if [[ -z "$SERVER_ID" ]] || [[ ! "$SERVER_ID" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid server ID extracted: '$SERVER_ID'"
+            echo "Full result: $RESULT"
+            exit 1
+          fi
+          
+          echo "🆔 Server created with ID: $SERVER_ID"
           
           # Wait for server to be running
           echo "⏳ Waiting for server to be ready..."
