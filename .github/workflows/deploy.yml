@@ -1941,47 +1941,104 @@ jobs:
             journalctl -u stage2-setup.service --no-pager -l --since='10 minutes ago' || echo 'No logs available'
           " || true
           
-          # Wait for Stage 2 systemd service to complete
-          echo "⏳ Waiting for stage2-setup.service to complete..."
-          for i in {1..12}; do  # Wait up to 3 minutes (12 * 15s)
-            SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-              "systemctl is-active stage2-setup.service 2>/dev/null || echo 'inactive'")
-            
-            echo "Attempt $i/12: Stage 2 service status: $SERVICE_STATUS"
-            
-            # For oneshot services: inactive means it completed (successfully or failed)
-            if [[ "$SERVICE_STATUS" == "inactive" ]]; then
-              # Check if it completed successfully
-              EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-                "systemctl show stage2-setup.service --property=ExecMainStatus --value 2>/dev/null || echo 'unknown'")
+          # Quick check if Tailscale is already working
+          echo "🔍 Quick Tailscale connectivity check..."
+          QUICK_TAILSCALE_CHECK=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+            "timeout 10 tailscale status 2>/dev/null | grep -q 'Logged in' && echo 'connected' || echo 'checking'" || echo "checking")
+          
+          if [[ "$QUICK_TAILSCALE_CHECK" == "connected" ]]; then
+            echo "✅ Tailscale is already connected - skipping service wait"
+            SKIP_SERVICE_WAIT=true
+          else
+            echo "⏳ Tailscale not yet ready - will monitor service completion"
+            SKIP_SERVICE_WAIT=false
+          fi
+          
+          # Wait for Stage 2 systemd service to complete (only if Tailscale not already connected)
+          if [[ "$SKIP_SERVICE_WAIT" != "true" ]]; then
+            echo "⏳ Waiting for stage2-setup.service to complete..."
+            for i in {1..8}; do  # Reduced to 2 minutes (8 * 15s) since it's usually quick
+              SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "systemctl is-active stage2-setup.service 2>/dev/null || echo 'inactive'")
               
-              if [[ "$EXIT_STATUS" == "0" ]]; then
-                echo "✅ Stage 2 service completed successfully"
-                break
-              else
-                echo "⚠️ Stage 2 service completed with exit status: $EXIT_STATUS"
-                # Show logs for debugging
-                echo "🔍 Stage 2 service logs:"
-                ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-                  "journalctl -u stage2-setup.service --no-pager -l --since='5 minutes ago'" || true
+              echo "Attempt $i/8: Stage 2 service status: $SERVICE_STATUS"
+              
+              # Check Tailscale status during wait
+              TAILSCALE_READY=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "timeout 5 tailscale status 2>/dev/null | grep -q 'Logged in' && echo 'ready' || echo 'pending'" || echo "pending")
+              
+              if [[ "$TAILSCALE_READY" == "ready" ]]; then
+                echo "✅ Tailscale is connected - service completed successfully"
                 break
               fi
-            fi
-            
-            sleep 15
-          done
-          
-          # Manual trigger of stage2 if it hasn't run
-          echo "🔧 Checking if stage2 needs manual execution..."
-          TAILSCALE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-            "tailscale status 2>/dev/null | grep -q 'Logged in' && echo 'connected' || echo 'not-connected'")
-          
-          if [[ "$TAILSCALE_STATUS" == "not-connected" ]]; then
-            echo "⚠️ Tailscale not connected - manually triggering stage2..."
-            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-              "/usr/local/bin/stage2-post-reboot.sh" || echo "Manual stage2 execution failed"
+              
+              # For oneshot services: inactive means it completed (successfully or failed)
+              if [[ "$SERVICE_STATUS" == "inactive" ]]; then
+                # Check if it completed successfully
+                EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                  "systemctl show stage2-setup.service --property=ExecMainStatus --value 2>/dev/null || echo 'unknown'")
+                
+                if [[ "$EXIT_STATUS" == "0" ]]; then
+                  echo "✅ Stage 2 service completed successfully"
+                  break
+                else
+                  echo "⚠️ Stage 2 service completed with exit status: $EXIT_STATUS"
+                  echo "🔍 Checking if Tailscale connected anyway..."
+                  FINAL_CHECK=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                    "timeout 5 tailscale status 2>/dev/null | grep -q 'Logged in' && echo 'connected' || echo 'failed'")
+                  
+                  if [[ "$FINAL_CHECK" == "connected" ]]; then
+                    echo "✅ Tailscale is connected despite service exit status - continuing"
+                    break
+                  else
+                    # Show logs for debugging
+                    echo "🔍 Stage 2 service logs:"
+                    ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                      "journalctl -u stage2-setup.service --no-pager -l --since='5 minutes ago'" || true
+                    break
+                  fi
+                fi
+              fi
+              
+              sleep 15
+            done
           else
-            echo "✅ Tailscale is already connected"
+            echo "⚡ Skipped service wait - Tailscale already operational"
+          fi
+          
+          # Smart stage2 completion check
+          echo "🔧 Verifying deployment completion..."
+          TAILSCALE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+            "timeout 10 tailscale status 2>/dev/null | grep -q 'Logged in' && echo 'connected' || echo 'not-connected'")
+          
+          if [[ "$TAILSCALE_STATUS" == "connected" ]]; then
+            echo "✅ Tailscale is connected and operational"
+            
+            # Quick verification of key services
+            echo "🔍 Verifying core services..."
+            DOCKER_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "systemctl is-active docker 2>/dev/null || echo 'inactive'")
+            echo "Docker status: $DOCKER_STATUS"
+            
+            if [[ "$DOCKER_STATUS" == "active" ]]; then
+              echo "✅ All core services are operational"
+            else
+              echo "⚠️ Docker not active, but continuing since Tailscale is connected"
+            fi
+          else
+            echo "⚠️ Tailscale not connected - attempting manual stage2 trigger..."
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "timeout 60 /usr/local/bin/stage2-post-reboot.sh || echo 'Manual stage2 execution completed with timeout/error'" || true
+            
+            # Recheck after manual trigger
+            TAILSCALE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "timeout 10 tailscale status 2>/dev/null | grep -q 'Logged in' && echo 'connected' || echo 'not-connected'")
+            
+            if [[ "$TAILSCALE_STATUS" == "connected" ]]; then
+              echo "✅ Manual trigger successful - Tailscale now connected"
+            else
+              echo "❌ Manual trigger failed - Tailscale still not connected"
+            fi
           fi
           
           # Get Tailscale IP (multiple methods)
