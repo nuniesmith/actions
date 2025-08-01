@@ -1,5 +1,36 @@
 #!/bin/bash
-# stage2-validation.sh - Validation script for Stage 2 completion
+# stage2-validation.sh - Validation scriptinfo "Checking Docker Networks"
+echo "-------------------------"
+
+# Get the service name (check if network config exists)
+SERVICE_NAME=""
+if [[ -f "/opt/docker-networks.conf" ]]; then
+    source /opt/docker-networks.conf
+fi
+
+if [[ -n "$SERVICE_NAME" ]]; then
+    EXPECTED_NETWORK="${SERVICE_NAME}-network"
+    if docker network inspect "$EXPECTED_NETWORK" >/dev/null 2>&1; then
+        success "Docker network '$EXPECTED_NETWORK' exists"
+        # Get subnet info
+        SUBNET=$(docker network inspect "$EXPECTED_NETWORK" --format='{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || echo "unknown")
+        info "  Subnet: $SUBNET"
+    else
+        error "Docker network '$EXPECTED_NETWORK' not found"
+    fi
+else
+    # Fallback: check for any of the known networks
+    EXPECTED_NETWORKS=("nginx-network" "fks-network" "ats-network")
+    for network in "${EXPECTED_NETWORKS[@]}"; do
+        if docker network inspect "$network" >/dev/null 2>&1; then
+            success "Docker network '$network' exists"
+            # Get subnet info
+            SUBNET=$(docker network inspect "$network" --format='{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || echo "unknown")
+            info "  Subnet: $SUBNET"
+            break
+        fi
+    done
+fiompletion
 # This script validates that Stage 2 completed successfully
 
 set -euo pipefail
@@ -54,18 +85,6 @@ fi
 echo ""
 info "Checking Docker Networks"
 echo "-------------------------"
-
-EXPECTED_NETWORKS=("fks-network" "ats-network" "nginx-network")
-for network in "${EXPECTED_NETWORKS[@]}"; do
-    if docker network inspect "$network" >/dev/null 2>&1; then
-        success "Docker network '$network' exists"
-        # Get subnet info
-        SUBNET=$(docker network inspect "$network" --format='{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || echo "unknown")
-        info "  Subnet: $SUBNET"
-    else
-        warning "Docker network '$network' not found"
-    fi
-done
 
 # Check 3: Firewall Configuration
 echo ""
@@ -215,10 +234,29 @@ else
     error "Critical services have issues"
 fi
 
-if docker network inspect fks-network >/dev/null 2>&1 && docker network inspect ats-network >/dev/null 2>&1 && docker network inspect nginx-network >/dev/null 2>&1; then
+# Check for service-specific network
+NETWORK_FOUND=false
+if [[ -f "/opt/docker-networks.conf" ]]; then
+    source /opt/docker-networks.conf
+    if [[ -n "$SERVICE_NAME" ]] && docker network inspect "${SERVICE_NAME}-network" >/dev/null 2>&1; then
+        NETWORK_FOUND=true
+    fi
+fi
+
+# Fallback: check for any known network
+if [[ "$NETWORK_FOUND" == "false" ]]; then
+    for network in nginx-network fks-network ats-network; do
+        if docker network inspect "$network" >/dev/null 2>&1; then
+            NETWORK_FOUND=true
+            break
+        fi
+    done
+fi
+
+if [[ "$NETWORK_FOUND" == "true" ]]; then
     success "Docker networks are configured"
 else
-    warning "Some Docker networks are missing"
+    warning "Docker networks are missing"
 fi
 
 if [[ -f "/tmp/tailscale_ip" ]] && [[ "$(cat /tmp/tailscale_ip)" != "pending" ]] && [[ "$(cat /tmp/tailscale_ip)" != "failed" ]]; then

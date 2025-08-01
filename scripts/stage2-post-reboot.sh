@@ -55,32 +55,74 @@ for i in {1..10}; do
   sleep 5
 done
 
-echo "🌐 Recreating Docker networks with static IPs..."
-docker network rm fks-network ats-network nginx-network 2>/dev/null || true
+echo "🌐 Creating Docker network for service: $SERVICE_NAME..."
 
-docker network create --driver bridge --subnet=172.20.0.0/16 --ip-range=172.20.1.0/24 --gateway=172.20.0.1 fks-network
-docker network create --driver bridge --subnet=172.21.0.0/16 --ip-range=172.21.1.0/24 --gateway=172.21.0.1 ats-network
-docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network
+# Clean up any existing networks (but only remove the one we're about to create)
+docker network rm ${SERVICE_NAME}-network 2>/dev/null || true
 
-echo "🔧 Configuring iptables rules for Docker networks..."
-iptables -I DOCKER-USER -s 172.20.0.0/16 -d 172.21.0.0/16 -j ACCEPT 2>/dev/null || true
-iptables -I DOCKER-USER -s 172.20.0.0/16 -d 172.22.0.0/16 -j ACCEPT 2>/dev/null || true
-iptables -I DOCKER-USER -s 172.21.0.0/16 -d 172.20.0.0/16 -j ACCEPT 2>/dev/null || true
-iptables -I DOCKER-USER -s 172.21.0.0/16 -d 172.22.0.0/16 -j ACCEPT 2>/dev/null || true
-iptables -I DOCKER-USER -s 172.22.0.0/16 -d 172.20.0.0/16 -j ACCEPT 2>/dev/null || true
-iptables -I DOCKER-USER -s 172.22.0.0/16 -d 172.21.0.0/16 -j ACCEPT 2>/dev/null || true
+# Create service-specific network
+case "$SERVICE_NAME" in
+  "nginx")
+    docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network
+    echo "✅ nginx-network created with subnet 172.22.0.0/16"
+    ;;
+  "fks")
+    docker network create --driver bridge --subnet=172.20.0.0/16 --ip-range=172.20.1.0/24 --gateway=172.20.0.1 fks-network
+    echo "✅ fks-network created with subnet 172.20.0.0/16"
+    ;;
+  "ats")
+    docker network create --driver bridge --subnet=172.21.0.0/16 --ip-range=172.21.1.0/24 --gateway=172.21.0.1 ats-network
+    echo "✅ ats-network created with subnet 172.21.0.0/16"
+    ;;
+  *)
+    # Default: create a generic network for the service
+    docker network create --driver bridge --subnet=172.23.0.0/16 --ip-range=172.23.1.0/24 --gateway=172.23.0.1 ${SERVICE_NAME}-network
+    echo "✅ ${SERVICE_NAME}-network created with subnet 172.23.0.0/16"
+    ;;
+esac
 
-echo "✅ Docker networks configured with static IP ranges"
+echo "🔧 Configuring iptables rules for ${SERVICE_NAME} network..."
+# Basic Docker network access rules (these are usually handled by Docker automatically)
+case "$SERVICE_NAME" in
+  "nginx")
+    # nginx typically needs to communicate outbound for reverse proxy functionality
+    iptables -I DOCKER-USER -s 172.22.0.0/16 -j ACCEPT 2>/dev/null || true
+    ;;
+  "fks")
+    iptables -I DOCKER-USER -s 172.20.0.0/16 -j ACCEPT 2>/dev/null || true
+    ;;
+  "ats")
+    iptables -I DOCKER-USER -s 172.21.0.0/16 -j ACCEPT 2>/dev/null || true
+    ;;
+  *)
+    iptables -I DOCKER-USER -s 172.23.0.0/16 -j ACCEPT 2>/dev/null || true
+    ;;
+esac
 
-cat > /opt/docker-networks.conf << 'NETWORKS_EOF'
-FKS_NETWORK_NAME="fks-network"
-FKS_NETWORK_SUBNET="172.20.0.0/16"
-ATS_NETWORK_NAME="ats-network"
-ATS_NETWORK_SUBNET="172.21.0.0/16"
-NGINX_NETWORK_NAME="nginx-network"
-NGINX_NETWORK_SUBNET="172.22.0.0/16"
-ALL_DOCKER_SUBNETS="172.17.0.0/16,172.20.0.0/16,172.21.0.0/16,172.22.0.0/16"
-NETWORKS_EOF
+echo "✅ Docker network configured for $SERVICE_NAME"
+
+# Create service-specific network configuration
+cat > /opt/docker-networks.conf << EOF
+# Docker network configuration for $SERVICE_NAME service
+SERVICE_NAME="$SERVICE_NAME"
+SERVICE_NETWORK_NAME="${SERVICE_NAME}-network"
+
+# Service-specific network details
+case "\$SERVICE_NAME" in
+  "nginx")
+    SERVICE_NETWORK_SUBNET="172.22.0.0/16"
+    ;;
+  "fks")
+    SERVICE_NETWORK_SUBNET="172.20.0.0/16"
+    ;;
+  "ats")
+    SERVICE_NETWORK_SUBNET="172.21.0.0/16"
+    ;;
+  *)
+    SERVICE_NETWORK_SUBNET="172.23.0.0/16"
+    ;;
+esac
+EOF
 chmod 644 /opt/docker-networks.conf
 
 echo "🔗 Starting and authenticating Tailscale..."
@@ -218,21 +260,40 @@ if [[ "$TAILSCALE_CONNECTED" != "true" ]]; then
 fi
 
 if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
-  echo "⏳ Waiting for Tailscale network to be ready..."
+  echo "🔍 Quick Tailscale IP assignment check..."
   TAILSCALE_IP="pending"
   
-  for i in {1..30}; do
-    if tailscale status | grep -q "Logged in"; then
-      CURRENT_IP=$(tailscale ip -4 2>/dev/null || echo "")
-      if [[ -n "$CURRENT_IP" && "$CURRENT_IP" != "" ]]; then
-        TAILSCALE_IP="$CURRENT_IP"
-        echo "✅ Tailscale fully connected - IP: $TAILSCALE_IP"
-        break
+  # Quick check - if we're logged in, get the IP immediately
+  if tailscale status | grep -q "Logged in"; then
+    CURRENT_IP=$(tailscale ip -4 2>/dev/null || echo "")
+    if [[ -n "$CURRENT_IP" && "$CURRENT_IP" != "" ]]; then
+      TAILSCALE_IP="$CURRENT_IP"
+      echo "✅ Tailscale IP available immediately: $TAILSCALE_IP"
+    else
+      # Brief wait for IP assignment - but only 3 attempts max
+      echo "⏳ Brief wait for IP assignment..."
+      for i in {1..3}; do
+        CURRENT_IP=$(tailscale ip -4 2>/dev/null || echo "")
+        if [[ -n "$CURRENT_IP" && "$CURRENT_IP" != "" ]]; then
+          TAILSCALE_IP="$CURRENT_IP"
+          echo "✅ Tailscale IP assigned: $TAILSCALE_IP"
+          break
+        fi
+        echo "Attempt $i/3: Waiting for IP..."
+        sleep 5
+      done
+      
+      # If still no IP, proceed anyway - we can get it later
+      if [[ "$TAILSCALE_IP" == "pending" ]]; then
+        echo "⚠️ IP not immediately available, but Tailscale is connected - proceeding"
+        # Try one more time with a different method
+        TAILSCALE_IP=$(tailscale status --self --peers=false 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || echo "pending")
+        if [[ "$TAILSCALE_IP" != "pending" ]]; then
+          echo "✅ Got IP via status command: $TAILSCALE_IP"
+        fi
       fi
     fi
-    echo "Attempt $i/30: Waiting for Tailscale IP assignment..."
-    sleep 10
-  done
+  fi
   
   echo "$TAILSCALE_IP" > /tmp/tailscale_ip
   

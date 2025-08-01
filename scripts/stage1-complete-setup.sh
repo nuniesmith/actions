@@ -43,13 +43,8 @@ systemctl enable docker
 systemctl start docker
 sleep 5
 
-# Create service-specific networks with static IP ranges
-echo "🔧 Creating service networks..."
-docker network rm fks-network ats-network nginx-network 2>/dev/null || true
-
-docker network create --driver bridge --subnet=172.20.0.0/16 --ip-range=172.20.1.0/24 --gateway=172.20.0.1 fks-network
-docker network create --driver bridge --subnet=172.21.0.0/16 --ip-range=172.21.1.0/24 --gateway=172.21.0.1 ats-network  
-docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network
+# Docker networks will be created in stage2 post-reboot
+echo "🔧 Docker network creation deferred to stage2 post-reboot..."
 
 systemctl stop docker
 

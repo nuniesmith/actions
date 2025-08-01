@@ -2167,16 +2167,15 @@ jobs:
               
               echo '✅ start.sh deployment completed'
             elif [[ -f 'docker-compose.yml' ]]; then
-              echo '🐳 Deploying with Docker Compose...'
+              echo '� Deploying with Docker Compose...'
               
-              # Stop existing containers first
+              # Stop existing containers
               docker-compose down 2>/dev/null || true
               
-              # Clean up conflicting networks if they exist
-              echo '🧹 Cleaning up conflicting networks...'
-              docker network rm ${{ env.SERVICE_NAME }}-network 2>/dev/null || true
+              # No need to pull images since they're standard (nginx, etc.)
+              echo 'ℹ️ Using standard Docker images - no custom image pull needed'
               
-              # Start services (docker-compose will create the network)
+              # Start services
               docker-compose up -d
               
               echo '✅ Docker Compose deployment completed'
@@ -2185,6 +2184,14 @@ jobs:
               echo '🔍 Available files:'
               ls -la
               exit 1
+            fi
+          "
+                --restart unless-stopped \
+                --network ${{ env.SERVICE_NAME }}-network \
+                -p 80:80 \
+                nginx:alpine
+              
+              echo '✅ Basic service deployment completed'
             fi
           "
           
