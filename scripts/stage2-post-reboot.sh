@@ -86,35 +86,65 @@ echo "🔗 Starting and authenticating Tailscale..."
 systemctl start tailscaled
 
 echo "⏳ Waiting for tailscaled daemon to start..."
-for i in {1..10}; do
+for i in {1..15}; do
   if systemctl is-active tailscaled >/dev/null 2>&1; then
     echo "✅ Tailscaled daemon is active"
     break
   fi
-  echo "Attempt $i/10: Waiting for tailscaled..."
+  echo "Attempt $i/15: Waiting for tailscaled..."
   sleep 3
 done
 
+# Get the auth key (should be replaced by the workflow)
 AUTH_KEY="TAILSCALE_AUTH_KEY_PLACEHOLDER"
+SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
+
+# Validate that placeholders were replaced
+if [[ "$AUTH_KEY" == "TAILSCALE_AUTH_KEY_PLACEHOLDER" ]]; then
+  echo "❌ TAILSCALE_AUTH_KEY placeholder was not replaced!"
+  exit 1
+fi
+
+if [[ "$SERVICE_NAME" == "SERVICE_NAME_PLACEHOLDER" ]]; then
+  echo "❌ SERVICE_NAME placeholder was not replaced!"
+  exit 1
+fi
+
 if [[ -z "$AUTH_KEY" ]]; then
   echo "❌ TAILSCALE_AUTH_KEY is empty"
   exit 1
 fi
 
 echo "🔗 Authenticating with Tailscale..."
+echo "Using hostname: $SERVICE_NAME"
+
 TAILSCALE_CONNECTED=false
 DOCKER_SUBNETS="172.17.0.0/16,172.20.0.0/16,172.21.0.0/16,172.22.0.0/16"
 
-if tailscale up --authkey="$AUTH_KEY" --hostname="SERVICE_NAME_PLACEHOLDER" --accept-routes --advertise-routes="$DOCKER_SUBNETS" --timeout=180s; then
+# First attempt: Full configuration with Docker subnets
+echo "🌐 Attempting Tailscale connection with Docker subnet advertisement..."
+if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --advertise-routes="$DOCKER_SUBNETS" --reset; then
   TAILSCALE_CONNECTED=true
-  echo "✅ Tailscale connected with Docker subnets"
+  echo "✅ Tailscale connected with Docker subnets advertised"
 else
-  echo "⚠️ First attempt failed, trying basic connection..."
-  if tailscale up --authkey="$AUTH_KEY" --accept-routes --timeout=180s; then
+  echo "⚠️ Full configuration failed, trying basic connection..."
+  # Second attempt: Basic connection without subnet advertisement
+  if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --reset; then
     TAILSCALE_CONNECTED=true
     echo "✅ Tailscale connected with basic configuration"
+    
+    # Try to add subnet advertisement after connection
+    echo "🔄 Attempting to add Docker subnet advertisement..."
+    sleep 10
+    if timeout 60 tailscale up --advertise-routes="$DOCKER_SUBNETS"; then
+      echo "✅ Docker subnets advertised successfully"
+    else
+      echo "⚠️ Failed to advertise Docker subnets, but connection is established"
+    fi
   else
-    echo "❌ Tailscale connection failed"
+    echo "❌ Tailscale connection failed completely"
+    echo "🔍 Checking tailscale logs..."
+    journalctl -u tailscaled --no-pager -l --since="5 minutes ago" || true
   fi
 fi
 
@@ -150,6 +180,15 @@ sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_c
 systemctl restart sshd
 
 echo "🔍 Verifying service user configuration..."
-id SERVICE_NAME_PLACEHOLDER_user || echo "⚠️ Service user not found"
+id "${SERVICE_NAME}_user" || echo "⚠️ Service user ${SERVICE_NAME}_user not found"
+
+echo "📊 Tailscale status summary..."
+if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
+  echo "🔗 Tailscale Status:"
+  tailscale status --self || echo "⚠️ Could not get tailscale status"
+  echo ""
+  echo "🌐 Advertised Routes:"
+  tailscale status --peers=false --self | grep -E "(advertised|routes)" || echo "⚠️ No route information available"
+fi
 
 echo "✅ Stage 2 complete - server ready for service deployment"

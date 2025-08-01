@@ -81,15 +81,8 @@ echo "⚙️ Enabling services for post-reboot..."
 systemctl enable docker
 systemctl enable tailscaled
 
-echo "📝 Creating stage2 post-reboot script..."
-curl -o /usr/local/bin/stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
-chmod +x /usr/local/bin/stage2-post-reboot.sh
-
-# Replace placeholders in stage2 script
-sed -i "s/SERVICE_NAME_PLACEHOLDER/SERVICE_NAME_PLACEHOLDER/g" /usr/local/bin/stage2-post-reboot.sh
-sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/TAILSCALE_AUTH_KEY_PLACEHOLDER/g" /usr/local/bin/stage2-post-reboot.sh
-
-echo "🔄 Creating systemd service for post-reboot setup..."
+echo "📝 Creating systemd service for post-reboot setup..."
+# Note: The stage2-post-reboot.sh script is uploaded by the workflow with placeholders already replaced
 cat > /etc/systemd/system/stage2-setup.service << 'SERVICEEOF'
 [Unit]
 Description=Stage 2 Post-Reboot Setup

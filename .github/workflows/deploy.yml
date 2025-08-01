@@ -1668,8 +1668,20 @@ jobs:
           sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${{ secrets.ACTIONS_USER_PASSWORD }}/g" stage1-setup.sh
           sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${{ secrets.JORDAN_PASSWORD }}/g" stage1-setup.sh
           
+          # Download and prepare the stage 2 script with proper placeholders replaced
+          curl -o stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
+          chmod +x stage2-post-reboot.sh
+          
+          # Replace placeholders in stage2 script
+          sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage2-post-reboot.sh
+          sed -i "s/TAILSCALE_AUTH_KEY_PLACEHOLDER/${{ secrets.TAILSCALE_AUTH_KEY }}/g" stage2-post-reboot.sh
+          
+          # Upload both scripts
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/stage1-setup.sh && /tmp/stage1-setup.sh"
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-post-reboot.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
+          
+          # Execute stage 1 setup
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "chmod +x /tmp/stage1-setup.sh && chmod +x /usr/local/bin/stage2-post-reboot.sh && /tmp/stage1-setup.sh"
           
           STAGE1_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "cat /tmp/stage1_status" || echo "unknown")
           echo "stage1_status=$STAGE1_STATUS" >> $GITHUB_OUTPUT
