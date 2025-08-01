@@ -509,21 +509,91 @@ jobs:
             # Install dependencies
             sudo apt-get update && sudo apt-get install -y curl jq
             
-            # Quick Tailscale cleanup (only exact matches)
+            # Enhanced Tailscale cleanup for nginx (comprehensive patterns)
             if [[ -n "$TAILSCALE_AUTH_KEY" && -n "$TAILSCALE_TAILNET" ]]; then
-              echo "🔗 Quick Tailscale cleanup for nginx..."
-              DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices" || echo '{"devices":[]}')
+              echo "🔗 Enhanced Tailscale cleanup for nginx..."
+              DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices" 2>/dev/null || echo "CURL_FAILED")
               
-              if echo "$DEVICES_RESPONSE" | jq -e '.devices' >/dev/null 2>&1; then
-                NGINX_DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r '.devices[]? | select(.hostname == "nginx" or .name == "nginx") | .id')
-                for device_id in $NGINX_DEVICES; do
-                  if [[ -n "$device_id" ]]; then
-                    echo "🗑️ Removing nginx device: $device_id"
-                    curl -s -X DELETE -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                      "https://api.tailscale.com/api/v2/device/$device_id" || true
+              # Extract HTTP status code
+              HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+              DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+              
+              if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
+                echo "🔍 Searching for nginx devices with comprehensive patterns..."
+                
+                # Multiple patterns to catch nginx devices with various naming conventions
+                NGINX_CLEANUP_PATTERNS=(
+                  "^nginx(-[0-9]+)?$"
+                  "^nginx$" 
+                  "^nginx-"
+                  "nginx"
+                )
+                
+                TOTAL_NGINX_REMOVED=0
+                ALL_NGINX_DEVICES=""
+                
+                # Collect all matching nginx device IDs
+                for pattern in "${NGINX_CLEANUP_PATTERNS[@]}"; do
+                  echo "🔍 Searching for nginx pattern: $pattern"
+                  
+                  DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$pattern" '
+                    .devices[]? | 
+                    select(
+                      (.hostname // .name | test($pattern; "i")) or 
+                      (.name // .hostname | test($pattern; "i"))
+                    ) | 
+                    .id // empty' | grep -v '^$')
+                  
+                  if [[ -n "$DEVICES" ]]; then
+                    ALL_NGINX_DEVICES="$ALL_NGINX_DEVICES $DEVICES"
                   fi
                 done
+                
+                # Remove duplicates
+                UNIQUE_NGINX_DEVICES=$(echo "$ALL_NGINX_DEVICES" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+                
+                if [[ -n "$UNIQUE_NGINX_DEVICES" ]]; then
+                  echo "Found nginx devices to remove..."
+                  for device_id in $UNIQUE_NGINX_DEVICES; do
+                    if [[ -n "$device_id" ]]; then
+                      DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
+                      echo "🗑️ Removing nginx device: $device_id - $DEVICE_INFO"
+                      
+                      # Try primary endpoint
+                      REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                        -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                        "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "CURL_FAILED")
+                      
+                      REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                      
+                      if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
+                        echo "   ✅ Successfully removed"
+                        ((TOTAL_NGINX_REMOVED++))
+                      else
+                        echo "   ⚠️ Trying alternative endpoint..."
+                        # Try alternative endpoint
+                        ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
+                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                          "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices/$device_id" 2>/dev/null || echo "CURL_FAILED")
+                        
+                        ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                        if [[ "$ALT_REMOVE_CODE" == "200" || "$ALT_REMOVE_CODE" == "204" ]]; then
+                          echo "   ✅ Successfully removed via alternative endpoint"
+                          ((TOTAL_NGINX_REMOVED++))
+                        else
+                          echo "   ❌ Failed to remove device $device_id"
+                        fi
+                      fi
+                      sleep 1
+                    fi
+                  done
+                  echo "✅ Enhanced nginx Tailscale cleanup completed - removed $TOTAL_NGINX_REMOVED devices"
+                else
+                  echo "ℹ️ No nginx devices found to remove"
+                fi
+              else
+                echo "⚠️ Tailscale API error or no devices array (HTTP: $HTTP_CODE)"
               fi
             fi
             
