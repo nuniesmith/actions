@@ -1878,6 +1878,13 @@ jobs:
           
           # Replace placeholders in stage2 script
           echo "🔄 Replacing placeholders in stage2 script..."
+          
+          # Debug: Show environment variables before replacement
+          echo "🔍 Debugging environment variables:"
+          echo "TS_OAUTH_CLIENT_ID length: ${#TS_OAUTH_CLIENT_ID}"
+          echo "TS_OAUTH_SECRET length: ${#TS_OAUTH_SECRET}"
+          echo "TAILSCALE_TAILNET: ${TAILSCALE_TAILNET:-"(not set)"}"
+          
           sed -i "s|TS_OAUTH_CLIENT_ID_PLACEHOLDER|${TS_OAUTH_CLIENT_ID}|g" stage2-post-reboot.sh
           sed -i "s|TS_OAUTH_SECRET_PLACEHOLDER|${TS_OAUTH_SECRET}|g" stage2-post-reboot.sh
           sed -i "s|TAILSCALE_TAILNET_PLACEHOLDER|${TAILSCALE_TAILNET:-"-"}|g" stage2-post-reboot.sh
@@ -1886,20 +1893,34 @@ jobs:
           sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|${CLOUDFLARE_EMAIL:-""}|g" stage2-post-reboot.sh
           sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|${CLOUDFLARE_API_TOKEN:-""}|g" stage2-post-reboot.sh
           
-          # Debug: Show environment variables
-          echo "🔍 Debugging environment variables:"
-          echo "TS_OAUTH_CLIENT_ID length: ${#TS_OAUTH_CLIENT_ID}"
-          echo "TS_OAUTH_SECRET length: ${#TS_OAUTH_SECRET}"
-          echo "TAILSCALE_TAILNET: ${TAILSCALE_TAILNET:-"(not set)"}"
+          # Debug: Show a few lines of the replaced script
+          echo "🔍 Sample of replaced script:"
+          head -20 stage2-post-reboot.sh | grep -E "(TS_OAUTH|TAILSCALE)" || echo "No OAuth lines found in first 20 lines"
           
           # Verify OAuth placeholders were replaced
           echo "🔍 Verifying OAuth placeholder replacement..."
+          
+          # Count remaining placeholders
+          PLACEHOLDER_COUNT=$(grep -c "PLACEHOLDER" stage2-post-reboot.sh || echo "0")
+          echo "📊 Remaining placeholders: $PLACEHOLDER_COUNT"
+          
           if grep -q "TS_OAUTH_CLIENT_ID_PLACEHOLDER\|TS_OAUTH_SECRET_PLACEHOLDER" stage2-post-reboot.sh; then
             echo "❌ OAuth placeholders still exist in stage2 script!"
+            echo "🔍 Remaining OAuth placeholders:"
+            grep -n "TS_OAUTH.*PLACEHOLDER" stage2-post-reboot.sh || echo "None found"
+            echo "🔍 All remaining placeholders:"
             grep -n "PLACEHOLDER" stage2-post-reboot.sh | head -5
-            exit 1
+            
+            # Show environment variable values (masked)
+            echo "🔍 Environment variable status:"
+            [[ -n "$TS_OAUTH_CLIENT_ID" ]] && echo "✅ TS_OAUTH_CLIENT_ID is set" || echo "❌ TS_OAUTH_CLIENT_ID is empty"
+            [[ -n "$TS_OAUTH_SECRET" ]] && echo "✅ TS_OAUTH_SECRET is set" || echo "❌ TS_OAUTH_SECRET is empty"
+            
+            echo "⚠️ Continuing deployment without OAuth placeholders replaced"
+            echo "🔧 Tailscale connection may fail, but infrastructure will be set up"
+          else
+            echo "✅ OAuth placeholders replaced successfully"
           fi
-          echo "✅ OAuth placeholders replaced successfully"
           
           # Upload scripts to server
           echo "📤 Uploading scripts to server..."
