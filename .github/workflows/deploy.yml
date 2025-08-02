@@ -1883,6 +1883,14 @@ jobs:
           sed -i "s|TAILSCALE_TAILNET_PLACEHOLDER|${TAILSCALE_TAILNET:-"-"}|g" stage2-post-reboot.sh
           sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" stage2-post-reboot.sh
           sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" stage2-post-reboot.sh
+          sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|${CLOUDFLARE_EMAIL:-""}|g" stage2-post-reboot.sh
+          sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|${CLOUDFLARE_API_TOKEN:-""}|g" stage2-post-reboot.sh
+          
+          # Debug: Show environment variables
+          echo "🔍 Debugging environment variables:"
+          echo "TS_OAUTH_CLIENT_ID length: ${#TS_OAUTH_CLIENT_ID}"
+          echo "TS_OAUTH_SECRET length: ${#TS_OAUTH_SECRET}"
+          echo "TAILSCALE_TAILNET: ${TAILSCALE_TAILNET:-"(not set)"}"
           
           # Verify OAuth placeholders were replaced
           echo "🔍 Verifying OAuth placeholder replacement..."
