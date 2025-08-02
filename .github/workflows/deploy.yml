@@ -532,6 +532,12 @@ jobs:
                 -H "Authorization: Bearer $TOKEN" \
                 -H "Accept: application/json" 2>/dev/null || echo '{"devices":[]}')
               
+              # Validate response before processing
+              if ! echo "$DEVICES_RESPONSE" | jq empty 2>/dev/null; then
+                echo "⚠️ Invalid JSON response from Tailscale API, skipping cleanup"
+                return 0
+              fi
+              
               MATCHING_DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg pattern "$hostname_pattern" '
                 .devices[]? | 
                 select(
@@ -543,282 +549,42 @@ jobs:
                 .id' 2>/dev/null || echo "")
               
               local removed_count=0
-              for device_id in $MATCHING_DEVICES; do
-                if [[ -n "$device_id" && "$device_id" != "null" ]]; then
-                  echo "🗑️ Removing Tailscale device: $device_id"
-                  RESPONSE=$(curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
-                    -H "Authorization: Bearer $TOKEN" \
-                    -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
-                  
-                  HTTP_STATUS=$(echo "$RESPONSE" | grep -o "HTTP_STATUS:[0-9]*" | cut -d: -f2)
-                  if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]]; then
-                    echo "✅ Removed Tailscale device $device_id"
-                    removed_count=$((removed_count + 1))
-                  else
-                    echo "⚠️ Failed to remove device $device_id (HTTP $HTTP_STATUS)"
+              if [[ -n "$MATCHING_DEVICES" ]]; then
+                for device_id in $MATCHING_DEVICES; do
+                  if [[ -n "$device_id" && "$device_id" != "null" ]]; then
+                    echo "🗑️ Removing Tailscale device: $device_id"
+                    RESPONSE=$(curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
+                      -H "Authorization: Bearer $TOKEN" \
+                      -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
+                    
+                    HTTP_STATUS=$(echo "$RESPONSE" | grep -o "HTTP_STATUS:[0-9]*" | cut -d: -f2)
+                    if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]]; then
+                      echo "✅ Removed Tailscale device $device_id"
+                      removed_count=$((removed_count + 1))
+                    else
+                      echo "⚠️ Failed to remove device $device_id (HTTP $HTTP_STATUS)"
+                    fi
                   fi
-                fi
-                sleep 1
-              done
+                  sleep 1
+                done
+              fi
               
               if [[ $removed_count -gt 0 ]]; then
                 echo "✅ $hostname_pattern cleanup completed - removed $removed_count devices"
               else
                 echo "ℹ️ No $hostname_pattern devices found to remove"
               fi
+              
+              return 0
             }
             
             # Perform cleanup
-            cleanup_tailscale_devices "${{ env.SERVICE_NAME }}" "pre-deployment cleanup"
-          fi
-              -H "Accept: application/json" 2>/dev/null || echo '{"devices":[]}')
-            
-            MATCHING_DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg pattern "$hostname_pattern" '
-              .devices[]? | 
-              select(
-                (.name | test("^" + $pattern + "(-[0-9]+)?$")) or
-                (.name == $pattern) or
-                (.hostname | test("^" + $pattern + "(-[0-9]+)?$")) or
-                (.hostname == $pattern)
-              ) | 
-              .id' 2>/dev/null || echo "")
-            
-            local removed_count=0
-            for device_id in $MATCHING_DEVICES; do
-              if [[ -n "$device_id" && "$device_id" != "null" ]]; then
-                echo "🗑️ Removing Tailscale device: $device_id"
-                RESPONSE=$(curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
-                  -H "Authorization: Bearer $TOKEN" \
-                  -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
-                
-                HTTP_STATUS=$(echo "$RESPONSE" | grep -o "HTTP_STATUS:[0-9]*" | cut -d: -f2)
-                if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]]; then
-                  echo "✅ Removed Tailscale device $device_id"
-                  removed_count=$((removed_count + 1))
-                else
-                  echo "⚠️ Failed to remove Tailscale device $device_id"
-                fi
-                sleep 2
-              fi
-            done
-            
-            echo "✅ Removed $removed_count Tailscale devices for pattern: $hostname_pattern"
-            return $removed_count
-          }
-          
-          # For nginx deployments, do minimal cleanup to speed up deployment
-          if [[ "${{ env.SERVICE_NAME }}" == "nginx" ]]; then
-            echo "⚡ Fast cleanup mode for nginx deployment"
-            
-            # Install dependencies
-            sudo apt-get update && sudo apt-get install -y curl jq
-            
-            # Enhanced Tailscale cleanup for nginx (comprehensive patterns)
-            if [[ -n "$TAILSCALE_AUTH_KEY" && -n "$TAILSCALE_TAILNET" ]]; then
-              echo "🔗 Enhanced Tailscale cleanup for nginx..."
-              DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices" 2>/dev/null || echo "CURL_FAILED")
-              
-              # Extract HTTP status code
-              HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-              DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
-              
-              if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                echo "🔍 Searching for nginx devices with comprehensive patterns..."
-                
-                # Multiple patterns to catch nginx devices with various naming conventions
-                NGINX_CLEANUP_PATTERNS=(
-                  "^nginx(-[0-9]+)?$"
-                  "^nginx$" 
-                  "^nginx-"
-                  "nginx"
-                )
-                
-                TOTAL_NGINX_REMOVED=0
-                ALL_NGINX_DEVICES=""
-                
-                # Collect all matching nginx device IDs
-                for pattern in "${NGINX_CLEANUP_PATTERNS[@]}"; do
-                  echo "🔍 Searching for nginx pattern: $pattern"
-                  
-                  DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$pattern" '
-                    .devices[]? | 
-                    select(
-                      (.hostname // .name | test($pattern; "i")) or 
-                      (.name // .hostname | test($pattern; "i"))
-                    ) | 
-                    .id // empty' | grep -v '^$')
-                  
-                  if [[ -n "$DEVICES" ]]; then
-                    ALL_NGINX_DEVICES="$ALL_NGINX_DEVICES $DEVICES"
-                  fi
-                done
-                
-                # Remove duplicates
-                UNIQUE_NGINX_DEVICES=$(echo "$ALL_NGINX_DEVICES" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
-                
-                if [[ -n "$UNIQUE_NGINX_DEVICES" ]]; then
-                  echo "Found nginx devices to remove..."
-                  for device_id in $UNIQUE_NGINX_DEVICES; do
-                    if [[ -n "$device_id" ]]; then
-                      DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
-                      echo "🗑️ Removing nginx device: $device_id - $DEVICE_INFO"
-                      
-                      # Try primary endpoint
-                      REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                        -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                        "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "CURL_FAILED")
-                      
-                      REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-                      
-                      if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
-                        echo "   ✅ Successfully removed"
-                        ((TOTAL_NGINX_REMOVED++))
-                      else
-                        echo "   ⚠️ Trying alternative endpoint..."
-                        # Try alternative endpoint
-                        ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                          "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices/$device_id" 2>/dev/null || echo "CURL_FAILED")
-                        
-                        ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-                        if [[ "$ALT_REMOVE_CODE" == "200" || "$ALT_REMOVE_CODE" == "204" ]]; then
-                          echo "   ✅ Successfully removed via alternative endpoint"
-                          ((TOTAL_NGINX_REMOVED++))
-                        else
-                          echo "   ❌ Failed to remove device $device_id"
-                        fi
-                      fi
-                      sleep 1
-                    fi
-                  done
-                  echo "✅ Enhanced nginx Tailscale cleanup completed - removed $TOTAL_NGINX_REMOVED devices"
-                else
-                  echo "ℹ️ No nginx devices found to remove"
-                fi
-              else
-                echo "⚠️ Tailscale API error or no devices array (HTTP: $HTTP_CODE)"
-              fi
-            fi
-            
-            # Quick Linode cleanup
-            if [[ -n "$LINODE_CLI_TOKEN" ]]; then
-              echo "🖥️ Quick Linode cleanup for nginx..."
-              pip install linode-cli
-              echo "[DEFAULT]
-          token = $LINODE_CLI_TOKEN" > ~/.linode-cli
-              
-              OLD_SERVERS=$(linode-cli linodes list --json | jq -r '.[] | select(.label == "nginx") | .id')
-              for server_id in $OLD_SERVERS; do
-                if [[ -n "$server_id" ]]; then
-                  echo "🗑️ Removing nginx server: $server_id"
-                  linode-cli linodes delete $server_id --format id || echo "Failed to remove $server_id"
-                fi
-              done
-            fi
-            
-            echo "✅ Quick cleanup completed for nginx"
-            exit 0
+            cleanup_tailscale_devices "${{ env.SERVICE_NAME }}" "pre-deployment cleanup" || {
+              echo "⚠️ Cleanup function failed, but continuing deployment..."
+            }
           fi
           
-          # Full cleanup for other services
-          echo "🔧 Full cleanup mode for ${{ env.SERVICE_NAME }}"
-          
-          # Install dependencies
-          sudo apt-get update && sudo apt-get install -y curl jq
-          
-          # Cleanup Tailscale devices first
-          if [[ -n "$TAILSCALE_AUTH_KEY" && -n "$TAILSCALE_TAILNET" ]]; then
-            echo "🔗 Cleaning up old Tailscale devices..."
-            
-            # Remove old service devices using direct API
-            echo "🔍 Comprehensive cleanup of old ${{ env.SERVICE_NAME }} devices..."
-            DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-              "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices" 2>/dev/null || echo "CURL_FAILED")
-            
-            # Extract HTTP status code
-            HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-            DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
-            
-            if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-              # Multiple patterns to catch all service variants
-              CLEANUP_PATTERNS=(
-                "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
-                "^${{ env.SERVICE_NAME }}$" 
-                "^${{ env.SERVICE_NAME }}-"
-                "${{ env.SERVICE_NAME }}"
-              )
-              
-              TOTAL_REMOVED=0
-              ALL_FOUND_DEVICES=""
-              
-              # Collect all matching device IDs
-              for pattern in "${CLEANUP_PATTERNS[@]}"; do
-                echo "🔍 Searching for pattern: $pattern"
-                
-                DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg pattern "$pattern" '
-                  .devices[]? | 
-                  select(
-                    (.hostname // .name | test($pattern; "i")) or 
-                    (.name // .hostname | test($pattern; "i"))
-                  ) | 
-                  .id // empty' | grep -v '^$')
-                
-                if [[ -n "$DEVICES" ]]; then
-                  ALL_FOUND_DEVICES="$ALL_FOUND_DEVICES $DEVICES"
-                fi
-              done
-              
-              # Remove duplicates
-              UNIQUE_DEVICES=$(echo "$ALL_FOUND_DEVICES" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
-              
-              if [[ -n "$UNIQUE_DEVICES" ]]; then
-                echo "Found ${{ env.SERVICE_NAME }} devices to remove..."
-                for device_id in $UNIQUE_DEVICES; do
-                  if [[ -n "$device_id" ]]; then
-                    DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown") (\(.addresses[0] // "no-ip"))"')
-                    echo "🗑️ Removing Tailscale device: $device_id - $DEVICE_INFO"
-                    
-                    # Try primary endpoint
-                    REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                      -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                      "https://api.tailscale.com/api/v2/device/$device_id" 2>/dev/null || echo "CURL_FAILED")
-                    
-                    REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-                    
-                    if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
-                      echo "   ✅ Successfully removed"
-                      ((TOTAL_REMOVED++))
-                    else
-                      echo "   ⚠️ Trying alternative endpoint..."
-                      # Try alternative endpoint
-                      ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                        -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                        "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices/$device_id" 2>/dev/null || echo "CURL_FAILED")
-                      
-                      ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-                      if [[ "$ALT_REMOVE_CODE" == "200" || "$ALT_REMOVE_CODE" == "204" ]]; then
-                        echo "   ✅ Successfully removed via alternative endpoint"
-                        ((TOTAL_REMOVED++))
-                      else
-                        echo "   ❌ Failed to remove device $device_id"
-                      fi
-                    fi
-                    sleep 1
-                  fi
-                done
-                echo "✅ ${{ env.SERVICE_NAME }} Tailscale cleanup completed - removed $TOTAL_REMOVED devices"
-              else
-                echo "No ${{ env.SERVICE_NAME }} devices found to remove"
-              fi
-            else
-              echo "⚠️ No devices array in Tailscale response or API error"
-            fi
-          else
-            echo "⚠️ Tailscale API credentials not available"
-          fi
-          
-          # Cleanup Linode servers
+          # Linode cleanup for old servers
           if [[ -n "$LINODE_CLI_TOKEN" ]]; then
             echo "🖥️ Cleaning up old Linode servers..."
             
@@ -829,7 +595,7 @@ jobs:
             echo "[DEFAULT]
           token = $LINODE_CLI_TOKEN" > ~/.linode-cli
             
-            # Remove old service servers with Tailscale cleanup
+            # Remove old service servers
             echo "🔍 Looking for old ${{ env.SERVICE_NAME }} servers..."
             OLD_SERVERS=$(linode-cli linodes list --json | jq -r --arg service "${{ env.SERVICE_NAME }}" '.[] | select(.label | startswith($service)) | "\(.id):\(.label)"')
             
@@ -838,15 +604,7 @@ jobs:
                 server_id="${server_entry%%:*}"
                 server_label="${server_entry#*:}"
                 
-                echo "🗑️ Preparing to remove old server: $server_id ($server_label)"
-                
-                # Clean up Tailscale devices for this server first
-                if [[ -n "$server_label" ]]; then
-                  cleanup_tailscale_devices "$server_label" "server removal"
-                fi
-                
-                # Now remove the Linode server
-                echo "🗑️ Removing Linode server: $server_id"
+                echo "�️ Removing old server: $server_id ($server_label)"
                 linode-cli linodes delete "$server_id" --json || echo "⚠️ Failed to remove server $server_id"
                 sleep 10
               fi
@@ -855,11 +613,11 @@ jobs:
             echo "⚠️ Linode CLI token not available"
           fi
           
-          # Final Tailscale cleanup to catch any remaining devices
-          echo "🔗 Final Tailscale cleanup for service ${{ env.SERVICE_NAME }}..."
-          cleanup_tailscale_devices "${{ env.SERVICE_NAME }}" "final cleanup"
-          
           echo "✅ Cleanup completed for ${{ env.SERVICE_NAME }}"
+
+  # ============================================================================
+  # Infrastructure Setup
+  # ============================================================================
 
   # ============================================================================
   # Code Testing (Optional)
