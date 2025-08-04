@@ -636,12 +636,183 @@ jobs:
           fi
           
           # Execute with explicit error handling and detailed logging
-          echo "🚀 Executing server creation script..."
+          echo "🚀 Executing server creation process..."
           set -e  # Exit on any error
-          set -x  # Show executed commands
-          actions/scripts/linode/create-server.sh "${{ env.SERVICE_NAME }}" "${{ env.SERVER_TYPE }}" "${{ env.TARGET_REGION }}" "${{ inputs.overwrite_server }}"
-          set +x  # Disable command echoing
-          echo "✅ Server creation script completed successfully"
+          
+          # Determine server label
+          SERVER_LABEL="${{ env.SERVICE_NAME }}"
+          echo "🏷️ Using server label: $SERVER_LABEL"
+          
+          # Check if we need to overwrite/destroy existing servers
+          if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
+            echo "🔍 Checking for existing servers to overwrite..."
+            EXISTING_SERVERS=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" || true)
+            
+            if [[ -n "$EXISTING_SERVERS" ]]; then
+              echo "🗑️ Found existing servers to remove:"
+              echo "$EXISTING_SERVERS"
+              
+              # Remove each existing server
+              echo "$EXISTING_SERVERS" | while IFS= read -r server_line; do
+                if [[ -n "$server_line" ]]; then
+                  SERVER_ID=$(echo "$server_line" | cut -f1)
+                  SERVER_LABEL_OLD=$(echo "$server_line" | cut -f2)
+                  echo "🗑️ Removing existing server: $SERVER_ID ($SERVER_LABEL_OLD)"
+                  linode-cli linodes delete "$SERVER_ID" || echo "⚠️ Failed to remove server $SERVER_ID"
+                fi
+              done
+              
+              echo "⏳ Waiting for server deletion to complete..."
+              sleep 30
+            else
+              echo "✅ No existing servers found with name pattern '${{ env.SERVICE_NAME }}'"
+            fi
+          fi
+          
+          # Check if server already exists (unless we just destroyed it or overwrite is enabled)
+          if [[ "${{ inputs.overwrite_server }}" != "true" ]]; then
+            EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep "${{ env.SERVICE_NAME }}" | head -1)
+            
+            if [[ -n "$EXISTING_SERVER" ]]; then
+              echo "🔍 Found existing server - using it"
+              SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
+              
+              # Try different columns for IP address (Linode CLI output format can vary)
+              for col in 5 6 7; do
+                IP=$(echo "$EXISTING_SERVER" | cut -f$col)
+                if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  SERVER_IP="$IP"
+                  break
+                fi
+              done
+              
+              if [[ -z "$SERVER_IP" ]]; then
+                echo "❌ Could not extract IP address from existing server info"
+                exit 1
+              fi
+              
+              echo "✅ Using existing server: $SERVER_IP (ID: $SERVER_ID)"
+              echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+              echo "server_id=$SERVER_ID" >> $GITHUB_OUTPUT
+              
+              # Create SSH key for consistency
+              ssh-keygen -t rsa -b 4096 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-${{ env.SERVICE_NAME }}" 2>/dev/null || true
+              SSH_PRIVATE_KEY=$(base64 -w 0 ~/.ssh/linode_deployment_key 2>/dev/null || echo "")
+              echo "ssh_private_key=$SSH_PRIVATE_KEY" >> $GITHUB_OUTPUT
+              
+              echo "✅ Server ready for deployment"
+              exit 0
+            fi
+          fi
+          
+          # Create new server
+          echo "🆕 Creating new server: $SERVER_LABEL"
+          
+          # Generate SSH key for this deployment
+          echo "🔑 Generating SSH key for server access..."
+          ssh-keygen -t rsa -b 4096 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-${{ env.SERVICE_NAME }}"
+          
+          # Get the public key content for server authorization
+          SSH_PUBLIC_KEY=$(cat ~/.ssh/linode_deployment_key.pub)
+          echo "🔑 Generated SSH key pair"
+          
+          # Store the private key (base64 encoded for safe storage)
+          SSH_PRIVATE_KEY=$(base64 -w 0 ~/.ssh/linode_deployment_key)
+          echo "ssh_private_key=$SSH_PRIVATE_KEY" >> $GITHUB_OUTPUT
+          
+          echo "🚀 Creating server with Linode CLI..."
+          echo "Parameters:"
+          echo "  Type: ${{ env.SERVER_TYPE }}"
+          echo "  Region: ${{ env.TARGET_REGION }}"
+          echo "  Label: $SERVER_LABEL"
+          
+          # Create the server
+          RESULT=$(linode-cli linodes create \
+            --type "${{ env.SERVER_TYPE }}" \
+            --region "${{ env.TARGET_REGION }}" \
+            --image "linode/arch" \
+            --label "$SERVER_LABEL" \
+            --root_pass "$SERVICE_ROOT_PASSWORD" \
+            --authorized_keys "$SSH_PUBLIC_KEY" \
+            --backups_enabled=false \
+            --text --no-headers)
+          
+          echo "🔍 Server creation result:"
+          echo "$RESULT"
+          
+          if [[ -z "$RESULT" ]] || [[ "$RESULT" == *"error"* ]] || [[ "$RESULT" == *"Error"* ]]; then
+            echo "❌ Server creation failed!"
+            echo "Result: $RESULT"
+            exit 1
+          fi
+          
+          SERVER_ID=$(echo "$RESULT" | cut -f1)
+          
+          if [[ -z "$SERVER_ID" ]] || [[ ! "$SERVER_ID" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid server ID extracted: '$SERVER_ID'"
+            echo "Full result: $RESULT"
+            exit 1
+          fi
+          
+          echo "🆔 Server created with ID: $SERVER_ID"
+          
+          # Wait for server to be running
+          echo "⏳ Waiting for server to be ready..."
+          ATTEMPT=0
+          while true; do
+            # Get server info and check status
+            SERVER_INFO=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
+            
+            # Debug: show the full output on first few attempts
+            if [[ $ATTEMPT -lt 3 ]]; then
+              echo "🔍 Server info: $SERVER_INFO"
+            fi
+            
+            # Status is typically in column 6, but let's be flexible
+            STATUS=$(echo "$SERVER_INFO" | cut -f6)
+            
+            echo "Attempt $((++ATTEMPT)): Status='$STATUS'"
+            
+            # Check if server is running
+            if [[ "$STATUS" == "running" ]]; then
+              echo "✅ Server is running!"
+              break
+            fi
+            
+            # Don't wait forever for server status
+            if [[ $ATTEMPT -gt 20 ]]; then
+              echo "⚠️ Server status check timeout - proceeding anyway"
+              break
+            fi
+            
+            sleep 10
+          done
+          
+          # Get server IP
+          SERVER_INFO=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
+          echo "🔍 Final server info: $SERVER_INFO"
+          
+          # Try different columns for IP address
+          for col in 5 6 7; do
+            IP=$(echo "$SERVER_INFO" | cut -f$col)
+            if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              SERVER_IP="$IP"
+              break
+            fi
+          done
+          
+          if [[ -z "$SERVER_IP" ]]; then
+            echo "❌ Could not extract IP address from server info"
+            echo "Server info was: $SERVER_INFO"
+            exit 1
+          fi
+          
+          echo "✅ Server ready: $SERVER_IP (ID: $SERVER_ID)"
+          
+          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+          echo "server_id=$SERVER_ID" >> $GITHUB_OUTPUT
+          
+          echo "✅ Server creation completed successfully"
 
       - name: ⏳ Wait for SSH Access
         run: |
