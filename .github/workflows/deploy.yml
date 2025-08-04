@@ -1295,7 +1295,7 @@ jobs:
                     DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown")"')
                     echo "   Removing: $device_id ($DEVICE_INFO)"
                     
-                    curl -s -X DELETE -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                    curl -s -X DELETE -H "Authorization: Bearer $CLEANUP_TOKEN" \
                       "https://api.tailscale.com/api/v2/device/$device_id" >/dev/null 2>&1 || true
                   done
                   echo "✅ Final cleanup completed"
@@ -1422,27 +1422,27 @@ jobs:
                         DEVICES_URL="https://api.tailscale.com/api/v2/devices"
                       else
                         echo "🔍 Using tailnet: $TAILNET"
-                    DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
-                  fi
-                  
-                  echo "🌐 Fetching ALL remaining devices for final cleanup..."
-                  DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
-                  
-                  # Extract HTTP status code
-                  HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-                  DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
-                  
-                  echo "🔍 API Response Code: $HTTP_CODE"
-                  
-                  if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                    # Even more aggressive cleanup patterns for final cleanup
-                    CLEANUP_PATTERNS=(
-                      "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
-                      "^${{ env.SERVICE_NAME }}$" 
-                      "^${{ env.SERVICE_NAME }}-"
-                      "${{ env.SERVICE_NAME }}"
-                      ".*${{ env.SERVICE_NAME }}.*"  # Catch any device containing the service name
-                    )
+                        DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
+                      fi
+                      
+                      echo "🌐 Fetching ALL remaining devices for final cleanup..."
+                      DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $DESTROY_TOKEN" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
+                      
+                      # Extract HTTP status code
+                      HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                      DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+                      
+                      echo "🔍 API Response Code: $HTTP_CODE"
+                      
+                      if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
+                        # Even more aggressive cleanup patterns for final cleanup
+                        CLEANUP_PATTERNS=(
+                          "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"
+                          "^${{ env.SERVICE_NAME }}$" 
+                          "^${{ env.SERVICE_NAME }}-"
+                          "${{ env.SERVICE_NAME }}"
+                          ".*${{ env.SERVICE_NAME }}.*"  # Catch any device containing the service name
+                        )
                     
                     TOTAL_REMOVED=0
                     ALL_FOUND_DEVICES=""
@@ -1478,7 +1478,7 @@ jobs:
                           # Try both API endpoint formats aggressively
                           DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
                           REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                            -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                            -H "Authorization: Bearer $DESTROY_TOKEN" \
                             "$DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
                           
                           REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
@@ -1496,7 +1496,7 @@ jobs:
                             fi
                             
                             ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                              -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                              -H "Authorization: Bearer $DESTROY_TOKEN" \
                               "$ALT_DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
                             
                             ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
@@ -1513,38 +1513,19 @@ jobs:
                         fi
                       done
                       echo "✅ Final Tailscale cleanup completed - removed $TOTAL_REMOVED devices total"
-                          echo "🗑️ Removing orphaned Tailscale device: $device_id - $DEVICE_INFO"
-                          
-                          DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
-                          REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                            -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
-                            "$DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
-                          
-                          REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-                          
-                          if [[ "$REMOVE_CODE" == "200" || "$REMOVE_CODE" == "204" ]]; then
-                            echo "   ✅ Successfully removed"
-                            ((REMOVED_COUNT++))
-                          else
-                            echo "   ❌ Failed to remove device $device_id (HTTP: $REMOVE_CODE)"
-                          fi
-                          
-                          # Rate limiting
-                          sleep 1
-                        fi
-                      done
-                      echo "✅ Orphaned device cleanup completed - removed $REMOVED_COUNT devices"
                     else
-                      echo "ℹ️ No orphaned Tailscale devices found matching pattern: $SERVICE_PATTERN"
+                      echo "ℹ️ No Tailscale devices found matching cleanup patterns"
                     fi
                   else
                     echo "⚠️ Could not retrieve Tailscale devices for cleanup - HTTP: $HTTP_CODE"
                   fi
                 fi
-              else
-                echo "⚠️ No server found for ${{ env.SERVICE_NAME }}"
               fi
-              ;;
+            fi
+          else
+            echo "⚠️ No server found for ${{ env.SERVICE_NAME }}"
+          fi
+          ;;
           esac
 
   # ============================================================================
