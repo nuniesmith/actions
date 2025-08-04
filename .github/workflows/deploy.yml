@@ -1383,6 +1383,18 @@ jobs:
       needs.setup-infrastructure.outputs.tailscale_ip != ''
       
     steps:
+      - name: 📥 Checkout Actions Repository
+        uses: actions/checkout@v4
+        with:
+          repository: nuniesmith/actions
+          path: actions
+          
+      - name: 🔑 Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/linode_deployment_key
+          chmod 600 ~/.ssh/linode_deployment_key
+          
       - name: 🌐 Verify Cloudflare DNS Updates
         env:
           TAILSCALE_IP: ${{ needs.setup-infrastructure.outputs.tailscale_ip }}
