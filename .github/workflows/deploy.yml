@@ -912,6 +912,18 @@ jobs:
           echo "export CLOUDFLARE_API_TOKEN_ENV=\"${CLOUDFLARE_API_TOKEN:-}\"" >> stage2-env.sh
           echo "export ADMIN_EMAIL_ENV=\"${ADMIN_EMAIL:-}\"" >> stage2-env.sh
           echo "export DOMAIN_NAME_ENV=\"${{ env.FULL_DOMAIN }}\"" >> stage2-env.sh
+          
+          # Add GitHub Actions direct environment variables as fallback
+          echo "# GitHub Actions direct environment variables (fallback)" >> stage2-env.sh
+          echo "export GITHUB_ACTIONS_TS_OAUTH_CLIENT_ID=\"${TS_OAUTH_CLIENT_ID}\"" >> stage2-env.sh
+          echo "export GITHUB_ACTIONS_TS_OAUTH_SECRET=\"${TS_OAUTH_SECRET}\"" >> stage2-env.sh
+          echo "export GITHUB_ACTIONS_SERVICE_NAME=\"${{ env.SERVICE_NAME }}\"" >> stage2-env.sh
+          echo "export GITHUB_ACTIONS_DOMAIN_NAME=\"${{ env.FULL_DOMAIN }}\"" >> stage2-env.sh
+          echo "export GITHUB_ACTIONS_TAILSCALE_TAILNET=\"${TAILSCALE_TAILNET:-}\"" >> stage2-env.sh
+          echo "echo \"✅ Stage2 environment variables exported\"" >> stage2-env.sh
+          echo "echo \"🔍 TS_OAUTH_CLIENT_ID length: \${#TS_OAUTH_CLIENT_ID_ENV}\"" >> stage2-env.sh
+          echo "echo \"🔍 TS_OAUTH_SECRET length: \${#TS_OAUTH_SECRET_ENV}\"" >> stage2-env.sh
+          
           chmod +x stage2-env.sh
           
           # Also create a direct credential replacement script for troubleshooting
@@ -971,12 +983,14 @@ jobs:
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-post-reboot.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-env.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-env.sh root@${{ steps.create-server.outputs.server_ip }}:/opt/
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no fix-stage2-credentials.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
           
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "
             chmod +x /tmp/stage1-setup.sh
             chmod +x /usr/local/bin/stage2-post-reboot.sh
             chmod +x /usr/local/bin/stage2-env.sh
+            chmod +x /opt/stage2-env.sh
             chmod +x /usr/local/bin/fix-stage2-credentials.sh
             /tmp/stage1-setup.sh
           "

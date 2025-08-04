@@ -3,6 +3,17 @@ set -euo pipefail
 
 echo "🚀 Stage 2: Post-reboot setup starting..."
 
+# Source environment variables if available
+if [[ -f /opt/stage2-env.sh ]]; then
+  echo "🔧 Loading environment variables from stage2-env.sh..."
+  source /opt/stage2-env.sh
+  echo "✅ Environment variables loaded"
+  echo "🔍 Debug: TS_OAUTH_CLIENT_ID_ENV length: ${#TS_OAUTH_CLIENT_ID_ENV:-0}"
+  echo "🔍 Debug: TS_OAUTH_SECRET_ENV length: ${#TS_OAUTH_SECRET_ENV:-0}"
+else
+  echo "⚠️ No environment file found at /opt/stage2-env.sh"
+fi
+
 # Get configuration variables (should be replaced by the workflow)
 TS_OAUTH_CLIENT_ID="TS_OAUTH_CLIENT_ID_PLACEHOLDER"
 TS_OAUTH_SECRET="TS_OAUTH_SECRET_PLACEHOLDER"
@@ -13,20 +24,44 @@ CLOUDFLARE_EMAIL="CLOUDFLARE_EMAIL_PLACEHOLDER"
 CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_PLACEHOLDER"
 ADMIN_EMAIL="ADMIN_EMAIL_PLACEHOLDER"
 
+# Fallback: Check for direct GitHub Actions environment variables first
+echo "🔍 Checking for GitHub Actions environment variables..."
+if [[ -n "${GITHUB_ACTIONS_TS_OAUTH_CLIENT_ID:-}" ]]; then
+  echo "✅ Found TS_OAUTH_CLIENT_ID in GitHub Actions environment"
+  TS_OAUTH_CLIENT_ID="$GITHUB_ACTIONS_TS_OAUTH_CLIENT_ID"
+fi
+
+if [[ -n "${GITHUB_ACTIONS_TS_OAUTH_SECRET:-}" ]]; then
+  echo "✅ Found TS_OAUTH_SECRET in GitHub Actions environment"
+  TS_OAUTH_SECRET="$GITHUB_ACTIONS_TS_OAUTH_SECRET"
+fi
+
+if [[ -n "${GITHUB_ACTIONS_SERVICE_NAME:-}" ]]; then
+  echo "✅ Found SERVICE_NAME in GitHub Actions environment"
+  SERVICE_NAME="$GITHUB_ACTIONS_SERVICE_NAME"
+fi
+
+if [[ -n "${GITHUB_ACTIONS_DOMAIN_NAME:-}" ]]; then
+  echo "✅ Found DOMAIN_NAME in GitHub Actions environment"
+  DOMAIN_NAME="$GITHUB_ACTIONS_DOMAIN_NAME"
+fi
+
 # Validate that placeholders were replaced, or try environment variables as fallback
-if [[ "$TS_OAUTH_CLIENT_ID" == "TS_OAUTH_CLIENT_ID_PLACEHOLDER" ]]; then
-  echo "⚠️ TS_OAUTH_CLIENT_ID placeholder was not replaced by workflow"
+if [[ "$TS_OAUTH_CLIENT_ID" == "TS_OAUTH_CLIENT_ID_PLACEHOLDER" || "$TS_OAUTH_CLIENT_ID" == "***" ]]; then
+  echo "⚠️ TS_OAUTH_CLIENT_ID placeholder was not replaced by workflow or is masked"
   if [[ -n "${TS_OAUTH_CLIENT_ID_ENV:-}" ]]; then
     echo "🔄 Using TS_OAUTH_CLIENT_ID from environment variable"
     TS_OAUTH_CLIENT_ID="$TS_OAUTH_CLIENT_ID_ENV"
   else
     echo "❌ No TS_OAUTH_CLIENT_ID found in environment either!"
+    echo "🔍 Available environment variables:"
+    env | grep -E "(TS_|OAUTH|CLIENT)" || echo "No OAuth-related variables found"
     exit 1
   fi
 fi
 
-if [[ "$TS_OAUTH_SECRET" == "TS_OAUTH_SECRET_PLACEHOLDER" ]]; then
-  echo "⚠️ TS_OAUTH_SECRET placeholder was not replaced by workflow"
+if [[ "$TS_OAUTH_SECRET" == "TS_OAUTH_SECRET_PLACEHOLDER" || "$TS_OAUTH_SECRET" == "***" ]]; then
+  echo "⚠️ TS_OAUTH_SECRET placeholder was not replaced by workflow or is masked"
   if [[ -n "${TS_OAUTH_SECRET_ENV:-}" ]]; then
     echo "🔄 Using TS_OAUTH_SECRET from environment variable"
     TS_OAUTH_SECRET="$TS_OAUTH_SECRET_ENV"
@@ -36,8 +71,8 @@ if [[ "$TS_OAUTH_SECRET" == "TS_OAUTH_SECRET_PLACEHOLDER" ]]; then
   fi
 fi
 
-if [[ "$SERVICE_NAME" == "SERVICE_NAME_PLACEHOLDER" ]]; then
-  echo "⚠️ SERVICE_NAME placeholder was not replaced by workflow"
+if [[ "$SERVICE_NAME" == "SERVICE_NAME_PLACEHOLDER" || "$SERVICE_NAME" == "***" ]]; then
+  echo "⚠️ SERVICE_NAME placeholder was not replaced by workflow or is masked"
   if [[ -n "${SERVICE_NAME_ENV:-}" ]]; then
     echo "🔄 Using SERVICE_NAME from environment variable"
     SERVICE_NAME="$SERVICE_NAME_ENV"
