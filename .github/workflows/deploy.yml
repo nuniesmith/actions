@@ -855,14 +855,42 @@ jobs:
           sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${SAFE_ACTIONS_PASSWORD}/g" stage1-setup.sh
           sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${SAFE_JORDAN_PASSWORD}/g" stage1-setup.sh
           
-          # Stage2 script replacements with proper escaping
-          SAFE_CLOUDFLARE_EMAIL=$(printf '%s\n' "${CLOUDFLARE_EMAIL}" | sed 's/[[\.*^$()+?{|]/\\&/g')
-          SAFE_CLOUDFLARE_TOKEN=$(printf '%s\n' "${CLOUDFLARE_API_TOKEN}" | sed 's/[[\.*^$()+?{|]/\\&/g')
-          SAFE_ADMIN_EMAIL=$(printf '%s\n' "${ADMIN_EMAIL}" | sed 's/[[\.*^$()+?{|]/\\&/g')
-          SAFE_TS_CLIENT_ID=$(printf '%s\n' "${TS_OAUTH_CLIENT_ID}" | sed 's/[[\.*^$()+?{|]/\\&/g')
-          SAFE_TS_SECRET=$(printf '%s\n' "${TS_OAUTH_SECRET}" | sed 's/[[\.*^$()+?{|]/\\&/g')
-          SAFE_TAILNET=$(printf '%s\n' "${TAILSCALE_TAILNET}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          # Stage2 script replacements with enhanced error checking and debugging
+          echo "🔍 Preparing stage2 script with enhanced credential handling..."
           
+          # First, validate that all required credentials are available
+          echo "🔍 Validating OAuth credentials availability:"
+          echo "TS_OAUTH_CLIENT_ID set: $([ -n "$TS_OAUTH_CLIENT_ID" ] && echo 'YES' || echo 'NO')"
+          echo "TS_OAUTH_SECRET set: $([ -n "$TS_OAUTH_SECRET" ] && echo 'YES' || echo 'NO')"
+          echo "TAILSCALE_TAILNET set: $([ -n "$TAILSCALE_TAILNET" ] && echo 'YES' || echo 'NO')"
+          echo "SERVICE_NAME: '${{ env.SERVICE_NAME }}'"
+          
+          if [[ -z "$TS_OAUTH_CLIENT_ID" ]]; then
+            echo "❌ TS_OAUTH_CLIENT_ID is empty or not set!"
+            exit 1
+          fi
+          
+          if [[ -z "$TS_OAUTH_SECRET" ]]; then
+            echo "❌ TS_OAUTH_SECRET is empty or not set!"
+            exit 1
+          fi
+          
+          # Create a safe escaping function that handles all special characters
+          escape_for_sed() {
+            printf '%s\n' "$1" | sed 's/[[\.*^$()+?{|]/\\&/g'
+          }
+          
+          # Escape all variables with better error handling
+          SAFE_CLOUDFLARE_EMAIL=$(escape_for_sed "${CLOUDFLARE_EMAIL:-}")
+          SAFE_CLOUDFLARE_TOKEN=$(escape_for_sed "${CLOUDFLARE_API_TOKEN:-}")
+          SAFE_ADMIN_EMAIL=$(escape_for_sed "${ADMIN_EMAIL:-}")
+          SAFE_TS_CLIENT_ID=$(escape_for_sed "${TS_OAUTH_CLIENT_ID}")
+          SAFE_TS_SECRET=$(escape_for_sed "${TS_OAUTH_SECRET}")
+          SAFE_TAILNET=$(escape_for_sed "${TAILSCALE_TAILNET:-}")
+          
+          echo "🔄 Performing placeholder replacements in stage2 script..."
+          
+          # Perform replacements with error checking
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${SAFE_SERVICE_NAME}/g" stage2-post-reboot.sh
           sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${SAFE_CLOUDFLARE_EMAIL}/g" stage2-post-reboot.sh
           sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${SAFE_CLOUDFLARE_TOKEN}/g" stage2-post-reboot.sh
@@ -870,6 +898,51 @@ jobs:
           sed -i "s/TS_OAUTH_CLIENT_ID_PLACEHOLDER/${SAFE_TS_CLIENT_ID}/g" stage2-post-reboot.sh
           sed -i "s/TS_OAUTH_SECRET_PLACEHOLDER/${SAFE_TS_SECRET}/g" stage2-post-reboot.sh
           sed -i "s/TAILSCALE_TAILNET_PLACEHOLDER/${SAFE_TAILNET}/g" stage2-post-reboot.sh
+          
+          # Create environment file as backup method for credentials
+          echo "🔧 Creating environment file as backup credential source..."
+          echo "#!/bin/bash" > stage2-env.sh
+          echo "# Tailscale OAuth credentials for stage2 script" >> stage2-env.sh
+          echo "export TS_OAUTH_CLIENT_ID_ENV=\"${TS_OAUTH_CLIENT_ID}\"" >> stage2-env.sh
+          echo "export TS_OAUTH_SECRET_ENV=\"${TS_OAUTH_SECRET}\"" >> stage2-env.sh
+          echo "export TAILSCALE_TAILNET_ENV=\"${TAILSCALE_TAILNET:-}\"" >> stage2-env.sh
+          echo "export SERVICE_NAME_ENV=\"${{ env.SERVICE_NAME }}\"" >> stage2-env.sh
+          echo "export CLOUDFLARE_EMAIL_ENV=\"${CLOUDFLARE_EMAIL:-}\"" >> stage2-env.sh
+          echo "export CLOUDFLARE_API_TOKEN_ENV=\"${CLOUDFLARE_API_TOKEN:-}\"" >> stage2-env.sh
+          echo "export ADMIN_EMAIL_ENV=\"${ADMIN_EMAIL:-}\"" >> stage2-env.sh
+          chmod +x stage2-env.sh
+          
+          # Also create a direct credential replacement script for troubleshooting
+          echo "#!/bin/bash" > fix-stage2-credentials.sh
+          echo "# Emergency credential fix script" >> fix-stage2-credentials.sh
+          echo "echo \"🔧 Emergency credential fix for stage2 script...\"" >> fix-stage2-credentials.sh
+          echo "" >> fix-stage2-credentials.sh
+          echo "# Source environment variables" >> fix-stage2-credentials.sh
+          echo "if [ -f /usr/local/bin/stage2-env.sh ]; then" >> fix-stage2-credentials.sh
+          echo "  source /usr/local/bin/stage2-env.sh" >> fix-stage2-credentials.sh
+          echo "  echo \"✅ Loaded environment variables from file\"" >> fix-stage2-credentials.sh
+          echo "else" >> fix-stage2-credentials.sh
+          echo "  echo \"❌ Environment file not found\"" >> fix-stage2-credentials.sh
+          echo "  exit 1" >> fix-stage2-credentials.sh
+          echo "fi" >> fix-stage2-credentials.sh
+          echo "" >> fix-stage2-credentials.sh
+          echo "# Patch the stage2 script with correct credentials" >> fix-stage2-credentials.sh
+          echo "if [ -f /usr/local/bin/stage2-post-reboot.sh ]; then" >> fix-stage2-credentials.sh
+          echo "  echo \"🔄 Applying emergency credential patches...\"" >> fix-stage2-credentials.sh
+          echo "  # Replace any remaining placeholders with environment variables" >> fix-stage2-credentials.sh
+          echo "  sed -i \"s/TS_OAUTH_CLIENT_ID_PLACEHOLDER/\\\${TS_OAUTH_CLIENT_ID_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
+          echo "  sed -i \"s/TS_OAUTH_SECRET_PLACEHOLDER/\\\${TS_OAUTH_SECRET_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
+          echo "  sed -i \"s/TAILSCALE_TAILNET_PLACEHOLDER/\\\${TAILSCALE_TAILNET_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
+          echo "  sed -i \"s/SERVICE_NAME_PLACEHOLDER/\\\${SERVICE_NAME_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
+          echo "  echo \"✅ Emergency patches applied\"" >> fix-stage2-credentials.sh
+          echo "  echo \"🔍 Verification of fixes:\"" >> fix-stage2-credentials.sh
+          echo "  grep -n \"TS_OAUTH_CLIENT_ID=\" /usr/local/bin/stage2-post-reboot.sh | head -1" >> fix-stage2-credentials.sh
+          echo "  grep -n \"TS_OAUTH_SECRET=\" /usr/local/bin/stage2-post-reboot.sh | head -1" >> fix-stage2-credentials.sh
+          echo "else" >> fix-stage2-credentials.sh
+          echo "  echo \"❌ Stage2 script not found\"" >> fix-stage2-credentials.sh
+          echo "  exit 1" >> fix-stage2-credentials.sh
+          echo "fi" >> fix-stage2-credentials.sh
+          chmod +x fix-stage2-credentials.sh
           
           # Verify replacements worked with enhanced debugging
           echo "🔍 Verifying placeholder replacements in stage2 script..."
@@ -891,13 +964,17 @@ jobs:
           fi
           
           # Upload and execute stage 1 setup
-          echo "📤 Uploading setup scripts..."
+          echo "📤 Uploading setup scripts and environment files..."
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-post-reboot.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-env.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no fix-stage2-credentials.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
           
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "
             chmod +x /tmp/stage1-setup.sh
             chmod +x /usr/local/bin/stage2-post-reboot.sh
+            chmod +x /usr/local/bin/stage2-env.sh
+            chmod +x /usr/local/bin/fix-stage2-credentials.sh
             /tmp/stage1-setup.sh
           "
 
@@ -952,6 +1029,18 @@ jobs:
               if grep -q "PLACEHOLDER" /usr/local/bin/stage2-post-reboot.sh; then
                 echo "⚠️ Warning: Found unreplaced placeholders:"
                 grep "PLACEHOLDER" /usr/local/bin/stage2-post-reboot.sh || true
+                echo ""
+                echo "🔧 Attempting emergency credential fix..."
+                if [ -f /usr/local/bin/fix-stage2-credentials.sh ]; then
+                  source /usr/local/bin/stage2-env.sh
+                  /usr/local/bin/fix-stage2-credentials.sh
+                  echo "✅ Emergency fix completed, retrying script verification..."
+                  echo "🔍 Script content after fix (lines with OAuth):"
+                  grep -n "TS_OAUTH_CLIENT_ID=" /usr/local/bin/stage2-post-reboot.sh | head -1 || echo "Client ID line not found"
+                  grep -n "TS_OAUTH_SECRET=" /usr/local/bin/stage2-post-reboot.sh | head -1 || echo "Secret line not found"
+                else
+                  echo "❌ Emergency fix script not found!"
+                fi
               else
                 echo "✅ All placeholders appear to be replaced"
               fi
@@ -1182,9 +1271,20 @@ jobs:
             ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} '
               echo "🔧 Manual Tailscale connection attempt..."
               
+              # First, try the emergency credential fix
+              if [ -f /usr/local/bin/fix-stage2-credentials.sh ]; then
+                echo "🚨 Running emergency credential fix first..."
+                source /usr/local/bin/stage2-env.sh
+                /usr/local/bin/fix-stage2-credentials.sh
+              fi
+              
               # Try to run the stage2 script one more time with debug output
               if [ -f /usr/local/bin/stage2-post-reboot.sh ]; then
                 echo "🔍 Re-running stage2 script with debug output..."
+                
+                # Source environment variables for the script
+                source /usr/local/bin/stage2-env.sh 2>/dev/null || echo "Warning: Could not source environment file"
+                
                 bash -x /usr/local/bin/stage2-post-reboot.sh > /tmp/final-stage2-debug.log 2>&1 &
                 STAGE2_PID=$!
                 
@@ -1213,6 +1313,15 @@ jobs:
                   echo "$FINAL_IP" > /tmp/tailscale_final_ip
                 else
                   echo "❌ Still no valid Tailscale IP: $FINAL_IP"
+                  
+                  # Show detailed troubleshooting info
+                  echo "🔍 Final troubleshooting information:"
+                  echo "=== Environment Variables ==="
+                  env | grep -E "(TS_|TAILSCALE)" || echo "No Tailscale env vars found"
+                  echo "=== Stage2 Script OAuth Lines ==="
+                  grep -n "TS_OAUTH" /usr/local/bin/stage2-post-reboot.sh | head -5 || echo "No OAuth lines found"
+                  echo "=== Final Debug Log Excerpt (OAuth related) ==="
+                  grep -i "oauth\|auth\|client" /tmp/final-stage2-debug.log | tail -10 || echo "No OAuth debug info found"
                 fi
               fi
             '
