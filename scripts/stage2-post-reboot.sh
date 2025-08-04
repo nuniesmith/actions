@@ -8,8 +8,17 @@ if [[ -f /opt/stage2-env.sh ]]; then
   echo "🔧 Loading environment variables from stage2-env.sh..."
   source /opt/stage2-env.sh
   echo "✅ Environment variables loaded"
-  echo "🔍 Debug: TS_OAUTH_CLIENT_ID_ENV length: ${#TS_OAUTH_CLIENT_ID_ENV:-0}"
-  echo "🔍 Debug: TS_OAUTH_SECRET_ENV length: ${#TS_OAUTH_SECRET_ENV:-0}"
+  # Check if environment variables are available (safe syntax)
+  if [[ -n "${TS_OAUTH_CLIENT_ID_ENV:-}" ]]; then
+    echo "🔍 Debug: TS_OAUTH_CLIENT_ID_ENV length: ${#TS_OAUTH_CLIENT_ID_ENV}"
+  else
+    echo "🔍 Debug: TS_OAUTH_CLIENT_ID_ENV not set"
+  fi
+  if [[ -n "${TS_OAUTH_SECRET_ENV:-}" ]]; then
+    echo "🔍 Debug: TS_OAUTH_SECRET_ENV length: ${#TS_OAUTH_SECRET_ENV}"
+  else
+    echo "🔍 Debug: TS_OAUTH_SECRET_ENV not set"
+  fi
 else
   echo "⚠️ No environment file found at /opt/stage2-env.sh"
 fi
