@@ -4,7 +4,9 @@ set -euo pipefail
 echo "🚀 Stage 2: Post-reboot setup starting..."
 
 # Get configuration variables (should be replaced by the workflow)
-AUTH_KEY="TAILSCALE_AUTH_KEY_PLACEHOLDER"
+TS_OAUTH_CLIENT_ID="TS_OAUTH_CLIENT_ID_PLACEHOLDER"
+TS_OAUTH_SECRET="TS_OAUTH_SECRET_PLACEHOLDER"
+TAILSCALE_TAILNET="TAILSCALE_TAILNET_PLACEHOLDER"
 SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
 DOMAIN_NAME="DOMAIN_NAME_PLACEHOLDER"
 CLOUDFLARE_EMAIL="CLOUDFLARE_EMAIL_PLACEHOLDER"
@@ -12,13 +14,24 @@ CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_PLACEHOLDER"
 ADMIN_EMAIL="ADMIN_EMAIL_PLACEHOLDER"
 
 # Validate that placeholders were replaced, or try environment variables as fallback
-if [[ "$AUTH_KEY" == "TAILSCALE_AUTH_KEY_PLACEHOLDER" ]]; then
-  echo "⚠️ TAILSCALE_AUTH_KEY placeholder was not replaced by workflow"
-  if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
-    echo "🔄 Using TAILSCALE_AUTH_KEY from environment variable"
-    AUTH_KEY="$TAILSCALE_AUTH_KEY"
+if [[ "$TS_OAUTH_CLIENT_ID" == "TS_OAUTH_CLIENT_ID_PLACEHOLDER" ]]; then
+  echo "⚠️ TS_OAUTH_CLIENT_ID placeholder was not replaced by workflow"
+  if [[ -n "${TS_OAUTH_CLIENT_ID_ENV:-}" ]]; then
+    echo "🔄 Using TS_OAUTH_CLIENT_ID from environment variable"
+    TS_OAUTH_CLIENT_ID="$TS_OAUTH_CLIENT_ID_ENV"
   else
-    echo "❌ No TAILSCALE_AUTH_KEY found in environment either!"
+    echo "❌ No TS_OAUTH_CLIENT_ID found in environment either!"
+    exit 1
+  fi
+fi
+
+if [[ "$TS_OAUTH_SECRET" == "TS_OAUTH_SECRET_PLACEHOLDER" ]]; then
+  echo "⚠️ TS_OAUTH_SECRET placeholder was not replaced by workflow"
+  if [[ -n "${TS_OAUTH_SECRET_ENV:-}" ]]; then
+    echo "🔄 Using TS_OAUTH_SECRET from environment variable"
+    TS_OAUTH_SECRET="$TS_OAUTH_SECRET_ENV"
+  else
+    echo "❌ No TS_OAUTH_SECRET found in environment either!"
     exit 1
   fi
 fi
@@ -41,12 +54,13 @@ echo "📦 Installing firewall packages after reboot..."
 echo "🔧 Resolving iptables conflicts..."
 pacman -Rdd --noconfirm iptables 2>/dev/null || true
 
-# Now install iptables-nft, ufw, and jq (for DNS updates)
-if ! pacman -S --noconfirm iptables-nft ufw jq; then
+# Now install iptables-nft, ufw, jq, and curl (for API calls and DNS updates)
+if ! pacman -S --noconfirm iptables-nft ufw jq curl; then
   echo "⚠️ First attempt failed, trying individually..."
   pacman -S --noconfirm iptables-nft || echo "Failed to install iptables-nft"
   pacman -S --noconfirm ufw || echo "Failed to install ufw"
   pacman -S --noconfirm jq || echo "Failed to install jq"
+  pacman -S --noconfirm curl || echo "Failed to install curl"
 fi
 
 echo "✅ Firewall packages installed successfully"
@@ -171,24 +185,28 @@ for i in {1..15}; do
   sleep 3
 done
 
-# Validate that placeholders were replaced, or try environment variables as fallback
-if [[ "$AUTH_KEY" == "TAILSCALE_AUTH_KEY_PLACEHOLDER" ]]; then
-  echo "⚠️ TAILSCALE_AUTH_KEY placeholder was not replaced by workflow"
-  if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
-    echo "🔄 Using TAILSCALE_AUTH_KEY from environment variable"
-    AUTH_KEY="$TAILSCALE_AUTH_KEY"
+# Validate OAuth credentials were set properly
+if [[ "$TS_OAUTH_CLIENT_ID" == "TS_OAUTH_CLIENT_ID_PLACEHOLDER" ]]; then
+  echo "⚠️ TS_OAUTH_CLIENT_ID placeholder was not replaced by workflow"
+  if [[ -n "${TS_OAUTH_CLIENT_ID:-}" ]]; then
+    echo "🔄 Using TS_OAUTH_CLIENT_ID from environment variable"
+    TS_OAUTH_CLIENT_ID="$TS_OAUTH_CLIENT_ID"
   else
-    echo "❌ TAILSCALE_AUTH_KEY not available in environment either!"
-    echo "🔍 Available environment variables starting with TAILSCALE:"
-    env | grep -i tailscale || echo "None found"
-    echo "🔍 Checking for auth key file..."
-    if [[ -f "/root/tailscale_auth_key" ]]; then
-      AUTH_KEY=$(cat /root/tailscale_auth_key)
-      echo "✅ Found auth key in file"
-    else
-      echo "❌ No auth key file found either"
-      exit 1
-    fi
+    echo "❌ TS_OAUTH_CLIENT_ID not available in environment either!"
+    echo "🔍 Available environment variables starting with TS:"
+    env | grep -i "^TS" || echo "None found"
+    exit 1
+  fi
+fi
+
+if [[ "$TS_OAUTH_SECRET" == "TS_OAUTH_SECRET_PLACEHOLDER" ]]; then
+  echo "⚠️ TS_OAUTH_SECRET placeholder was not replaced by workflow"
+  if [[ -n "${TS_OAUTH_SECRET:-}" ]]; then
+    echo "🔄 Using TS_OAUTH_SECRET from environment variable"
+    TS_OAUTH_SECRET="$TS_OAUTH_SECRET"
+  else
+    echo "❌ TS_OAUTH_SECRET not available in environment either!"
+    exit 1
   fi
 fi
 
@@ -204,13 +222,88 @@ if [[ "$SERVICE_NAME" == "SERVICE_NAME_PLACEHOLDER" ]]; then
   fi
 fi
 
-if [[ -z "$AUTH_KEY" ]]; then
-  echo "❌ TAILSCALE_AUTH_KEY is empty"
+if [[ -z "$TS_OAUTH_CLIENT_ID" || -z "$TS_OAUTH_SECRET" ]]; then
+  echo "❌ Tailscale OAuth credentials are empty"
   exit 1
 fi
 
-echo "🔗 Authenticating with Tailscale..."
+echo "🔗 Authenticating with Tailscale using OAuth..."
 echo "Using hostname: $SERVICE_NAME"
+
+# Get OAuth access token for Tailscale API
+echo "🔑 Getting Tailscale OAuth access token..."
+OAUTH_RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=${TS_OAUTH_CLIENT_ID}" \
+  -d "client_secret=${TS_OAUTH_SECRET}" 2>/dev/null || echo "CURL_FAILED")
+
+if [[ "$OAUTH_RESPONSE" == "CURL_FAILED" ]]; then
+  echo "❌ OAuth request failed"
+  exit 1
+fi
+
+# Extract access token
+ACCESS_TOKEN=$(echo "$OAUTH_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null || echo "")
+
+if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" || "$ACCESS_TOKEN" == "empty" ]]; then
+  echo "❌ Failed to get OAuth access token"
+  echo "OAuth response: $OAUTH_RESPONSE"
+  exit 1
+fi
+
+echo "✅ OAuth access token obtained"
+
+# Get tailnet information
+if [[ "$TAILSCALE_TAILNET" == "TAILSCALE_TAILNET_PLACEHOLDER" || -z "$TAILSCALE_TAILNET" ]]; then
+  echo "🔍 Getting tailnet information..."
+  TAILNET_RESPONSE=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+    "https://api.tailscale.com/api/v2/tailnet" 2>/dev/null || echo "CURL_FAILED")
+  
+  if [[ "$TAILNET_RESPONSE" != "CURL_FAILED" ]]; then
+    TAILNET=$(echo "$TAILNET_RESPONSE" | jq -r '.tailnets[0] // empty' 2>/dev/null || echo "")
+    if [[ -n "$TAILNET" && "$TAILNET" != "null" && "$TAILNET" != "empty" ]]; then
+      TAILSCALE_TAILNET="$TAILNET"
+      echo "✅ Auto-detected tailnet: $TAILSCALE_TAILNET"
+    fi
+  fi
+fi
+
+# Create auth key using OAuth API
+echo "🔑 Creating Tailscale auth key..."
+AUTH_KEY_RESPONSE=$(curl -s -X POST \
+  "https://api.tailscale.com/api/v2/tailnet/${TAILSCALE_TAILNET}/keys" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "capabilities": {
+      "devices": {
+        "create": {
+          "reusable": false,
+          "ephemeral": false,
+          "preauthorized": true,
+          "tags": ["tag:ci"]
+        }
+      }
+    },
+    "expirySeconds": 3600
+  }' 2>/dev/null || echo "CURL_FAILED")
+
+if [[ "$AUTH_KEY_RESPONSE" == "CURL_FAILED" ]]; then
+  echo "❌ Failed to create auth key"
+  exit 1
+fi
+
+# Extract the auth key
+AUTH_KEY=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.key // empty' 2>/dev/null || echo "")
+
+if [[ -z "$AUTH_KEY" || "$AUTH_KEY" == "null" || "$AUTH_KEY" == "empty" ]]; then
+  echo "❌ Failed to extract auth key"
+  echo "Auth key response: $AUTH_KEY_RESPONSE"
+  exit 1
+fi
+
+echo "✅ Auth key created successfully"
 
 TAILSCALE_CONNECTED=false
 DOCKER_SUBNETS="172.17.0.0/16,172.20.0.0/16,172.21.0.0/16,172.22.0.0/16"

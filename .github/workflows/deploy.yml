@@ -554,6 +554,9 @@ jobs:
           sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${CLOUDFLARE_EMAIL}/g" stage2-post-reboot.sh
           sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${CLOUDFLARE_API_TOKEN}/g" stage2-post-reboot.sh
           sed -i "s/ADMIN_EMAIL_PLACEHOLDER/${ADMIN_EMAIL}/g" stage2-post-reboot.sh
+          sed -i "s/TS_OAUTH_CLIENT_ID_PLACEHOLDER/${TS_OAUTH_CLIENT_ID}/g" stage2-post-reboot.sh
+          sed -i "s/TS_OAUTH_SECRET_PLACEHOLDER/${TS_OAUTH_SECRET}/g" stage2-post-reboot.sh
+          sed -i "s/TAILSCALE_TAILNET_PLACEHOLDER/${TAILSCALE_TAILNET}/g" stage2-post-reboot.sh
           
           # Upload and execute stage 1 setup
           echo "📤 Uploading setup scripts..."
