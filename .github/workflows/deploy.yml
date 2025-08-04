@@ -610,7 +610,38 @@ jobs:
           export SERVICE_ROOT_PASSWORD="$SERVICE_ROOT_PASSWORD"
           
           echo "🚀 Starting server creation process..."
+          
+          # Add debugging for script execution
+          echo "🔍 Script execution details:"
+          echo "  Service Name: '${{ env.SERVICE_NAME }}'"
+          echo "  Server Type: '${{ env.SERVER_TYPE }}'"
+          echo "  Target Region: '${{ env.TARGET_REGION }}'"
+          echo "  Overwrite Server: '${{ inputs.overwrite_server }}'"
+          
+          # Check if script exists and is executable
+          if [ -f "actions/scripts/linode/create-server.sh" ]; then
+            echo "✅ Script found: actions/scripts/linode/create-server.sh"
+            ls -la actions/scripts/linode/create-server.sh
+            
+            # Show first few lines of script for debugging
+            echo "🔍 Script content preview (first 10 lines):"
+            head -10 actions/scripts/linode/create-server.sh
+          else
+            echo "❌ Script not found: actions/scripts/linode/create-server.sh"
+            echo "Available files in actions/scripts/linode/:"
+            ls -la actions/scripts/linode/ || echo "Directory not found"
+            echo "Available files in actions/scripts/:"
+            ls -la actions/scripts/ || echo "Directory not found"
+            exit 1
+          fi
+          
+          # Execute with explicit error handling and detailed logging
+          echo "🚀 Executing server creation script..."
+          set -e  # Exit on any error
+          set -x  # Show executed commands
           actions/scripts/linode/create-server.sh "${{ env.SERVICE_NAME }}" "${{ env.SERVER_TYPE }}" "${{ env.TARGET_REGION }}" "${{ inputs.overwrite_server }}"
+          set +x  # Disable command echoing
+          echo "✅ Server creation script completed successfully"
 
       - name: ⏳ Wait for SSH Access
         run: |
