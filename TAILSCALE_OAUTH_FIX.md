@@ -1,136 +1,126 @@
-# Tailscale OAuth Migration - Stage2 Connection Fix
+# Tailscale OAuth Connection Fixes
 
-## Issues Identified
+## Issues Identified and Fixed
 
-Your GitHub Actions workflow was failing to connect to Tailscale in the stage2 systemd process due to several OAuth migration issues:
+### 1. OAuth Credential Replacement Failure
+**Problem**: The OAuth credentials (`TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET`) were not being properly replaced in the stage2 setup script, showing as `kRvWcvcyE821CNTRL` which appeared to be a placeholder.
 
-### 1. **Mixed Authentication Methods**
-- Workflow partially migrated from auth keys to OAuth
-- Some sections still referenced old `TAILSCALE_AUTH_KEY` environment variable
-- Inconsistent API authentication across different cleanup jobs
+**Root Cause**: 
+- Complex shell variable expansion in sed commands
+- Potential special characters in OAuth credentials causing sed parsing issues
+- Inconsistent placeholder format
 
-### 2. **OAuth Error Handling**
-- Limited error checking for OAuth token requests
-- No retry logic for Tailscale connection attempts
-- Poor debugging information when OAuth fails
+**Fix Applied**:
+- Switched to `envsubst` for reliable environment variable substitution
+- Updated stage2 script template to use `${VAR}` format instead of `VAR_PLACEHOLDER`
+- Added robust validation of environment variables before replacement
+- Improved error messaging to identify exact replacement failures
 
-### 3. **Placeholder Replacement Issues**
-- Stage2 script OAuth credentials might not be properly replaced
-- No validation that placeholders were successfully substituted
+### 2. Server Destruction Logic Not Triggering
+**Problem**: The `destroy-existing-server` job was being skipped even when server recreation was needed.
 
-## Fixes Applied
+**Root Cause**: 
+- The nginx deployment was setting `overwrite_server: false` by default
+- The condition for server destruction required both `should_overwrite_server == 'true'` and proper action type
 
-### 1. **Enhanced OAuth Error Handling**
-```bash
-# Added comprehensive OAuth token request with error checking
-OAUTH_RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=client_credentials" \
-  -d "client_id=$TS_OAUTH_CLIENT_ID" \
-  -d "client_secret=$TS_OAUTH_SECRET" 2>/dev/null || echo "CURL_FAILED")
+**Fix Applied**:
+- Updated nginx deployment to set `overwrite_server: true` for consistent server recreation
+- Enhanced preflight validation to properly handle restart and deploy actions
+- Added better logging for overwrite server decisions
 
-# Better error messages and fallback handling
-if [[ -z "$OAUTH_TOKEN" || "$OAUTH_TOKEN" == "null" || "$OAUTH_TOKEN" == "empty" ]]; then
-  echo "❌ Failed to get OAuth access token"
-  echo "🔍 OAuth response: $OAUTH_RESPONSE"
-  ERROR_MSG=$(echo "$OAUTH_RESPONSE" | jq -r '.error_description // .error // empty' 2>/dev/null || echo "")
-  if [[ -n "$ERROR_MSG" ]]; then
-    echo "🔍 OAuth error: $ERROR_MSG"
-  fi
-  exit 1
-fi
+### 3. Missing Tailscale Subnet Sharing for Docker Networks
+**Problem**: Docker networks on each service were isolated and not accessible through Tailscale.
+
+**Root Cause**: 
+- No subnet route advertising configured in Tailscale setup
+- Missing IP forwarding configuration for subnet routing
+
+**Fix Applied**:
+- Added service-specific subnet route advertising:
+  - nginx: `172.22.0.0/16`
+  - fks: `172.20.0.0/16`
+  - ats: `172.21.0.0/16`
+  - default: `172.23.0.0/16`
+- Enabled IP forwarding with sysctl configuration
+- Added `--advertise-routes` and `--accept-routes` flags to Tailscale connection
+
+## Technical Changes Made
+
+### 1. OAuth Credential Handling (deploy.yml)
+```yaml
+# OLD: Sed-based replacement with potential parsing issues
+sed -i "s|TS_OAUTH_CLIENT_ID_PLACEHOLDER|${TS_OAUTH_CLIENT_ID}|g" stage2-post-reboot.sh
+
+# NEW: Environment variable substitution with envsubst
+envsubst '${TS_OAUTH_CLIENT_ID} ${TS_OAUTH_SECRET} ${TAILSCALE_TAILNET}' < stage2-post-reboot.sh > stage2-post-reboot-temp.sh
 ```
 
-### 2. **Improved Tailscale Connection**
+### 2. Stage2 Script Template Updates
 ```bash
-# Added connection retries with proper cleanup between attempts
-CONNECTION_SUCCESS=false
-for attempt in {1..3}; do
-  echo "🔗 Tailscale connection attempt $attempt/3..."
-  
-  if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --reset; then
-    echo "✅ Tailscale connected successfully on attempt $attempt"
-    CONNECTION_SUCCESS=true
-    break
-  else
-    # Logout and reset for clean retry
-    tailscale logout 2>/dev/null || true
-    sleep 5
-  fi
-done
+# OLD: Placeholder-based variables
+TS_OAUTH_CLIENT_ID="TS_OAUTH_CLIENT_ID_PLACEHOLDER"
+
+# NEW: Envsubst-compatible variables
+TS_OAUTH_CLIENT_ID="${TS_OAUTH_CLIENT_ID}"
 ```
 
-### 3. **Enhanced Stage2 Debugging**
-```bash
-# Added comprehensive debugging for systemd service
-echo '📋 OAuth credential check in stage2 script:'
-grep -E '(TS_OAUTH|PLACEHOLDER)' /usr/local/bin/stage2-post-reboot.sh | head -5 || echo 'No OAuth lines found'
-
-# Manual execution with enhanced logging
-timeout 300 bash -x /usr/local/bin/stage2-post-reboot.sh 2>&1 | tee /tmp/stage2_manual_output.log
+### 3. Server Overwrite Logic Enhancement
+```yaml
+# Enhanced validation for server recreation
+if [[ "${{ env.OVERWRITE_SERVER }}" == "true" && ("${{ env.ACTION_TYPE }}" == "deploy" || "${{ env.ACTION_TYPE }}" == "restart") ]]; then
+  echo "should_overwrite_server=true" >> $GITHUB_OUTPUT
+  echo "⚠️ Server will be overwritten (destroyed and recreated)"
 ```
 
-### 4. **Complete OAuth Migration**
-- Updated all cleanup sections to use OAuth instead of auth keys
-- Fixed environment variable references in destroy jobs
-- Consistent API authentication across all workflow sections
-
-## Testing Your OAuth Setup
-
-### 1. **Test OAuth Credentials Locally**
-Use the provided test script:
+### 4. Tailscale Subnet Configuration
 ```bash
-# Set your environment variables
-export TS_OAUTH_CLIENT_ID="your_client_id"
-export TS_OAUTH_SECRET="your_client_secret"
-export TAILSCALE_TAILNET="your_tailnet_or_leave_empty"
+# Service-specific subnet advertising
+case "$SERVICE_NAME" in
+  "nginx")
+    tailscale up --advertise-routes=172.22.0.0/16 --accept-routes
+    ;;
+  "fks")
+    tailscale up --advertise-routes=172.20.0.0/16 --accept-routes
+    ;;
+  # ... other services
+esac
 
-# Run the test script
-chmod +x scripts/test-oauth-connection.sh
-./scripts/test-oauth-connection.sh
+# Enable IP forwarding for subnet routing
+echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+sysctl -p
 ```
 
-### 2. **GitHub Secrets Verification**
-Ensure these secrets are set in your repository:
-- `TS_OAUTH_CLIENT_ID` - Your Tailscale OAuth client ID
-- `TS_OAUTH_SECRET` - Your Tailscale OAuth client secret  
-- `TAILSCALE_TAILNET` - Your tailnet name (can be empty for personal accounts)
-
-### 3. **OAuth Client Requirements**
-Your Tailscale OAuth client needs these permissions:
-- **Devices: Write** - To create auth keys and manage devices
-- **Write devices** - To register new devices
-- **Write device names** - To set hostname
-
-## Next Steps
-
-1. **Verify Secrets**: Make sure your GitHub repository has the correct OAuth secrets
-2. **Test Deployment**: Run a fresh deployment and monitor the stage2 logs
-3. **Check Debug Output**: The enhanced logging will show exactly where OAuth fails if issues persist
-
-## Debugging Commands
-
-If issues persist, check these in your server:
-```bash
-# Check systemd service status
-systemctl status stage2-setup.service
-
-# View service logs
-journalctl -u stage2-setup.service --no-pager -l
-
-# Check if OAuth credentials were replaced
-grep -E "(TS_OAUTH|PLACEHOLDER)" /usr/local/bin/stage2-post-reboot.sh
-
-# Test Tailscale daemon
-systemctl status tailscaled
-tailscale status
+### 5. nginx Deployment Configuration
+```yaml
+# Force server recreation for consistency
+overwrite_server: true  # Force server recreation to ensure clean state
 ```
 
-## OAuth vs Auth Key Differences
+## Expected Outcomes
 
-| Method | Pros | Cons |
-|--------|------|------|
-| **OAuth** | Secure, short-lived tokens, fine-grained permissions | More complex setup, requires API calls |
-| **Auth Key** | Simple, direct connection | Long-lived secrets, broader permissions |
+1. **OAuth Connection Success**: Tailscale should connect successfully using OAuth credentials
+2. **Server Recreation**: Existing servers will be properly destroyed and recreated
+3. **Docker Network Access**: Services on each server will be accessible through Tailscale subnet routes
+4. **Reliable Deployment**: Consistent deployment behavior with proper error handling
 
-The OAuth method is more secure and is the recommended approach for CI/CD environments.
+## Verification Steps
+
+1. **Check OAuth Replacement**: Look for "✅ OAuth credentials successfully replaced" in deployment logs
+2. **Verify Server Destruction**: Confirm "💥 Destroy Existing Server" job runs when needed
+3. **Validate Tailscale Connection**: Check for "✅ Tailscale connected successfully" in stage2 logs
+4. **Test Subnet Routing**: Verify Docker containers are accessible via Tailscale IPs
+
+## Debugging Information
+
+If issues persist, check:
+1. Environment variable lengths in deployment logs
+2. OAuth token creation response details
+3. Tailscale daemon status and logs via `journalctl -u tailscaled`
+4. Subnet route advertising status with `tailscale status`
+
+## Security Notes
+
+- OAuth credentials are validated before use
+- Temporary files for credential handling are cleaned up
+- Environment variable substitution avoids shell injection risks
+- Firewall rules properly configured for Tailscale interface

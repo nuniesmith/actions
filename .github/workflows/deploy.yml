@@ -315,12 +315,14 @@ jobs:
               ;;
           esac
           
-          # Check if server should be overwritten
-          if [[ "${{ env.OVERWRITE_SERVER }}" == "true" && "${{ env.ACTION_TYPE }}" == "deploy" ]]; then
+          # Check if server should be overwritten (force destroy when redeploying)
+          echo "🔍 Checking overwrite server setting: ${{ env.OVERWRITE_SERVER }}"
+          if [[ "${{ env.OVERWRITE_SERVER }}" == "true" && ("${{ env.ACTION_TYPE }}" == "deploy" || "${{ env.ACTION_TYPE }}" == "restart") ]]; then
             echo "should_overwrite_server=true" >> $GITHUB_OUTPUT
             echo "⚠️ Server will be overwritten (destroyed and recreated)"
           else
             echo "should_overwrite_server=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Server will be created if not exists, or reused if exists"
           fi
           
           echo "validated=true" >> $GITHUB_OUTPUT
@@ -1828,22 +1830,22 @@ jobs:
           echo "🚀 Stage 2: Post-reboot setup starting..."
           
           # Configuration variables (to be replaced by workflow)
-          TS_OAUTH_CLIENT_ID="TS_OAUTH_CLIENT_ID_PLACEHOLDER"
-          TS_OAUTH_SECRET="TS_OAUTH_SECRET_PLACEHOLDER"
-          TAILSCALE_TAILNET="TAILSCALE_TAILNET_PLACEHOLDER"
+          TS_OAUTH_CLIENT_ID="${TS_OAUTH_CLIENT_ID}"
+          TS_OAUTH_SECRET="${TS_OAUTH_SECRET}"
+          TAILSCALE_TAILNET="${TAILSCALE_TAILNET:-"-"}"
           SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
           DOMAIN_NAME="DOMAIN_NAME_PLACEHOLDER"
-          CLOUDFLARE_EMAIL="CLOUDFLARE_EMAIL_PLACEHOLDER"
-          CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_PLACEHOLDER"
+          CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL:-""}"
+          CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-""}"
           
           # Validate OAuth credentials
-          if [[ "$TS_OAUTH_CLIENT_ID" == "TS_OAUTH_CLIENT_ID_PLACEHOLDER" ]]; then
-            echo "❌ TS_OAUTH_CLIENT_ID placeholder was not replaced"
+          if [[ -z "$TS_OAUTH_CLIENT_ID" ]]; then
+            echo "❌ TS_OAUTH_CLIENT_ID is empty or not replaced"
             exit 1
           fi
           
-          if [[ "$TS_OAUTH_SECRET" == "TS_OAUTH_SECRET_PLACEHOLDER" ]]; then
-            echo "❌ TS_OAUTH_SECRET placeholder was not replaced"
+          if [[ -z "$TS_OAUTH_SECRET" ]]; then
+            echo "❌ TS_OAUTH_SECRET is empty or not replaced"
             exit 1
           fi
           
@@ -2047,6 +2049,43 @@ jobs:
             echo "pending" > /tmp/tailscale_ip
           fi
           
+          # Configure Tailscale subnet routing for Docker networks
+          echo "🌐 Configuring Tailscale subnet routing for Docker networks..."
+          
+          # Share Docker network subnets through Tailscale
+          case "$SERVICE_NAME" in
+            "nginx")
+              echo "🔗 Advertising nginx Docker network subnet: 172.22.0.0/16"
+              tailscale up --advertise-routes=172.22.0.0/16 --accept-routes || {
+                echo "⚠️ Failed to advertise nginx subnet, but continuing..."
+              }
+              ;;
+            "fks")
+              echo "🔗 Advertising FKS Docker network subnet: 172.20.0.0/16"
+              tailscale up --advertise-routes=172.20.0.0/16 --accept-routes || {
+                echo "⚠️ Failed to advertise FKS subnet, but continuing..."
+              }
+              ;;
+            "ats")
+              echo "🔗 Advertising ATS Docker network subnet: 172.21.0.0/16"
+              tailscale up --advertise-routes=172.21.0.0/16 --accept-routes || {
+                echo "⚠️ Failed to advertise ATS subnet, but continuing..."
+              }
+              ;;
+            *)
+              echo "🔗 Advertising generic Docker network subnet: 172.23.0.0/16"
+              tailscale up --advertise-routes=172.23.0.0/16 --accept-routes || {
+                echo "⚠️ Failed to advertise ${SERVICE_NAME} subnet, but continuing..."
+              }
+              ;;
+          esac
+          
+          # Enable IP forwarding for subnet routing
+          echo "📡 Enabling IP forwarding for subnet routing..."
+          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' >> /etc/sysctl.conf
+          sysctl -p
+          
           # Complete firewall setup
           ufw allow in on tailscale0
           ufw --force enable
@@ -2065,39 +2104,51 @@ jobs:
           echo "TS_OAUTH_SECRET length: ${#TS_OAUTH_SECRET}"
           echo "TAILSCALE_TAILNET: ${TAILSCALE_TAILNET:-"(not set)"}"
           
-          sed -i "s|TS_OAUTH_CLIENT_ID_PLACEHOLDER|${TS_OAUTH_CLIENT_ID}|g" stage2-post-reboot.sh
-          sed -i "s|TS_OAUTH_SECRET_PLACEHOLDER|${TS_OAUTH_SECRET}|g" stage2-post-reboot.sh
-          sed -i "s|TAILSCALE_TAILNET_PLACEHOLDER|${TAILSCALE_TAILNET:-"-"}|g" stage2-post-reboot.sh
+          # Validate OAuth variables before replacement
+          if [[ -z "$TS_OAUTH_CLIENT_ID" ]]; then
+            echo "❌ TS_OAUTH_CLIENT_ID environment variable is empty!"
+            exit 1
+          fi
+          
+          if [[ -z "$TS_OAUTH_SECRET" ]]; then
+            echo "❌ TS_OAUTH_SECRET environment variable is empty!"
+            exit 1
+          fi
+          
+          # Replace OAuth credentials using environment variable expansion  
+          envsubst '${TS_OAUTH_CLIENT_ID} ${TS_OAUTH_SECRET} ${TAILSCALE_TAILNET} ${CLOUDFLARE_EMAIL} ${CLOUDFLARE_API_TOKEN}' < stage2-post-reboot.sh > stage2-post-reboot-temp.sh
+          mv stage2-post-reboot-temp.sh stage2-post-reboot.sh
+          
+          # Replace service-specific variables
           sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" stage2-post-reboot.sh
           sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" stage2-post-reboot.sh
-          sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER|${CLOUDFLARE_EMAIL:-""}|g" stage2-post-reboot.sh
-          sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|${CLOUDFLARE_API_TOKEN:-""}|g" stage2-post-reboot.sh
           
           # Debug: Show a few lines of the replaced script
           echo "🔍 Sample of replaced script:"
           head -20 stage2-post-reboot.sh | grep -E "(TS_OAUTH|TAILSCALE)" || echo "No OAuth lines found in first 20 lines"
           
-          # Verify OAuth placeholders were replaced
-          echo "🔍 Verifying OAuth placeholder replacement..."
+          # Verify OAuth credentials were replaced
+          echo "🔍 Verifying OAuth credential replacement..."
           
           # Count remaining placeholders
           PLACEHOLDER_COUNT=$(grep -c "PLACEHOLDER" stage2-post-reboot.sh || echo "0")
           echo "📊 Remaining placeholders: $PLACEHOLDER_COUNT"
           
-          if grep -q "TS_OAUTH_CLIENT_ID_PLACEHOLDER\|TS_OAUTH_SECRET_PLACEHOLDER" stage2-post-reboot.sh; then
-            echo "❌ OAuth placeholders still exist in stage2 script!"
-            echo "🔍 Remaining OAuth placeholders:"
-            grep -n "TS_OAUTH.*PLACEHOLDER" stage2-post-reboot.sh || echo "None found"
-            echo "🔍 All remaining placeholders:"
-            grep -n "PLACEHOLDER" stage2-post-reboot.sh | head -5
+          # Check for any template variables that weren't replaced (envsubst format)
+          if grep -q '\${TS_OAUTH_CLIENT_ID}' stage2-post-reboot.sh; then
+            echo "❌ OAuth template variables still exist in stage2 script!"
+            echo "🔍 Script preview (OAuth section):"
+            grep -A 5 -B 5 "TS_OAUTH_CLIENT_ID" stage2-post-reboot.sh | head -10
             
-            # Show environment variable values (masked)
+            # Show environment variable status
             echo "🔍 Environment variable status:"
-            [[ -n "$TS_OAUTH_CLIENT_ID" ]] && echo "✅ TS_OAUTH_CLIENT_ID is set" || echo "❌ TS_OAUTH_CLIENT_ID is empty"
-            [[ -n "$TS_OAUTH_SECRET" ]] && echo "✅ TS_OAUTH_SECRET is set" || echo "❌ TS_OAUTH_SECRET is empty"
+            [[ -n "$TS_OAUTH_CLIENT_ID" ]] && echo "✅ TS_OAUTH_CLIENT_ID is set (length: ${#TS_OAUTH_CLIENT_ID})" || echo "❌ TS_OAUTH_CLIENT_ID is empty"
+            [[ -n "$TS_OAUTH_SECRET" ]] && echo "✅ TS_OAUTH_SECRET is set (length: ${#TS_OAUTH_SECRET})" || echo "❌ TS_OAUTH_SECRET is empty"
             
-            echo "⚠️ Continuing deployment without OAuth placeholders replaced"
-            echo "🔧 Tailscale connection may fail, but infrastructure will be set up"
+            echo "⚠️ Continuing deployment - OAuth may fail but infrastructure will be set up"
+          else
+            echo "✅ OAuth credentials successfully replaced in stage2 script"
+          fi
           else
             echo "✅ OAuth placeholders replaced successfully"
           fi
