@@ -584,12 +584,100 @@ jobs:
           chmod +x actions/scripts/linode/wait-for-ssh.sh
           actions/scripts/linode/wait-for-ssh.sh "${{ steps.create-server.outputs.server_ip }}"
           
-          # Verify stage2 completed (use existing stage2 from stage1-complete-setup.sh)
-          echo "🔍 Verifying stage2 completion..."
-          TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-            "tailscale ip -4 2>/dev/null || echo 'pending'")
-          echo "🔗 Tailscale IP: $TAILSCALE_IP"
-          echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+          # Monitor stage2 systemd service completion
+          echo "🔍 Monitoring stage2-setup service..."
+          MAX_ATTEMPTS=30
+          ATTEMPT=1
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Checking stage2-setup service status..."
+            
+            # Check if stage2 service has completed
+            SERVICE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "systemctl is-active stage2-setup.service 2>/dev/null || echo 'not-found'")
+            
+            echo "Stage2 service status: $SERVICE_STATUS"
+            
+            # Check if service completed successfully (inactive means it ran and finished)
+            if [[ "$SERVICE_STATUS" == "inactive" ]]; then
+              echo "✅ Stage2 service completed, checking exit status..."
+              
+              EXIT_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "systemctl show stage2-setup.service --property=ExecMainStatus --value 2>/dev/null || echo '1'")
+              
+              if [[ "$EXIT_STATUS" == "0" ]]; then
+                echo "✅ Stage2 completed successfully"
+                break
+              else
+                echo "❌ Stage2 completed with error (exit code: $EXIT_STATUS)"
+                echo "📋 Stage2 service logs:"
+                ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                  "journalctl -u stage2-setup.service --no-pager -n 50" || true
+                exit 1
+              fi
+            elif [[ "$SERVICE_STATUS" == "failed" ]]; then
+              echo "❌ Stage2 service failed"
+              echo "📋 Stage2 service logs:"
+              ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "journalctl -u stage2-setup.service --no-pager -n 50" || true
+              exit 1
+            elif [[ "$SERVICE_STATUS" == "not-found" ]]; then
+              echo "❌ Stage2 service not found"
+              exit 1
+            else
+              echo "⏳ Stage2 service still running ($SERVICE_STATUS), waiting..."
+            fi
+            
+            sleep 30
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
+            echo "❌ Timeout waiting for stage2 service to complete"
+            echo "📋 Current stage2 service logs:"
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "journalctl -u stage2-setup.service --no-pager -n 50" || true
+            exit 1
+          fi
+          
+          # Verify Tailscale connection
+          echo "🔍 Verifying Tailscale connection..."
+          TAILSCALE_ATTEMPTS=10
+          TAILSCALE_ATTEMPT=1
+          
+          while [ $TAILSCALE_ATTEMPT -le $TAILSCALE_ATTEMPTS ]; do
+            echo "Tailscale attempt $TAILSCALE_ATTEMPT/$TAILSCALE_ATTEMPTS: Getting Tailscale IP..."
+            
+            TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "tailscale ip -4 2>/dev/null || echo 'pending'")
+            
+            echo "🔗 Tailscale IP: $TAILSCALE_IP"
+            
+            if [[ "$TAILSCALE_IP" != "pending" && "$TAILSCALE_IP" != "" ]]; then
+              echo "✅ Tailscale connected successfully with IP: $TAILSCALE_IP"
+              echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+              
+              # Verify hostname is set correctly
+              TAILSCALE_HOSTNAME=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "tailscale status --json 2>/dev/null | jq -r '.Self.HostName // \"unknown\"' 2>/dev/null || echo 'unknown'")
+              echo "🏷️ Tailscale hostname: $TAILSCALE_HOSTNAME"
+              
+              exit 0
+            else
+              echo "⏳ Tailscale not ready yet, waiting..."
+              sleep 20
+              TAILSCALE_ATTEMPT=$((TAILSCALE_ATTEMPT + 1))
+            fi
+          done
+          
+          echo "❌ Tailscale connection failed after $TAILSCALE_ATTEMPTS attempts"
+          echo "📋 Tailscale status:"
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+            "tailscale status 2>/dev/null || echo 'Tailscale status failed'" || true
+          echo "📋 Tailscaled service logs:"
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+            "journalctl -u tailscaled --no-pager -n 20" || true
+          exit 1
 
   # ============================================================================
   # Deploy Service Application  
