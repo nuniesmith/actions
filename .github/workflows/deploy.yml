@@ -1373,6 +1373,48 @@ jobs:
           echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/deployment_key
           chmod 600 ~/.ssh/deployment_key
           
+          # Pre-deployment Docker networking fix
+          echo "🔧 Pre-deployment: Fixing Docker networking issues..."
+          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@${{ needs.setup-infrastructure.outputs.server_ip }} "
+            echo '🔧 Checking and fixing Docker networking before service deployment...'
+            
+            # Check if Docker is running properly
+            if ! docker info >/dev/null 2>&1; then
+              echo '⚠️ Docker not responding properly, restarting...'
+              systemctl restart docker
+              sleep 10
+            fi
+            
+            # Fix common Docker networking issues
+            echo '🔧 Fixing Docker networking issues...'
+            
+            # Restart Docker to clean up any broken network state
+            systemctl restart docker
+            sleep 15
+            
+            # Verify Docker is running
+            if docker info >/dev/null 2>&1; then
+              echo '✅ Docker networking fixed and ready'
+            else
+              echo '❌ Docker still having issues'
+              systemctl status docker
+            fi
+            
+            # Clean up any broken networks
+            echo '🧹 Cleaning up broken Docker networks...'
+            docker network prune -f 2>/dev/null || true
+            
+            # Create the nginx network if it doesn't exist
+            if ! docker network ls | grep -q 'nginx-network'; then
+              echo '🌐 Creating nginx-network...'
+              docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network || echo 'Network creation failed, will retry during deployment'
+            else
+              echo '✅ nginx-network already exists'
+            fi
+            
+            echo '✅ Docker networking pre-check completed'
+          "
+          
           chmod +x actions/scripts/deployment/deploy-service.sh
           actions/scripts/deployment/deploy-service.sh "${{ env.SERVICE_NAME }}" "${{ needs.setup-infrastructure.outputs.server_ip }}"
 

@@ -69,6 +69,10 @@ ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
   echo '👤 Setting ownership to service user...'
   chown -R ${SERVICE_NAME}_user:${SERVICE_NAME}_user /home/${SERVICE_NAME}_user/$SERVICE_NAME
   
+  # Add service user to docker group if not already there
+  echo '🐳 Ensuring service user has Docker access...'
+  usermod -aG docker ${SERVICE_NAME}_user 2>/dev/null || echo 'User already in docker group'
+  
   echo '✅ Repository setup completed'
 "
 
@@ -81,6 +85,18 @@ ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
   pwd
   ls -la
   
+  # Verify Docker networking is working before switching users
+  echo '🔧 Final Docker network verification...'
+  if ! docker info >/dev/null 2>&1; then
+    echo '❌ Docker still not responding properly'
+    systemctl restart docker
+    sleep 10
+  fi
+  
+  # Ensure docker daemon socket permissions for service user
+  echo '🐳 Setting Docker socket permissions...'
+  chmod 666 /var/run/docker.sock 2>/dev/null || true
+  
   # Run as the service user for proper permissions
   echo '🎭 Switching to service user for deployment...'
   
@@ -89,21 +105,17 @@ ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
     echo '🚀 Deploying with start.sh script...'
     chmod +x start.sh
     
-    # Run start.sh as the service user
+    # Run start.sh as the service user with proper environment
     su - ${SERVICE_NAME}_user -c 'cd /home/${SERVICE_NAME}_user/$SERVICE_NAME && ./start.sh'
     
     echo '✅ start.sh deployment completed'
   elif [[ -f 'docker-compose.yml' ]]; then
-    echo '🐳 Deploying with Docker Compose...'
+    echo '🐳 Deploying with Docker Compose as root (due to networking requirements)...'
     
     # Stop existing containers first
     docker-compose down 2>/dev/null || true
     
-    # Clean up conflicting networks if they exist
-    echo '🧹 Cleaning up conflicting networks...'
-    docker network rm ${SERVICE_NAME}-network 2>/dev/null || true
-    
-    # Start services (docker-compose will create the network)
+    # Start services (run as root to avoid Docker permission issues)
     docker-compose up -d
     
     echo '✅ Docker Compose deployment completed'
