@@ -1048,10 +1048,42 @@ jobs:
                   echo "⚠️ Skipping Tailscale cleanup due to OAuth token issues"
                 else
                   echo "✅ Successfully obtained OAuth access token for cleanup"
-                  echo "✅ Successfully obtained OAuth access token for cleanup"
                   
-                  # Function to clean up Tailscale devices by hostname pattern
-                  cleanup_tailscale_devices() {
+                  # Simplified Tailscale cleanup
+                  TAILNET="${TAILSCALE_TAILNET:-"-"}"
+                  if [[ "$TAILNET" == "-" ]]; then
+                    DEVICES_URL="https://api.tailscale.com/api/v2/devices"
+                  else
+                    DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
+                  fi
+                  
+                  echo "🔗 Fetching devices for cleanup..."
+                  DEVICES_RESPONSE=$(curl -s -H "Authorization: Bearer $TOKEN" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
+                  
+                  if [[ "$DEVICES_RESPONSE" != "CURL_FAILED" ]] && echo "$DEVICES_RESPONSE" | jq -e '.devices' >/dev/null 2>&1; then
+                    # Find devices matching service name
+                    CLEANUP_DEVICES=$(echo "$DEVICES_RESPONSE" | jq -r --arg service "${{ env.SERVICE_NAME }}" '
+                      .devices[]? | 
+                      select((.hostname // .name | test($service; "i"))) | 
+                      .id // empty' | grep -v '^$' || true)
+                    
+                    if [[ -n "$CLEANUP_DEVICES" ]]; then
+                      echo "🗑️ Cleaning up Tailscale devices:"
+                      for device_id in $CLEANUP_DEVICES; do
+                        echo "  Removing device: $device_id"
+                        curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+                          "https://api.tailscale.com/api/v2/device/$device_id" >/dev/null 2>&1 || true
+                        sleep 1
+                      done
+                      echo "✅ Tailscale cleanup completed"
+                    else
+                      echo "ℹ️ No ${{ env.SERVICE_NAME }} devices found for cleanup"
+                    fi
+                  else
+                    echo "⚠️ Could not retrieve Tailscale devices for cleanup"
+                  fi
+                fi
+              fi
                     local hostname_pattern="$1"
                     local cleanup_reason="${2:-old server cleanup}"
                     
@@ -1079,9 +1111,17 @@ jobs:
                     
                     # Validate response before processing
                     if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                
-                # Multiple cleanup patterns to catch all variants for nginx
-                CLEANUP_PATTERNS=(
+                      echo "✅ Devices API accessible, but cleanup simplified"
+                    fi
+                  fi
+                fi
+              fi
+            else
+              echo "⚠️ Tailscale API key not available"
+            fi
+          else
+            echo "ℹ️ No existing server found for cleanup"
+          fi
                   "^${{ env.SERVICE_NAME }}$"              # Exact match: "nginx" 
                   "^${{ env.SERVICE_NAME }}(-[0-9]+)?$"     # With optional number: "nginx-1"
                   "^${{ env.SERVICE_NAME }}-"               # Starts with service name: "nginx-*"
@@ -1219,79 +1259,6 @@ jobs:
             echo "ℹ️ No existing ${{ env.SERVICE_NAME }} server found to destroy"
             echo "✅ Proceeding with fresh deployment"
           fi
-            
-            # Post-destruction Tailscale cleanup (in case any devices were missed)
-            echo "🧹 Final Tailscale cleanup after server destruction..."
-            if [[ -n "$TS_OAUTH_CLIENT_ID" && -n "$TS_OAUTH_SECRET" ]]; then
-              # Get OAuth token for post-destruction cleanup
-              echo "🔑 Getting OAuth token for post-destruction cleanup..."
-              CLEANUP_OAUTH_RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
-                -H "Content-Type: application/x-www-form-urlencoded" \
-                -d "grant_type=client_credentials" \
-                -d "client_id=$TS_OAUTH_CLIENT_ID" \
-                -d "client_secret=$TS_OAUTH_SECRET" 2>/dev/null || echo "CURL_FAILED")
-              
-              if [[ "$CLEANUP_OAUTH_RESPONSE" != "CURL_FAILED" ]]; then
-                CLEANUP_TOKEN=$(echo "$CLEANUP_OAUTH_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null || echo "")
-                
-                if [[ -n "$CLEANUP_TOKEN" && "$CLEANUP_TOKEN" != "empty" ]]; then
-                  TAILNET="${TAILSCALE_TAILNET:-"-"}"
-                  if [[ "$TAILNET" == "-" ]]; then
-                    DEVICES_URL="https://api.tailscale.com/api/v2/devices"
-                  else
-                    DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
-                  fi
-                  
-                  DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $CLEANUP_TOKEN" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
-                  HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-                  DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
-                  
-                  if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                    echo "🔍 Searching for remaining ${{ env.SERVICE_NAME }} devices..."
-                    
-                    # Find any remaining devices with service patterns
-                    REMAINING_DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg service "${{ env.SERVICE_NAME }}" '
-                      .devices[]? | 
-                      select(
-                        (.hostname // .name | test("^" + $service + "$"; "i")) or
-                        (.hostname // .name | test("^" + $service + "-"; "i")) or
-                        (.hostname // .name | test($service; "i"))
-                      ) | 
-                      .id // empty' | grep -v '^$' || true)
-                    
-                    if [[ -n "$REMAINING_DEVICES" ]]; then
-                      echo "🗑️ Found remaining devices to clean up:"
-                      for device_id in $REMAINING_DEVICES; do
-                        if [[ -n "$device_id" ]]; then
-                          DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown")"')
-                          echo "  Removing: $device_id ($DEVICE_INFO)"
-                          
-                          if [[ "$TAILNET" == "-" ]]; then
-                            DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
-                          else
-                            DELETE_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id"
-                          fi
-                          
-                          curl -s -X DELETE -H "Authorization: Bearer $CLEANUP_TOKEN" "$DELETE_URL" >/dev/null 2>&1 || true
-                          sleep 1
-                        fi
-                      done
-                      echo "✅ Final cleanup completed"
-                    else
-                      echo "✅ No remaining ${{ env.SERVICE_NAME }} devices found"
-                    fi
-                  else
-                    echo "⚠️ Could not retrieve devices for cleanup (HTTP: $HTTP_CODE)"
-                  fi
-                else
-                  echo "⚠️ Could not get OAuth token for post-destruction cleanup"
-                fi
-              else
-                echo "⚠️ OAuth request failed for post-destruction cleanup"
-              fi
-            else
-              echo "⚠️ OAuth credentials not available for post-destruction cleanup"
-            fi
 
   # ============================================================================
   # Main Destroy Job (for destroy action)
