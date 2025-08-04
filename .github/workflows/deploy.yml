@@ -332,16 +332,34 @@ jobs:
           
           # Also cleanup old GitHub runners and service devices from Tailscale
           echo "🧹 Cleaning up old Tailscale devices..."
-          curl -s "https://api.tailscale.com/api/v2/tailnet/${TAILSCALE_TAILNET:-${{ github.repository_owner }}}/devices" \
-            -H "Authorization: Bearer $TS_OAUTH_SECRET" | \
-          jq -r '.devices[] | select(.hostname | test("github-|runner-|actions-|'${{ env.SERVICE_NAME }}'-old")) | .nodeId' | \
-          while read -r device_id; do
-            if [ -n "$device_id" ]; then
-              echo "🗑️ Removing old device: $device_id"
-              curl -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
-                -H "Authorization: Bearer $TS_OAUTH_SECRET" || true
+          
+          # Determine tailnet to use
+          TAILNET_NAME="${TAILSCALE_TAILNET:-${{ github.repository_owner }}}"
+          echo "📋 Using Tailnet: $TAILNET_NAME"
+          
+          # Get devices and clean up old ones
+          if [ -n "$TS_OAUTH_SECRET" ]; then
+            echo "🔍 Fetching Tailscale devices..."
+            DEVICES_RESPONSE=$(curl -s "https://api.tailscale.com/api/v2/tailnet/${TAILNET_NAME}/devices" \
+              -H "Authorization: Bearer $TS_OAUTH_SECRET" 2>/dev/null || echo "ERROR")
+            
+            if [ "$DEVICES_RESPONSE" != "ERROR" ]; then
+              echo "📋 Tailscale devices response received"
+              echo "$DEVICES_RESPONSE" | jq -r '.devices[]? | select(.hostname | test("github-|runner-|actions-|'${{ env.SERVICE_NAME }}'-old")) | .nodeId' 2>/dev/null | \
+              while read -r device_id; do
+                if [ -n "$device_id" ] && [ "$device_id" != "null" ]; then
+                  echo "🗑️ Removing old device: $device_id"
+                  curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$device_id" \
+                    -H "Authorization: Bearer $TS_OAUTH_SECRET" 2>/dev/null || true
+                  sleep 1  # Rate limiting
+                fi
+              done
+            else
+              echo "⚠️ Could not fetch Tailscale devices (API call failed)"
             fi
-          done
+          else
+            echo "⚠️ No Tailscale OAuth secret available for device cleanup"
+          fi
 
   # ============================================================================
   # Code Testing (Optional)
@@ -558,18 +576,41 @@ jobs:
           
           # Replace placeholders in setup scripts
           echo "🔄 Replacing placeholders in setup scripts..."
-          sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage1-setup.sh
-          sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${ACTIONS_USER_PASSWORD}/g" stage1-setup.sh
-          sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${JORDAN_PASSWORD}/g" stage1-setup.sh
           
-          # Replace placeholders in stage2 script
-          sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage2-post-reboot.sh
-          sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${CLOUDFLARE_EMAIL}/g" stage2-post-reboot.sh
-          sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${CLOUDFLARE_API_TOKEN}/g" stage2-post-reboot.sh
-          sed -i "s/ADMIN_EMAIL_PLACEHOLDER/${ADMIN_EMAIL}/g" stage2-post-reboot.sh
-          sed -i "s/TS_OAUTH_CLIENT_ID_PLACEHOLDER/${TS_OAUTH_CLIENT_ID}/g" stage2-post-reboot.sh
-          sed -i "s/TS_OAUTH_SECRET_PLACEHOLDER/${TS_OAUTH_SECRET}/g" stage2-post-reboot.sh
-          sed -i "s/TAILSCALE_TAILNET_PLACEHOLDER/${TAILSCALE_TAILNET}/g" stage2-post-reboot.sh
+          # Escape special characters for sed
+          SAFE_ACTIONS_PASSWORD=$(printf '%s\n' "${ACTIONS_USER_PASSWORD}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          SAFE_JORDAN_PASSWORD=$(printf '%s\n' "${JORDAN_PASSWORD}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          SAFE_SERVICE_NAME=$(printf '%s\n' "${{ env.SERVICE_NAME }}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          
+          # Stage1 script replacements
+          sed -i "s/SERVICE_NAME_PLACEHOLDER/${SAFE_SERVICE_NAME}/g" stage1-setup.sh
+          sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${SAFE_ACTIONS_PASSWORD}/g" stage1-setup.sh
+          sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${SAFE_JORDAN_PASSWORD}/g" stage1-setup.sh
+          
+          # Stage2 script replacements with proper escaping
+          SAFE_CLOUDFLARE_EMAIL=$(printf '%s\n' "${CLOUDFLARE_EMAIL}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          SAFE_CLOUDFLARE_TOKEN=$(printf '%s\n' "${CLOUDFLARE_API_TOKEN}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          SAFE_ADMIN_EMAIL=$(printf '%s\n' "${ADMIN_EMAIL}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          SAFE_TS_CLIENT_ID=$(printf '%s\n' "${TS_OAUTH_CLIENT_ID}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          SAFE_TS_SECRET=$(printf '%s\n' "${TS_OAUTH_SECRET}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          SAFE_TAILNET=$(printf '%s\n' "${TAILSCALE_TAILNET}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+          
+          sed -i "s/SERVICE_NAME_PLACEHOLDER/${SAFE_SERVICE_NAME}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${SAFE_CLOUDFLARE_EMAIL}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${SAFE_CLOUDFLARE_TOKEN}/g" stage2-post-reboot.sh
+          sed -i "s/ADMIN_EMAIL_PLACEHOLDER/${SAFE_ADMIN_EMAIL}/g" stage2-post-reboot.sh
+          sed -i "s/TS_OAUTH_CLIENT_ID_PLACEHOLDER/${SAFE_TS_CLIENT_ID}/g" stage2-post-reboot.sh
+          sed -i "s/TS_OAUTH_SECRET_PLACEHOLDER/${SAFE_TS_SECRET}/g" stage2-post-reboot.sh
+          sed -i "s/TAILSCALE_TAILNET_PLACEHOLDER/${SAFE_TAILNET}/g" stage2-post-reboot.sh
+          
+          # Verify replacements worked
+          echo "🔍 Verifying placeholder replacements in stage2 script..."
+          if grep -q "PLACEHOLDER" stage2-post-reboot.sh; then
+            echo "⚠️ Warning: Some placeholders were not replaced:"
+            grep "PLACEHOLDER" stage2-post-reboot.sh || true
+          else
+            echo "✅ All placeholders replaced successfully"
+          fi
           
           # Upload and execute stage 1 setup
           echo "📤 Uploading setup scripts..."
@@ -624,8 +665,19 @@ jobs:
             if [ -f /usr/local/bin/stage2-post-reboot.sh ]; then
               echo "📋 Running stage2 script..."
               chmod +x /usr/local/bin/stage2-post-reboot.sh
+              
+              # Show first few lines to verify placeholders were replaced
+              echo "🔍 Verifying script content (first 10 lines):"
+              head -10 /usr/local/bin/stage2-post-reboot.sh
+              
+              # Run the script
               /usr/local/bin/stage2-post-reboot.sh
-              echo "✅ Stage2 script completed with exit code: $?"
+              STAGE2_EXIT_CODE=$?
+              echo "✅ Stage2 script completed with exit code: $STAGE2_EXIT_CODE"
+              
+              if [ $STAGE2_EXIT_CODE -ne 0 ]; then
+                echo "❌ Stage2 script failed, but continuing deployment..."
+              fi
             else
               echo "⚠️ Stage2 script not found, skipping..."
             fi
@@ -643,13 +695,14 @@ jobs:
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
             "systemctl status tailscaled --no-pager -l" || true
           
-          TAILSCALE_ATTEMPTS=6  # Reduced attempts, but with better checks
+          TAILSCALE_ATTEMPTS=4  # Reduced to 4 attempts (about 2 minutes total)
           TAILSCALE_ATTEMPT=1
           
           while [ $TAILSCALE_ATTEMPT -le $TAILSCALE_ATTEMPTS ]; do
             echo "🔗 Tailscale attempt $TAILSCALE_ATTEMPT/$TAILSCALE_ATTEMPTS: Checking connection..."
             
             # Get comprehensive Tailscale status
+            echo "📋 Getting Tailscale status..."
             TAILSCALE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
               "tailscale status 2>/dev/null || echo 'ERROR: tailscale status failed'")
             
@@ -658,7 +711,7 @@ jobs:
             
             # Try to get IP
             TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-              "tailscale ip -4 2>/dev/null | head -1 | tr -d '\n' || echo 'no-ip'")
+              "tailscale ip -4 2>/dev/null | head -1 | tr -d '\n\r' || echo 'no-ip'")
             
             echo "🔗 Tailscale IP result: '$TAILSCALE_IP'"
             
@@ -679,11 +732,11 @@ jobs:
               # Show recent Tailscale logs for debugging
               echo "📋 Recent tailscaled logs:"
               ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-                "journalctl -u tailscaled --no-pager -n 10 --since '5 minutes ago'" || true
+                "journalctl -u tailscaled --no-pager -n 5 --since '2 minutes ago' 2>/dev/null || echo 'Could not get logs'" || true
               
               if [ $TAILSCALE_ATTEMPT -lt $TAILSCALE_ATTEMPTS ]; then
-                echo "⏳ Waiting 20 seconds before next attempt..."
-                sleep 20
+                echo "⏳ Waiting 30 seconds before next attempt..."
+                sleep 30
               fi
               TAILSCALE_ATTEMPT=$((TAILSCALE_ATTEMPT + 1))
             fi
@@ -694,12 +747,15 @@ jobs:
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} '
             echo "=== Tailscale Status ==="
             tailscale status 2>&1 || echo "Status command failed"
+            echo ""
             echo "=== Tailscale Version ==="
-            tailscale version 2>&1 || echo "Version command failed"
-            echo "=== Recent Tailscaled Logs ==="
-            journalctl -u tailscaled --no-pager -n 20 --since "10 minutes ago" 2>&1 || echo "Log retrieval failed"
-            echo "=== Network Interfaces ==="
-            ip addr show 2>&1 || echo "Network interface check failed"
+            tailscale version 2>&1 || echo "Version command failed"  
+            echo ""
+            echo "=== Recent Tailscaled Logs (last 10 lines) ==="
+            journalctl -u tailscaled --no-pager -n 10 --since "5 minutes ago" 2>&1 || echo "Log retrieval failed"
+            echo ""
+            echo "=== Environment Variables Check ==="
+            env | grep -E "(TS_|TAILSCALE)" || echo "No Tailscale env vars found"
           '
           
           # Continue without Tailscale IP (don't fail the deployment)
