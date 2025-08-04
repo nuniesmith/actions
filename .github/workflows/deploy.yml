@@ -543,7 +543,73 @@ jobs:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
           SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
         run: |
+          # Debug environment setup
+          echo "🔍 Debug: Checking environment variables..."
+          echo "SERVICE_NAME: ${{ env.SERVICE_NAME }}"
+          echo "SERVER_TYPE: ${{ env.SERVER_TYPE }}"
+          echo "TARGET_REGION: ${{ env.TARGET_REGION }}"
+          echo "OVERWRITE_SERVER: ${{ inputs.overwrite_server }}"
+          echo "LINODE_CLI_TOKEN set: $([ -n "$LINODE_CLI_TOKEN" ] && echo 'YES' || echo 'NO')"
+          echo "SERVICE_ROOT_PASSWORD set: $([ -n "$SERVICE_ROOT_PASSWORD" ] && echo 'YES' || echo 'NO')"
+          
+          # Ensure script is executable and run with better error handling
           chmod +x actions/scripts/linode/create-server.sh
+          
+          # Pre-install and test Linode CLI
+          echo "� Installing and testing Linode CLI..."
+          pip install linode-cli
+          
+          # Test CLI functionality
+          export LINODE_CLI_TOKEN="$LINODE_CLI_TOKEN"
+          linode-cli --version
+          
+          echo "🔍 Testing API connectivity..."
+          if ! linode-cli linodes list --text --no-headers >/dev/null 2>&1; then
+            echo "❌ Linode CLI authentication failed - check LINODE_CLI_TOKEN"
+            echo "Attempting to show any error details:"
+            linode-cli linodes list --text --no-headers 2>&1 || true
+            exit 1
+          else
+            echo "✅ Linode CLI authentication successful"
+          fi
+          
+          # Validate server type and region availability
+          echo "🔍 Validating server type and region..."
+          echo "Checking if server type '${{ env.SERVER_TYPE }}' is available in region '${{ env.TARGET_REGION }}'..."
+          
+          # List available types and regions for debugging
+          echo "Available server types (first 10):"
+          linode-cli linodes types --text --no-headers | head -10 || true
+          
+          echo "Available regions:"
+          linode-cli regions list --text --no-headers || true
+          
+          # Check specific type availability
+          if linode-cli linodes types --text --no-headers | grep -q "${{ env.SERVER_TYPE }}"; then
+            echo "✅ Server type '${{ env.SERVER_TYPE }}' is available"
+          else
+            echo "⚠️ Server type '${{ env.SERVER_TYPE }}' may not be available"
+          fi
+          
+          # Validate password complexity (Linode requires complex passwords)
+          echo "🔍 Validating password complexity..."
+          if [[ ${#SERVICE_ROOT_PASSWORD} -lt 6 ]]; then
+            echo "❌ Password too short (minimum 6 characters required)"
+            exit 1
+          elif [[ ! "$SERVICE_ROOT_PASSWORD" =~ [A-Z] ]] || [[ ! "$SERVICE_ROOT_PASSWORD" =~ [a-z] ]] || [[ ! "$SERVICE_ROOT_PASSWORD" =~ [0-9] ]]; then
+            echo "⚠️ Password may not meet complexity requirements (needs uppercase, lowercase, and numbers)"
+          else
+            echo "✅ Password appears to meet complexity requirements"
+          fi
+          
+          # Pre-create SSH directory to avoid permission issues
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          
+          # Export environment variables that the script needs
+          export SERVICE_ROOT_PASSWORD="$SERVICE_ROOT_PASSWORD"
+          
+          echo "🚀 Starting server creation process..."
           actions/scripts/linode/create-server.sh "${{ env.SERVICE_NAME }}" "${{ env.SERVER_TYPE }}" "${{ env.TARGET_REGION }}" "${{ inputs.overwrite_server }}"
 
       - name: ⏳ Wait for SSH Access
