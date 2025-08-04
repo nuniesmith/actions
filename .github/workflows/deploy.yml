@@ -1430,6 +1430,9 @@ jobs:
           echo "Service: ${SERVICE_NAME}.${DOMAIN_SUFFIX}"
           echo ""
           
+          # Set error handling - continue on individual record failures
+          set +e  # Don't exit on errors, handle them gracefully
+          
           # Check if Cloudflare credentials are available
           if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
             echo "⚠️ Cloudflare API token not provided - skipping DNS updates"
@@ -1541,8 +1544,12 @@ jobs:
           echo "📋 Updating $total_count DNS records..."
           
           for record in "${records[@]}"; do
+            echo "🔄 Processing: $record"
             if update_dns_record "$record" "$TAILSCALE_IP" "$DOMAIN_SUFFIX"; then
               ((updated_count++))
+              echo "✅ Success: $record"
+            else
+              echo "❌ Failed: $record (continuing with remaining records)"
             fi
             sleep 1  # Rate limiting
           done
