@@ -602,13 +602,14 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
         declare -a dns_records
         
         if [[ "$SERVICE_NAME" == "nginx" ]]; then
-          # Nginx service - update all proxy-related records (excluding ATS and server-specific records)
+          # Nginx service - update ALL proxy-related records (excluding ATS and server-specific records)
+          # This list matches your complete DNS zone file to ensure full management
           dns_records=(
             # Core nginx service
             "$FULL_DOMAIN_NAME"           # nginx.7gram.xyz
             
             # Root domain and www
-            "$DOMAIN_NAME"                # 7gram.xyz (root domain)
+            "$DOMAIN_NAME"                # 7gram.xyz (root domain) 
             "www.$DOMAIN_NAME"            # www.7gram.xyz
             
             # Wildcard and admin
@@ -700,10 +701,11 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
             "fkstrading.xyz.$DOMAIN_NAME" # fkstrading.xyz.7gram.xyz
           )
           echo "🌐 Updating ${#dns_records[@]} DNS records for nginx service..."
-          echo "ℹ️ Excluded from updates:"
+          echo "ℹ️ Excluded from updates (managed by other repositories):"
           echo "   - ats.7gram.xyz (ATS Game Server)"
           echo "   - api.ats.7gram.xyz (ATS API)"
           echo "   - www.ats.7gram.xyz (ATS Web)"
+          echo "ℹ️ Excluded from updates (server-specific Tailscale IPs):"
           echo "   - freddy.7gram.xyz (Home automation server)"
           echo "   - sullivan.7gram.xyz (Main media server)"
         elif [[ "$SERVICE_NAME" == "fks" ]]; then
