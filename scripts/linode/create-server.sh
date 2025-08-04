@@ -16,7 +16,33 @@ pip install linode-cli
 export LINODE_CLI_TOKEN="${LINODE_CLI_TOKEN}"
 linode-cli --version
 
-# Check if server already exists (unless we just destroyed it)
+# If overwrite is enabled, check for and remove existing servers with the same name
+if [[ "$OVERWRITE_SERVER" == "true" ]]; then
+  echo "🔍 Checking for existing servers to overwrite..."
+  EXISTING_SERVERS=$(linode-cli linodes list --text --no-headers | grep "$SERVICE_NAME" || true)
+  
+  if [[ -n "$EXISTING_SERVERS" ]]; then
+    echo "🗑️ Found existing servers to remove:"
+    echo "$EXISTING_SERVERS"
+    
+    # Remove each existing server
+    echo "$EXISTING_SERVERS" | while IFS= read -r server_line; do
+      if [[ -n "$server_line" ]]; then
+        SERVER_ID=$(echo "$server_line" | cut -f1)
+        SERVER_LABEL=$(echo "$server_line" | cut -f2)
+        echo "🗑️ Removing existing server: $SERVER_ID ($SERVER_LABEL)"
+        linode-cli linodes delete "$SERVER_ID" || echo "⚠️ Failed to remove server $SERVER_ID"
+      fi
+    done
+    
+    echo "⏳ Waiting for server deletion to complete..."
+    sleep 30
+  else
+    echo "✅ No existing servers found with name pattern '$SERVICE_NAME'"
+  fi
+fi
+
+# Check if server already exists (unless we just destroyed it or overwrite is enabled)
 if [[ "$OVERWRITE_SERVER" != "true" ]]; then
   EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep "$SERVICE_NAME" | head -1)
   if [[ -n "$EXISTING_SERVER" ]]; then
