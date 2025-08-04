@@ -898,6 +898,7 @@ jobs:
           sed -i "s/TS_OAUTH_CLIENT_ID_PLACEHOLDER/${SAFE_TS_CLIENT_ID}/g" stage2-post-reboot.sh
           sed -i "s/TS_OAUTH_SECRET_PLACEHOLDER/${SAFE_TS_SECRET}/g" stage2-post-reboot.sh
           sed -i "s/TAILSCALE_TAILNET_PLACEHOLDER/${SAFE_TAILNET}/g" stage2-post-reboot.sh
+          sed -i "s/DOMAIN_NAME_PLACEHOLDER/${{ env.FULL_DOMAIN }}/g" stage2-post-reboot.sh
           
           # Create environment file as backup method for credentials
           echo "🔧 Creating environment file as backup credential source..."
@@ -910,6 +911,7 @@ jobs:
           echo "export CLOUDFLARE_EMAIL_ENV=\"${CLOUDFLARE_EMAIL:-}\"" >> stage2-env.sh
           echo "export CLOUDFLARE_API_TOKEN_ENV=\"${CLOUDFLARE_API_TOKEN:-}\"" >> stage2-env.sh
           echo "export ADMIN_EMAIL_ENV=\"${ADMIN_EMAIL:-}\"" >> stage2-env.sh
+          echo "export DOMAIN_NAME_ENV=\"${{ env.FULL_DOMAIN }}\"" >> stage2-env.sh
           chmod +x stage2-env.sh
           
           # Also create a direct credential replacement script for troubleshooting
@@ -934,6 +936,7 @@ jobs:
           echo "  sed -i \"s/TS_OAUTH_SECRET_PLACEHOLDER/\\\${TS_OAUTH_SECRET_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
           echo "  sed -i \"s/TAILSCALE_TAILNET_PLACEHOLDER/\\\${TAILSCALE_TAILNET_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
           echo "  sed -i \"s/SERVICE_NAME_PLACEHOLDER/\\\${SERVICE_NAME_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
+          echo "  sed -i \"s/DOMAIN_NAME_PLACEHOLDER/\\\${DOMAIN_NAME_ENV}/g\" /usr/local/bin/stage2-post-reboot.sh" >> fix-stage2-credentials.sh
           echo "  echo \"✅ Emergency patches applied\"" >> fix-stage2-credentials.sh
           echo "  echo \"🔍 Verification of fixes:\"" >> fix-stage2-credentials.sh
           echo "  grep -n \"TS_OAUTH_CLIENT_ID=\" /usr/local/bin/stage2-post-reboot.sh | head -1" >> fix-stage2-credentials.sh
