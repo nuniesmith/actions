@@ -871,13 +871,23 @@ jobs:
           sed -i "s/TS_OAUTH_SECRET_PLACEHOLDER/${SAFE_TS_SECRET}/g" stage2-post-reboot.sh
           sed -i "s/TAILSCALE_TAILNET_PLACEHOLDER/${SAFE_TAILNET}/g" stage2-post-reboot.sh
           
-          # Verify replacements worked
+          # Verify replacements worked with enhanced debugging
           echo "🔍 Verifying placeholder replacements in stage2 script..."
           if grep -q "PLACEHOLDER" stage2-post-reboot.sh; then
             echo "⚠️ Warning: Some placeholders were not replaced:"
             grep "PLACEHOLDER" stage2-post-reboot.sh || true
+            echo ""
+            echo "🔍 Environment variable check:"
+            echo "TS_OAUTH_CLIENT_ID length: ${#TS_OAUTH_CLIENT_ID}"
+            echo "TS_OAUTH_SECRET length: ${#TS_OAUTH_SECRET}"
+            echo "TAILSCALE_TAILNET: '${TAILSCALE_TAILNET}'"
+            echo "SERVICE_NAME: '${{ env.SERVICE_NAME }}'"
           else
             echo "✅ All placeholders replaced successfully"
+            echo "🔍 Verification - checking key lines in stage2 script:"
+            grep -n "TS_OAUTH_CLIENT_ID=" stage2-post-reboot.sh | head -1 || echo "Client ID line not found"
+            grep -n "TS_OAUTH_SECRET=" stage2-post-reboot.sh | head -1 || echo "Secret line not found"
+            grep -n "SERVICE_NAME=" stage2-post-reboot.sh | head -1 || echo "Service name line not found"
           fi
           
           # Upload and execute stage 1 setup
@@ -927,108 +937,302 @@ jobs:
             SSH_ATTEMPT=$((SSH_ATTEMPT + 1))
           done
           
-          # Run stage2 script directly instead of relying on systemd service
-          echo "🔧 Running stage2 setup directly..."
+          # Run stage2 script with enhanced error handling and monitoring
+          echo "🔧 Running stage2 setup with enhanced monitoring..."
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} '
             if [ -f /usr/local/bin/stage2-post-reboot.sh ]; then
               echo "📋 Running stage2 script..."
               chmod +x /usr/local/bin/stage2-post-reboot.sh
               
               # Show first few lines to verify placeholders were replaced
-              echo "🔍 Verifying script content (first 10 lines):"
-              head -10 /usr/local/bin/stage2-post-reboot.sh
+              echo "🔍 Verifying script content (first 15 lines):"
+              head -15 /usr/local/bin/stage2-post-reboot.sh
               
-              # Run the script
-              /usr/local/bin/stage2-post-reboot.sh
-              STAGE2_EXIT_CODE=$?
+              # Check for unreplaced placeholders
+              if grep -q "PLACEHOLDER" /usr/local/bin/stage2-post-reboot.sh; then
+                echo "⚠️ Warning: Found unreplaced placeholders:"
+                grep "PLACEHOLDER" /usr/local/bin/stage2-post-reboot.sh || true
+              else
+                echo "✅ All placeholders appear to be replaced"
+              fi
+              
+              # Run the script with output redirection for monitoring
+              echo "🚀 Starting stage2 script execution..."
+              
+              # Create a log file for the stage2 execution
+              /usr/local/bin/stage2-post-reboot.sh > /tmp/stage2-execution.log 2>&1 &
+              STAGE2_PID=$!
+              
+              echo "📋 Stage2 script running with PID: $STAGE2_PID"
+              
+              # Monitor the script execution with timeout
+              MONITOR_COUNT=0
+              MAX_MONITOR_TIME=600  # 10 minutes max
+              
+              while kill -0 $STAGE2_PID 2>/dev/null; do
+                sleep 15
+                MONITOR_COUNT=$((MONITOR_COUNT + 15))
+                
+                echo "📊 Stage2 script still running... (${MONITOR_COUNT}s elapsed)"
+                
+                # Show recent progress from log
+                if [ -f /tmp/stage2-execution.log ]; then
+                  echo "🔍 Recent progress (last 5 lines):"
+                  tail -5 /tmp/stage2-execution.log 2>/dev/null || echo "No log content yet"
+                fi
+                
+                # Safety timeout
+                if [ $MONITOR_COUNT -ge $MAX_MONITOR_TIME ]; then
+                  echo "⚠️ Stage2 script taking too long, killing process..."
+                  kill $STAGE2_PID 2>/dev/null || true
+                  sleep 5
+                  kill -9 $STAGE2_PID 2>/dev/null || true
+                  break
+                fi
+              done
+              
+              # Wait for process to fully complete
+              wait $STAGE2_PID 2>/dev/null || STAGE2_EXIT_CODE=$?
+              STAGE2_EXIT_CODE=${STAGE2_EXIT_CODE:-0}
+              
               echo "✅ Stage2 script completed with exit code: $STAGE2_EXIT_CODE"
+              
+              # Show full execution log for debugging
+              if [ -f /tmp/stage2-execution.log ]; then
+                echo "📋 Full stage2 execution log:"
+                echo "================================="
+                cat /tmp/stage2-execution.log
+                echo "================================="
+              fi
+              
+              # Check if Tailscale is connected after stage2
+              echo "🔍 Quick Tailscale status check after stage2:"
+              tailscale status 2>&1 || echo "Tailscale status not available yet"
               
               if [ $STAGE2_EXIT_CODE -ne 0 ]; then
                 echo "❌ Stage2 script failed, but continuing deployment..."
+                echo "🔍 Checking for specific error patterns in log..."
+                if [ -f /tmp/stage2-execution.log ]; then
+                  grep -i "error\|failed\|timeout" /tmp/stage2-execution.log | tail -10 || echo "No specific errors found"
+                fi
+              else
+                echo "✅ Stage2 script completed successfully"
               fi
             else
-              echo "⚠️ Stage2 script not found, skipping..."
+              echo "⚠️ Stage2 script not found at /usr/local/bin/stage2-post-reboot.sh"
+              echo "📋 Contents of /usr/local/bin/:"
+              ls -la /usr/local/bin/ || echo "Cannot list directory"
             fi
           '
           
-          # Wait a bit for Tailscale to initialize
-          echo "⏳ Waiting for Tailscale to initialize..."
-          sleep 30
+          # Extended wait for Tailscale to initialize properly
+          echo "⏳ Waiting for Tailscale to initialize and authenticate..."
+          echo "🔍 This may take several minutes for OAuth authentication to complete..."
+          sleep 90  # Increased from 30 to 90 seconds to allow more time for auth
           
-          # Verify Tailscale connection with better debugging
-          echo "🔍 Verifying Tailscale connection..."
+          # Enhanced Tailscale connection verification with retries
+          echo "🔍 Verifying Tailscale connection with enhanced retry logic..."
           
-          # First check if Tailscale is running
+          # First check if Tailscale daemon is running
           echo "📋 Checking Tailscale daemon status..."
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
             "systemctl status tailscaled --no-pager -l" || true
           
-          TAILSCALE_ATTEMPTS=4  # Reduced to 4 attempts (about 2 minutes total)
+          # Extended verification with more attempts and better error handling
+          TAILSCALE_ATTEMPTS=8  # Increased to 8 attempts (about 6-8 minutes total)
           TAILSCALE_ATTEMPT=1
+          TAILSCALE_CONNECTED=false
           
-          while [ $TAILSCALE_ATTEMPT -le $TAILSCALE_ATTEMPTS ]; do
+          while [ $TAILSCALE_ATTEMPT -le $TAILSCALE_ATTEMPTS ] && [ "$TAILSCALE_CONNECTED" != "true" ]; do
             echo "🔗 Tailscale attempt $TAILSCALE_ATTEMPT/$TAILSCALE_ATTEMPTS: Checking connection..."
             
-            # Get comprehensive Tailscale status
-            echo "📋 Getting Tailscale status..."
+            # Check if we're logged in first
             TAILSCALE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-              "tailscale status 2>/dev/null || echo 'ERROR: tailscale status failed'")
+              "tailscale status 2>/dev/null || echo 'STATUS_FAILED'")
             
             echo "📋 Tailscale status output:"
             echo "$TAILSCALE_STATUS"
             
-            # Try to get IP
-            TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-              "tailscale ip -4 2>/dev/null | head -1 | tr -d '\n\r' || echo 'no-ip'")
-            
-            echo "🔗 Tailscale IP result: '$TAILSCALE_IP'"
-            
-            # Check if we got a valid IP (proper regex validation)
-            if [[ "$TAILSCALE_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-              echo "✅ Tailscale connected successfully with IP: $TAILSCALE_IP"
-              echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+            # Check if status shows we're logged in
+            if echo "$TAILSCALE_STATUS" | grep -q "Logged in"; then
+              echo "✅ Tailscale shows logged in status"
               
-              # Get hostname for verification
-              TAILSCALE_HOSTNAME=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-                "hostname 2>/dev/null || echo 'unknown'")
-              echo "🏷️ Server hostname: $TAILSCALE_HOSTNAME"
+              # Now try to get IP address
+              TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "tailscale ip -4 2>/dev/null | head -1 | tr -d '\n\r' || echo 'no-ip'")
               
-              exit 0
-            else
-              echo "⏳ Tailscale not ready yet (got: '$TAILSCALE_IP'), checking logs..."
+              echo "🔗 Tailscale IP result: '$TAILSCALE_IP'"
               
-              # Show recent Tailscale logs for debugging
-              echo "📋 Recent tailscaled logs:"
-              ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-                "journalctl -u tailscaled --no-pager -n 5 --since '2 minutes ago' 2>/dev/null || echo 'Could not get logs'" || true
-              
-              if [ $TAILSCALE_ATTEMPT -lt $TAILSCALE_ATTEMPTS ]; then
-                echo "⏳ Waiting 30 seconds before next attempt..."
-                sleep 30
+              # Validate IP format
+              if [[ "$TAILSCALE_IP" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                echo "✅ Tailscale connected successfully with IP: $TAILSCALE_IP"
+                echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+                
+                # Get hostname for verification
+                TAILSCALE_HOSTNAME=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                  "hostname 2>/dev/null || echo 'unknown'")
+                echo "🏷️ Server hostname: $TAILSCALE_HOSTNAME"
+                
+                TAILSCALE_CONNECTED=true
+                break
+              else
+                echo "⏳ Valid IP not yet available (got: '$TAILSCALE_IP'), waiting for IP assignment..."
               fi
-              TAILSCALE_ATTEMPT=$((TAILSCALE_ATTEMPT + 1))
+              
+            elif echo "$TAILSCALE_STATUS" | grep -q "Logged out"; then
+              echo "⚠️ Tailscale shows 'Logged out' - authentication may have failed"
+              
+              # Try to re-run the connection process
+              if [ $TAILSCALE_ATTEMPT -le 3 ]; then
+                echo "🔄 Attempting to restart Tailscale authentication..."
+                ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                  "systemctl restart tailscaled && sleep 10 && /usr/local/bin/stage2-post-reboot.sh > /tmp/stage2-retry.log 2>&1 &" || true
+                echo "⏳ Waiting for authentication retry to complete..."
+                sleep 60
+              fi
+              
+            else
+              echo "⏳ Tailscale status unclear, checking logs..."
             fi
+            
+            # Show detailed logs for debugging
+            echo "📋 Recent tailscaled logs (last 10 lines):"
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "journalctl -u tailscaled --no-pager -n 10 --since '5 minutes ago' 2>/dev/null || echo 'Could not get logs'" || true
+              
+            # Show retry log if it exists
+            if [ $TAILSCALE_ATTEMPT -gt 3 ]; then
+              echo "📋 Stage2 retry log (if exists):"
+              ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                "tail -20 /tmp/stage2-retry.log 2>/dev/null || echo 'No retry log found'" || true
+            fi
+            
+            if [ $TAILSCALE_ATTEMPT -lt $TAILSCALE_ATTEMPTS ]; then
+              # Progressive wait times - shorter initially, longer later
+              if [ $TAILSCALE_ATTEMPT -le 2 ]; then
+                WAIT_TIME=30
+              elif [ $TAILSCALE_ATTEMPT -le 4 ]; then
+                WAIT_TIME=45  
+              else
+                WAIT_TIME=60
+              fi
+              echo "⏳ Waiting $WAIT_TIME seconds before next attempt..."
+              sleep $WAIT_TIME
+            fi
+            TAILSCALE_ATTEMPT=$((TAILSCALE_ATTEMPT + 1))
           done
           
-          echo "⚠️ Tailscale connection not established after $TAILSCALE_ATTEMPTS attempts"
-          echo "📋 Final Tailscale diagnostics:"
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} '
-            echo "=== Tailscale Status ==="
-            tailscale status 2>&1 || echo "Status command failed"
-            echo ""
-            echo "=== Tailscale Version ==="
-            tailscale version 2>&1 || echo "Version command failed"  
-            echo ""
-            echo "=== Recent Tailscaled Logs (last 10 lines) ==="
-            journalctl -u tailscaled --no-pager -n 10 --since "5 minutes ago" 2>&1 || echo "Log retrieval failed"
-            echo ""
-            echo "=== Environment Variables Check ==="
-            env | grep -E "(TS_|TAILSCALE)" || echo "No Tailscale env vars found"
-          '
-          
-          # Continue without Tailscale IP (don't fail the deployment)
-          echo "tailscale_ip=" >> $GITHUB_OUTPUT
-          echo "⚠️ Continuing deployment without Tailscale IP..."
+          # Final status check and diagnostics
+          if [ "$TAILSCALE_CONNECTED" != "true" ]; then
+            echo "⚠️ Tailscale connection not fully established after $TAILSCALE_ATTEMPTS attempts"
+            echo "📋 Comprehensive Tailscale diagnostics:"
+            
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} '
+              echo "=== System Information ==="
+              uname -a
+              echo ""
+              echo "=== Network Interfaces ==="
+              ip addr show | grep -E "(inet|tailscale)" || true
+              echo ""
+              echo "=== Tailscale Service Status ==="
+              systemctl status tailscaled --no-pager -l || true
+              echo ""
+              echo "=== Tailscale Status ==="
+              tailscale status 2>&1 || echo "Status command failed"
+              echo ""
+              echo "=== Tailscale Version ==="
+              tailscale version 2>&1 || echo "Version command failed"  
+              echo ""
+              echo "=== Tailscale Debug Info ==="
+              tailscale debug --help 2>&1 | head -5 || true
+              tailscale netcheck 2>&1 | head -10 || echo "Netcheck failed"
+              echo ""
+              echo "=== Recent Tailscaled Logs (last 25 lines) ==="
+              journalctl -u tailscaled --no-pager -n 25 --since "10 minutes ago" 2>&1 || echo "Log retrieval failed"
+              echo ""
+              echo "=== Environment Variables Check ==="
+              env | grep -E "(TS_|TAILSCALE)" || echo "No Tailscale env vars found"
+              echo ""
+              echo "=== DNS Resolution Test ==="
+              nslookup api.tailscale.com 2>&1 | head -10 || echo "DNS test failed"
+              echo ""
+              echo "=== Stage2 Script Status ==="
+              if [ -f /tmp/stage2-retry.log ]; then
+                echo "--- Stage2 Retry Log (last 20 lines) ---"
+                tail -20 /tmp/stage2-retry.log
+              else
+                echo "No retry log found"
+              fi
+              echo ""
+              echo "=== Auth Key Validation ==="
+              # Check if auth was attempted
+              if journalctl -u tailscaled --since "10 minutes ago" | grep -q "auth"; then
+                echo "Auth attempts found in logs"
+                journalctl -u tailscaled --since "10 minutes ago" | grep "auth" | tail -5
+              else
+                echo "No auth attempts found in recent logs"
+              fi
+              echo ""
+              echo "=== Network Connectivity Test ==="
+              ping -c 3 8.8.8.8 2>&1 || echo "Basic connectivity test failed"
+            '
+            
+            # Try one final manual connection attempt with more verbose output
+            echo "🔄 Final manual connection attempt..."
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} '
+              echo "🔧 Manual Tailscale connection attempt..."
+              
+              # Try to run the stage2 script one more time with debug output
+              if [ -f /usr/local/bin/stage2-post-reboot.sh ]; then
+                echo "🔍 Re-running stage2 script with debug output..."
+                bash -x /usr/local/bin/stage2-post-reboot.sh > /tmp/final-stage2-debug.log 2>&1 &
+                STAGE2_PID=$!
+                
+                # Wait up to 3 minutes for completion
+                for i in {1..18}; do
+                  if ! kill -0 $STAGE2_PID 2>/dev/null; then
+                    echo "Stage2 script completed"
+                    break
+                  fi
+                  echo "Stage2 script still running... ($i/18)"
+                  sleep 10
+                done
+                
+                # Show results
+                echo "🔍 Final stage2 debug log (last 30 lines):"
+                tail -30 /tmp/final-stage2-debug.log 2>/dev/null || echo "No debug log available"
+                
+                # Check final status
+                echo "🔍 Final Tailscale status after retry:"
+                tailscale status 2>&1 || echo "Status still failed"
+                
+                # Try to get IP one more time
+                FINAL_IP=$(tailscale ip -4 2>/dev/null | head -1 | tr -d "\n\r" || echo "")
+                if [[ "$FINAL_IP" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                  echo "✅ SUCCESS! Final IP retrieved: $FINAL_IP"
+                  echo "$FINAL_IP" > /tmp/tailscale_final_ip
+                else
+                  echo "❌ Still no valid Tailscale IP: $FINAL_IP"
+                fi
+              fi
+            '
+            
+            # Check if the final attempt succeeded
+            FINAL_TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "cat /tmp/tailscale_final_ip 2>/dev/null || echo ''")
+              
+            if [[ "$FINAL_TAILSCALE_IP" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+              echo "🎉 Final attempt successful! Tailscale IP: $FINAL_TAILSCALE_IP"
+              echo "tailscale_ip=$FINAL_TAILSCALE_IP" >> $GITHUB_OUTPUT
+            else
+              # Continue without Tailscale IP (don't fail the deployment)
+              echo "tailscale_ip=" >> $GITHUB_OUTPUT
+              echo "⚠️ Continuing deployment without Tailscale IP..."
+              echo "💡 Recommendation: Check Tailscale OAuth credentials and network connectivity"
+            fi
+          else
+            echo "✅ Tailscale verification completed successfully"
+          fi
 
   # ============================================================================
   # Deploy Service Application  
