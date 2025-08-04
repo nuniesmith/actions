@@ -359,8 +359,8 @@ if [[ "$TAILSCALE_TAILNET" == "TAILSCALE_TAILNET_PLACEHOLDER" || -z "$TAILSCALE_
   fi
 fi
 
-# Create auth key using OAuth API
-echo "🔑 Creating Tailscale auth key..."
+# Create ephemeral auth key using OAuth API
+echo "🔑 Creating ephemeral Tailscale auth key..."
 AUTH_KEY_RESPONSE=$(curl -s -X POST \
   "https://api.tailscale.com/api/v2/tailnet/${TAILSCALE_TAILNET}/keys" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
@@ -370,7 +370,7 @@ AUTH_KEY_RESPONSE=$(curl -s -X POST \
       "devices": {
         "create": {
           "reusable": false,
-          "ephemeral": false,
+          "ephemeral": true,
           "preauthorized": true,
           "tags": ["tag:ci"]
         }
@@ -511,7 +511,8 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
   
   # Update Cloudflare DNS records with Tailscale IP
   if [[ "$TAILSCALE_IP" != "pending" && -n "$TAILSCALE_IP" ]]; then
-    echo "🌐 Updating Cloudflare DNS records with Tailscale IP..."
+    echo "🌐 Updating Cloudflare DNS records with Tailscale IP: $TAILSCALE_IP"
+    echo "ℹ️ This will allow access to services via Tailscale VPN network"
     
     # Use variables already defined at the top of the script
     FULL_DOMAIN_NAME="$DOMAIN_NAME"
@@ -687,6 +688,13 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
             "status.$DOMAIN_NAME"         # status.7gram.xyz
             "vpn.$DOMAIN_NAME"            # vpn.7gram.xyz
             "remote.$DOMAIN_NAME"         # remote.7gram.xyz
+            
+            # Tailscale/VPN internal access records
+            "ts-$SERVICE_NAME.$DOMAIN_NAME"     # ts-nginx.7gram.xyz (Tailscale-specific)
+            "vpn-$SERVICE_NAME.$DOMAIN_NAME"    # vpn-nginx.7gram.xyz (VPN access)
+            "internal-$SERVICE_NAME.$DOMAIN_NAME" # internal-nginx.7gram.xyz (Internal access)
+            "tailnet.$DOMAIN_NAME"        # tailnet.7gram.xyz (Tailscale network entry)
+            "ts.$DOMAIN_NAME"             # ts.7gram.xyz (Short Tailscale access)
             
             # FKS Trading (legacy support)
             "fkstrading.xyz.$DOMAIN_NAME" # fkstrading.xyz.7gram.xyz
