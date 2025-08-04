@@ -1413,12 +1413,6 @@ jobs:
       dns_records_updated: ${{ steps.dns-update.outputs.records_updated }}
       
     steps:
-      - name: 📥 Checkout Actions Repository
-        uses: actions/checkout@v4
-        with:
-          repository: nuniesmith/actions
-          path: actions
-          
       - name: 🌐 Update Cloudflare DNS Records
         id: dns-update
         env:
@@ -1587,13 +1581,7 @@ jobs:
       dns_verification_result: ${{ steps.dns-verification.outcome }}
       
     steps:
-      - name: 📥 Checkout Actions Repository
-        uses: actions/checkout@v4
-        with:
-          repository: nuniesmith/actions
-          path: actions
-          
-      - name: 🔑 Setup SSH Key
+      - name:  Setup SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/linode_deployment_key
