@@ -1280,6 +1280,8 @@ jobs:
                     else
                       echo "✅ No remaining ${{ env.SERVICE_NAME }} devices found"
                     fi
+                  else
+                    echo "⚠️ Could not retrieve devices for cleanup (HTTP: $HTTP_CODE)"
                   fi
                 else
                   echo "⚠️ Could not get OAuth token for post-destruction cleanup"
@@ -1290,17 +1292,6 @@ jobs:
             else
               echo "⚠️ OAuth credentials not available for post-destruction cleanup"
             fi
-          else
-            echo "ℹ️ No existing server found for ${{ env.SERVICE_NAME }}"
-          fi
-                else
-                  echo "✅ No remaining ${{ env.SERVICE_NAME }} devices found"
-                fi
-              fi
-            fi
-          else
-            echo "ℹ️ No existing server found for ${{ env.SERVICE_NAME }}"
-          fi
 
   # ============================================================================
   # Main Destroy Job (for destroy action)
