@@ -114,14 +114,31 @@ on:
         required: false
       CLOUDFLARE_API_TOKEN:
         required: false
+      CLOUDFLARE_ZONE_ID:
+        description: 'Cloudflare zone ID for improved performance'
+        required: false
       ADMIN_EMAIL:
         description: 'Admin email for Let''s Encrypt SSL certificates'
+        required: false
+      SSL_EMAIL:
+        description: 'Alternative SSL email (fallback for ADMIN_EMAIL)'
         required: false
       
       # Container Registry (Optional)
       DOCKER_USERNAME:
         required: false
       DOCKER_TOKEN:
+        required: false
+      
+      # Monitoring & Notifications (Optional)
+      DISCORD_WEBHOOK_URL:
+        description: 'Discord webhook URL for deployment notifications'
+        required: false
+      NETDATA_CLAIM_TOKEN:
+        description: 'Netdata cloud claim token for monitoring'
+        required: false
+      NETDATA_CLAIM_ROOM:
+        description: 'Netdata cloud room ID for monitoring'
         required: false
 
     outputs:
