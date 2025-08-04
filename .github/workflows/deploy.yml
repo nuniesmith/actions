@@ -117,6 +117,9 @@ on:
         required: false
       CLOUDFLARE_API_TOKEN:
         required: false
+      ADMIN_EMAIL:
+        description: 'Admin email for Let''s Encrypt SSL certificates'
+        required: false
       
       # Container Registry (Optional)
       DOCKER_USERNAME:
@@ -289,6 +292,7 @@ jobs:
           TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
         run: |
           chmod +x actions/scripts/preflight/validate-secrets.sh
           actions/scripts/preflight/validate-secrets.sh "${{ env.SERVICE_NAME }}"
@@ -527,6 +531,7 @@ jobs:
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
           SERVICE_ROOT_PASSWORD: ${{ secrets.SERVICE_ROOT_PASSWORD }}
           ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
@@ -537,18 +542,30 @@ jobs:
           curl -o stage1-setup.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage1-complete-setup.sh
           chmod +x stage1-setup.sh
           
-          # Replace placeholders in setup script
-          echo "🔄 Replacing placeholders in stage1 setup script..."
+          # Download and configure stage2 script
+          curl -o stage2-post-reboot.sh https://raw.githubusercontent.com/nuniesmith/actions/main/scripts/stage2-post-reboot.sh
+          chmod +x stage2-post-reboot.sh
+          
+          # Replace placeholders in setup scripts
+          echo "🔄 Replacing placeholders in setup scripts..."
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage1-setup.sh
           sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${ACTIONS_USER_PASSWORD}/g" stage1-setup.sh
           sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${JORDAN_PASSWORD}/g" stage1-setup.sh
           
+          # Replace placeholders in stage2 script
+          sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_EMAIL_PLACEHOLDER/${CLOUDFLARE_EMAIL}/g" stage2-post-reboot.sh
+          sed -i "s/CLOUDFLARE_API_TOKEN_PLACEHOLDER/${CLOUDFLARE_API_TOKEN}/g" stage2-post-reboot.sh
+          sed -i "s/ADMIN_EMAIL_PLACEHOLDER/${ADMIN_EMAIL}/g" stage2-post-reboot.sh
+          
           # Upload and execute stage 1 setup
-          echo "📤 Uploading and executing stage1 setup..."
+          echo "📤 Uploading setup scripts..."
           scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage1-setup.sh root@${{ steps.create-server.outputs.server_ip }}:/tmp/
+          scp -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no stage2-post-reboot.sh root@${{ steps.create-server.outputs.server_ip }}:/usr/local/bin/
           
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} "
             chmod +x /tmp/stage1-setup.sh
+            chmod +x /usr/local/bin/stage2-post-reboot.sh
             /tmp/stage1-setup.sh
           "
 
