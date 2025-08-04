@@ -1588,7 +1588,7 @@ jobs:
       dns_verification_result: ${{ steps.dns-verification.outcome }}
       
     steps:
-      - name:  Setup SSH Key
+      - name: 🔑 Setup SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/linode_deployment_key
