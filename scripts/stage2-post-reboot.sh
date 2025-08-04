@@ -72,12 +72,14 @@ ufw default allow outgoing
 ufw allow ssh
 
 echo "🔧 Initializing iptables chains for Docker..."
+# Create all necessary Docker chains
 iptables -t nat -N DOCKER 2>/dev/null || true
 iptables -t filter -N DOCKER 2>/dev/null || true
 iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
 iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
 iptables -t filter -N DOCKER-USER 2>/dev/null || true
 
+# Set up the chain rules that Docker expects
 iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
   iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
 iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
@@ -88,6 +90,18 @@ iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || \
   iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
 iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
   iptables -t filter -A DOCKER-USER -j RETURN
+
+echo "✅ Docker iptables chains initialized"
+
+iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
+  iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
+  iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
+  iptables -t filter -I FORWARD -j DOCKER-USER
+iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || \
+  iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+echo "✅ Docker iptables chains initialized"
 
 echo "🐳 Starting Docker service..."
 systemctl start docker
@@ -102,29 +116,62 @@ for i in {1..10}; do
   sleep 5
 done
 
+# Wait a bit more for Docker to fully initialize its iptables rules
+echo "⏳ Waiting for Docker iptables initialization..."
+sleep 10
+
 echo "🌐 Creating Docker network for service: $SERVICE_NAME..."
 
 # Clean up any existing networks (but only remove the one we're about to create)
 docker network rm ${SERVICE_NAME}-network 2>/dev/null || true
 
-# Create service-specific network
+# Create service-specific network with retry logic
 case "$SERVICE_NAME" in
   "nginx")
-    docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network
-    echo "✅ nginx-network created with subnet 172.22.0.0/16"
+    echo "🌐 Creating nginx-network..."
+    if docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network; then
+      echo "✅ nginx-network created with subnet 172.22.0.0/16"
+    else
+      echo "⚠️ Network creation failed, trying fallback method..."
+      # Restart Docker and try again
+      systemctl restart docker
+      sleep 15
+      docker network create --driver bridge nginx-network || echo "❌ Network creation failed completely"
+    fi
     ;;
   "fks")
-    docker network create --driver bridge --subnet=172.20.0.0/16 --ip-range=172.20.1.0/24 --gateway=172.20.0.1 fks-network
-    echo "✅ fks-network created with subnet 172.20.0.0/16"
+    echo "🌐 Creating fks-network..."
+    if docker network create --driver bridge --subnet=172.20.0.0/16 --ip-range=172.20.1.0/24 --gateway=172.20.0.1 fks-network; then
+      echo "✅ fks-network created with subnet 172.20.0.0/16"
+    else
+      echo "⚠️ Network creation failed, trying fallback method..."
+      systemctl restart docker
+      sleep 15
+      docker network create --driver bridge fks-network || echo "❌ Network creation failed completely"
+    fi
     ;;
   "ats")
-    docker network create --driver bridge --subnet=172.21.0.0/16 --ip-range=172.21.1.0/24 --gateway=172.21.0.1 ats-network
-    echo "✅ ats-network created with subnet 172.21.0.0/16"
+    echo "🌐 Creating ats-network..."
+    if docker network create --driver bridge --subnet=172.21.0.0/16 --ip-range=172.21.1.0/24 --gateway=172.21.0.1 ats-network; then
+      echo "✅ ats-network created with subnet 172.21.0.0/16"
+    else
+      echo "⚠️ Network creation failed, trying fallback method..."
+      systemctl restart docker
+      sleep 15
+      docker network create --driver bridge ats-network || echo "❌ Network creation failed completely"
+    fi
     ;;
   *)
     # Default: create a generic network for the service
-    docker network create --driver bridge --subnet=172.23.0.0/16 --ip-range=172.23.1.0/24 --gateway=172.23.0.1 ${SERVICE_NAME}-network
-    echo "✅ ${SERVICE_NAME}-network created with subnet 172.23.0.0/16"
+    echo "🌐 Creating ${SERVICE_NAME}-network..."
+    if docker network create --driver bridge --subnet=172.23.0.0/16 --ip-range=172.23.1.0/24 --gateway=172.23.0.1 ${SERVICE_NAME}-network; then
+      echo "✅ ${SERVICE_NAME}-network created with subnet 172.23.0.0/16"
+    else
+      echo "⚠️ Network creation failed, trying fallback method..."
+      systemctl restart docker
+      sleep 15
+      docker network create --driver bridge ${SERVICE_NAME}-network || echo "❌ Network creation failed completely"
+    fi
     ;;
 esac
 
@@ -171,6 +218,14 @@ case "\$SERVICE_NAME" in
 esac
 EOF
 chmod 644 /opt/docker-networks.conf
+
+echo "⏳ Waiting for Docker networking to stabilize..."
+sleep 10
+
+# Verify Docker networks are working before proceeding
+echo "🔍 Verifying Docker network status..."
+docker network ls
+docker info | grep -A 5 "Network:"
 
 echo "🔗 Starting and authenticating Tailscale..."
 systemctl start tailscaled
