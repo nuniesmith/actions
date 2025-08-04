@@ -135,6 +135,9 @@ on:
       tailscale_ip:
         description: 'Tailscale IP address of the server'
         value: ${{ jobs.setup-infrastructure.outputs.tailscale_ip }}
+      dns_verification_result:
+        description: 'Result of DNS verification (success/partial/failed)'
+        value: ${{ jobs.verify-dns-updates.outputs.dns_verification_result }}
 
   workflow_dispatch:
     inputs:
@@ -1382,6 +1385,9 @@ jobs:
       needs.setup-infrastructure.result == 'success' &&
       needs.setup-infrastructure.outputs.tailscale_ip != ''
       
+    outputs:
+      dns_verification_result: ${{ steps.dns-verification.outcome }}
+      
     steps:
       - name: 📥 Checkout Actions Repository
         uses: actions/checkout@v4
@@ -1395,83 +1401,134 @@ jobs:
           echo "${{ needs.setup-infrastructure.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/linode_deployment_key
           chmod 600 ~/.ssh/linode_deployment_key
           
-      - name: 🌐 Verify Cloudflare DNS Updates
+      - name: 🌐 Comprehensive DNS Updates Verification
+        id: dns-verification
         env:
           TAILSCALE_IP: ${{ needs.setup-infrastructure.outputs.tailscale_ip }}
           SERVER_IP: ${{ needs.setup-infrastructure.outputs.server_ip }}
           SERVICE_NAME: ${{ inputs.service_name }}
           DOMAIN_SUFFIX: ${{ inputs.domain_suffix }}
         run: |
-          echo "🌐 Verifying DNS updates for $SERVICE_NAME.$DOMAIN_SUFFIX"
-          echo "========================================================"
-          echo "Expected Tailscale IP: $TAILSCALE_IP"
-          echo "Server Public IP: $SERVER_IP"
+          echo "🌐 DNS Configuration Verification"
+          echo "=================================="
+          echo "Expected Tailscale IP: ${TAILSCALE_IP}"
+          echo "Server Public IP: ${SERVER_IP}"
+          echo "Service: ${SERVICE_NAME}.${DOMAIN_SUFFIX}"
           echo ""
           
-          # Check if DNS records were updated by connecting to the server and examining the stage2 logs
-          echo "🔍 Checking stage2 script execution logs for DNS updates..."
-          
-          # Extract DNS-related logs from the server
-          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP '
-            echo "🔍 Searching for DNS update logs in journalctl..."
-            journalctl --no-pager -u stage2 --since="10 minutes ago" | grep -i "cloudflare\|dns" || echo "No DNS logs in systemd journal"
+          # First check server-side DNS update logs
+          echo "🔍 Checking stage2 script DNS update logs..."
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${SERVER_IP} '
+            echo "� Searching for DNS-related activity in recent logs..."
             
-            echo ""
-            echo "🔍 Checking for DNS-related logs in system logs..."
-            grep -i "cloudflare\|dns.*record\|updating.*dns" /var/log/messages /var/log/syslog 2>/dev/null | tail -10 || echo "No DNS logs in system logs"
-            
-            echo ""
-            echo "🔍 Checking for stage2 script output files..."
-            if [ -f /tmp/final-stage2-debug.log ]; then
-              echo "Found stage2 debug log, checking for DNS operations..."
-              grep -i "cloudflare\|dns.*record\|updating.*dns\|zone.*id" /tmp/final-stage2-debug.log | tail -15 || echo "No DNS operations found in debug log"
-            else
-              echo "No stage2 debug log found"
+            # Check stage2 execution log
+            if [ -f /tmp/stage2-execution.log ]; then
+              echo "🔍 Stage2 execution log (DNS-related entries):"
+              grep -i "cloudflare\|dns\|record.*update\|zone.*id" /tmp/stage2-execution.log | tail -10 || echo "No DNS activity found in stage2 log"
             fi
             
+            # Check system logs
             echo ""
-            echo "🔍 Attempting to verify DNS configuration status from server..."
-            # Check if the script variables were set correctly
+            echo "🔍 System logs (DNS-related entries):"
+            journalctl --no-pager --since="15 minutes ago" | grep -i "cloudflare\|dns.*record" | tail -5 || echo "No DNS activity in system logs"
+            
+            # Check environment configuration
+            echo ""
+            echo "🔍 Cloudflare configuration status:"
             if [ -f /opt/stage2-env.sh ]; then
-              echo "Stage2 environment file found, checking Cloudflare config:"
               source /opt/stage2-env.sh
-              echo "CLOUDFLARE_EMAIL_ENV length: ${#CLOUDFLARE_EMAIL_ENV:-0}"
-              echo "CLOUDFLARE_API_TOKEN_ENV length: ${#CLOUDFLARE_API_TOKEN_ENV:-0}"
+              echo "CLOUDFLARE_EMAIL_ENV configured: $([ -n "$CLOUDFLARE_EMAIL_ENV" ] && echo "YES" || echo "NO")"
+              echo "CLOUDFLARE_API_TOKEN_ENV configured: $([ -n "$CLOUDFLARE_API_TOKEN_ENV" ] && echo "YES" || echo "NO")"
             else
               echo "No stage2 environment file found"
             fi
-          ' || echo "Failed to connect to server for DNS verification"
+          ' || echo "Failed to connect to server for log analysis"
           
           echo ""
-          echo "🔍 External DNS verification..."
+          echo "🔍 Testing DNS record updates..."
           
-          # Test key DNS records to see if they point to Tailscale IP
-          TEST_RECORDS=("$SERVICE_NAME.$DOMAIN_SUFFIX" "$DOMAIN_SUFFIX" "www.$DOMAIN_SUFFIX")
+          # Comprehensive DNS records to test based on service type
+          declare -a test_records=()
           
-          for record in "${TEST_RECORDS[@]}"; do
+          if [[ "${SERVICE_NAME}" == "nginx" ]]; then
+            test_records=(
+              "${SERVICE_NAME}.${DOMAIN_SUFFIX}"
+              "${DOMAIN_SUFFIX}" 
+              "www.${DOMAIN_SUFFIX}"
+              "admin.${DOMAIN_SUFFIX}"
+              "emby.${DOMAIN_SUFFIX}"
+              "jellyfin.${DOMAIN_SUFFIX}"
+              "nc.${DOMAIN_SUFFIX}"
+              "ai.${DOMAIN_SUFFIX}"
+              "pihole.${DOMAIN_SUFFIX}"
+              "portainer.${DOMAIN_SUFFIX}"
+            )
+          else
+            # For other services, test key records
+            test_records=(
+              "${SERVICE_NAME}.${DOMAIN_SUFFIX}"
+              "${DOMAIN_SUFFIX}"
+              "www.${DOMAIN_SUFFIX}"
+              "admin.${DOMAIN_SUFFIX}"
+            )
+          fi
+          
+          updated_count=0
+          total_count=${#test_records[@]}
+          
+          for record in "${test_records[@]}"; do
             echo -n "Testing $record... "
             
-            # Use Google DNS API to check the record
-            CURRENT_IP=$(curl -s "https://dns.google/resolve?name=$record&type=A" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('Answer', [{}])[0].get('data', 'NO_RECORD') if data.get('Answer') else 'NO_RECORD')" 2>/dev/null || echo "DNS_QUERY_FAILED")
+            # Query DNS using Google's DNS API
+            response=$(curl -s "https://dns.google/resolve?name=$record&type=A" || echo '{"Status": 3}')
+            current_ip=$(echo "$response" | python3 -c "import sys, json; data = json.load(sys.stdin) if hasattr(sys.stdin, 'read') else {}; print(data['Answer'][0]['data'] if data.get('Status') == 0 and data.get('Answer') else 'NO_RECORD')" 2>/dev/null || echo "QUERY_FAILED")
             
-            if [[ "$CURRENT_IP" == "$TAILSCALE_IP" ]]; then
-              echo "✅ UPDATED ($CURRENT_IP)"
-            elif [[ "$CURRENT_IP" == "NO_RECORD" ]]; then
+            if [[ "$current_ip" == "$TAILSCALE_IP" ]]; then
+              echo "✅ UPDATED"
+              ((updated_count++))
+            elif [[ "$current_ip" == "NO_RECORD" ]]; then
               echo "❌ NO RECORD"
-            elif [[ "$CURRENT_IP" == "DNS_QUERY_FAILED" ]] || [[ "$CURRENT_IP" == "ERROR" ]]; then
+            elif [[ "$current_ip" == "QUERY_FAILED" ]]; then
               echo "⚠️ QUERY FAILED"
             else
-              echo "❌ NOT UPDATED ($CURRENT_IP)"
+              echo "❌ OLD IP ($current_ip)"
             fi
           done
           
           echo ""
-          echo "📋 DNS Update Summary:"
-          echo "If records are not updated, check:"
-          echo "1. CLOUDFLARE_EMAIL and CLOUDFLARE_API_TOKEN secrets are set"
-          echo "2. API token has DNS:Edit permissions for $DOMAIN_SUFFIX zone"
-          echo "3. Stage2 script logs above for error messages"
-          echo "4. Cloudflare API rate limits or connectivity issues"
+          echo "� DNS Update Summary:"
+          echo "  • Updated Records: $updated_count/$total_count"
+          echo "  • Success Rate: $(( updated_count * 100 / total_count ))%"
+          
+          if [[ $updated_count -eq $total_count ]]; then
+            echo "  🎉 All DNS records successfully updated!"
+            echo "dns_status=success" >> $GITHUB_OUTPUT
+          elif [[ $updated_count -gt 0 ]]; then
+            echo "  ⚠️ Partial update - some records need attention"
+            echo "dns_status=partial" >> $GITHUB_OUTPUT
+          else
+            echo "  ❌ No records updated - check deployment logs"
+            echo "dns_status=failed" >> $GITHUB_OUTPUT
+            echo ""
+            echo "🔧 Troubleshooting Steps:"
+            echo "  1. Verify CLOUDFLARE_EMAIL and CLOUDFLARE_API_TOKEN secrets"
+            echo "  2. Check API token permissions for ${DOMAIN_SUFFIX} zone"
+            echo "  3. Review stage2 script logs for DNS errors"
+            echo "  4. Check Cloudflare rate limits or API issues"
+            echo "  5. Verify DNS zone exists and is managed by the token"
+          fi
+          
+          # Additional service-specific DNS records information
+          if [[ "${SERVICE_NAME}" == "nginx" ]]; then
+            echo ""
+            echo "📋 Nginx-specific DNS records managed:"
+            echo "  • Root & Core: ${DOMAIN_SUFFIX}, www.${DOMAIN_SUFFIX}, admin.${DOMAIN_SUFFIX}"
+            echo "  • Media: emby, jellyfin, plex, music, youtube.${DOMAIN_SUFFIX}"
+            echo "  • Files: nc, calibre, abs, audiobooks, ebooks.${DOMAIN_SUFFIX}"
+            echo "  • AI/Dev: ai, chat, ollama, sd, code, whisper.${DOMAIN_SUFFIX}"
+            echo "  • Infrastructure: pihole, dns, grafana, prometheus.${DOMAIN_SUFFIX}"
+            echo "  • And ~60+ total records for VPN-only access"
+          fi
 
   # ============================================================================
   # Deploy Service Application  
