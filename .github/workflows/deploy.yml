@@ -964,7 +964,8 @@ jobs:
       - name: 🧹 Cleanup Services Before Destruction
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
           echo "🧹 Cleaning up external service registrations..."
@@ -1022,32 +1023,60 @@ jobs:
             fi
             
             # Cleanup Tailscale devices via API (more reliable and comprehensive)
-            if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
-              echo "🔗 Comprehensive Tailscale cleanup for service ${{ env.SERVICE_NAME }}..."
+            if [[ -n "$TS_OAUTH_CLIENT_ID" && -n "$TS_OAUTH_SECRET" ]]; then
+              echo "🔗 Comprehensive Tailscale cleanup for service ${{ env.SERVICE_NAME }} using OAuth..."
               
-              TAILNET="${TAILSCALE_TAILNET}"
-              if [[ -z "$TAILNET" ]]; then
-                echo "⚠️ TAILSCALE_TAILNET not set, using default discovery"
-                # For personal accounts, use the default endpoint without tailnet
-                DEVICES_URL="https://api.tailscale.com/api/v2/devices"
+              # Get OAuth access token
+              echo "🔑 Getting OAuth access token for cleanup..."
+              OAUTH_RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "grant_type=client_credentials" \
+                -d "client_id=$TS_OAUTH_CLIENT_ID" \
+                -d "client_secret=$TS_OAUTH_SECRET" 2>/dev/null || echo "CURL_FAILED")
+              
+              if [[ "$OAUTH_RESPONSE" == "CURL_FAILED" ]]; then
+                echo "❌ OAuth request failed for cleanup"
+                echo "⚠️ Skipping Tailscale cleanup due to OAuth issues"
               else
-                echo "🔍 Using tailnet: $TAILNET"
-                DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
-              fi
-              
-              echo "🌐 Fetching ALL devices for comprehensive cleanup..."
-              DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
-              
-              # Extract HTTP status code
-              HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-              DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
-              
-              echo "🔍 API Response Code: $HTTP_CODE"
-              
-              if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                # Debug: Show all devices before cleanup
-                echo "🔍 All devices in Tailscale network:"
-                echo "$DEVICES_JSON" | jq -r '.devices[]? | "\(.id) - \(.hostname // .name // "unknown") - \(.addresses[0] // "no-ip")"' || true
+                TOKEN=$(echo "$OAUTH_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null || echo "")
+                
+                if [[ -z "$TOKEN" || "$TOKEN" == "null" || "$TOKEN" == "empty" ]]; then
+                  echo "❌ Failed to get valid access token for cleanup"
+                  echo "🔍 OAuth response: $OAUTH_RESPONSE"
+                  echo "⚠️ Skipping Tailscale cleanup due to OAuth token issues"
+                else
+                  echo "✅ Successfully obtained OAuth access token for cleanup"
+                  echo "✅ Successfully obtained OAuth access token for cleanup"
+                  
+                  # Function to clean up Tailscale devices by hostname pattern
+                  cleanup_tailscale_devices() {
+                    local hostname_pattern="$1"
+                    local cleanup_reason="${2:-old server cleanup}"
+                    
+                    echo "� Tailscale cleanup for pattern: $hostname_pattern ($cleanup_reason)"
+                    
+                    # Use OAuth token and correct tailnet reference
+                    TAILNET="${TAILSCALE_TAILNET:-"-"}"
+                    
+                    if [[ "$TAILNET" == "-" ]]; then
+                      DEVICES_URL="https://api.tailscale.com/api/v2/devices"
+                    else
+                      DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
+                    fi
+                    
+                    DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+                      -H "Authorization: Bearer $TOKEN" \
+                      -H "Accept: application/json" \
+                      "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
+                    
+                    # Extract HTTP status code
+                    HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                    DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+                    
+                    echo "🔍 API Response Code: $HTTP_CODE"
+                    
+                    # Validate response before processing
+                    if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
                 
                 # Multiple cleanup patterns to catch all variants for nginx
                 CLEANUP_PATTERNS=(
@@ -1108,7 +1137,7 @@ jobs:
                       # Try both API endpoint formats
                       DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
                       REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                        -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                        -H "Authorization: Bearer $TOKEN" \
                         "$DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
                       
                       REMOVE_CODE=$(echo "$REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
@@ -1126,7 +1155,7 @@ jobs:
                         fi
                         
                         ALT_REMOVE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
-                          -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" \
+                          -H "Authorization: Bearer $TOKEN" \
                           "$ALT_DELETE_URL" 2>/dev/null || echo "CURL_FAILED")
                         
                         ALT_REMOVE_CODE=$(echo "$ALT_REMOVE_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
@@ -1147,9 +1176,9 @@ jobs:
                   echo "ℹ️ No Tailscale devices found matching service name pattern: $SERVICE_PATTERN"
                 fi
               elif [[ "$HTTP_CODE" == "401" ]]; then
-                echo "❌ Tailscale API authentication failed - check TAILSCALE_AUTH_KEY"
+                echo "❌ Tailscale API authentication failed - check OAuth credentials"
               elif [[ "$HTTP_CODE" == "403" ]]; then
-                echo "❌ Tailscale API access forbidden - check API key permissions"
+                echo "❌ Tailscale API access forbidden - check OAuth permissions"
               elif [[ "$HTTP_CODE" == "404" ]]; then
                 echo "❌ Tailscale tailnet not found - check TAILSCALE_TAILNET value"
               else
@@ -1187,28 +1216,74 @@ jobs:
             
             # Post-destruction Tailscale cleanup (in case any devices were missed)
             echo "🧹 Final Tailscale cleanup after server destruction..."
-            if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
-              TAILNET="${TAILSCALE_TAILNET}"
-              if [[ -z "$TAILNET" ]]; then
-                DEVICES_URL="https://api.tailscale.com/api/v2/devices"
-              else
-                DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
-              fi
+            if [[ -n "$TS_OAUTH_CLIENT_ID" && -n "$TS_OAUTH_SECRET" ]]; then
+              # Get OAuth token for post-destruction cleanup
+              echo "🔑 Getting OAuth token for post-destruction cleanup..."
+              CLEANUP_OAUTH_RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "grant_type=client_credentials" \
+                -d "client_id=$TS_OAUTH_CLIENT_ID" \
+                -d "client_secret=$TS_OAUTH_SECRET" 2>/dev/null || echo "CURL_FAILED")
               
-              DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $TAILSCALE_AUTH_KEY" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
-              HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-              DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
-              
-              if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
-                echo "🔍 Searching for remaining ${{ env.SERVICE_NAME }} devices..."
+              if [[ "$CLEANUP_OAUTH_RESPONSE" != "CURL_FAILED" ]]; then
+                CLEANUP_TOKEN=$(echo "$CLEANUP_OAUTH_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null || echo "")
                 
-                # Find any remaining devices with nginx patterns
-                REMAINING_DEVICES=$(echo "$DEVICES_JSON" | jq -r '
-                  .devices[]? | 
-                  select(
-                    (.hostname // .name | test("^${{ env.SERVICE_NAME }}$"; "i")) or
-                    (.hostname // .name | test("^${{ env.SERVICE_NAME }}-"; "i")) or
-                    (.hostname // .name | test("${{ env.SERVICE_NAME }}"; "i"))
+                if [[ -n "$CLEANUP_TOKEN" && "$CLEANUP_TOKEN" != "empty" ]]; then
+                  TAILNET="${TAILSCALE_TAILNET:-"-"}"
+                  if [[ "$TAILNET" == "-" ]]; then
+                    DEVICES_URL="https://api.tailscale.com/api/v2/devices"
+                  else
+                    DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
+                  fi
+                  
+                  DEVICES_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: Bearer $CLEANUP_TOKEN" "$DEVICES_URL" 2>/dev/null || echo "CURL_FAILED")
+                  HTTP_CODE=$(echo "$DEVICES_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                  DEVICES_JSON=$(echo "$DEVICES_RESPONSE" | sed '/HTTP_CODE:/d')
+                  
+                  if [[ "$HTTP_CODE" == "200" ]] && echo "$DEVICES_JSON" | jq -e '.devices' >/dev/null 2>&1; then
+                    echo "🔍 Searching for remaining ${{ env.SERVICE_NAME }} devices..."
+                    
+                    # Find any remaining devices with service patterns
+                    REMAINING_DEVICES=$(echo "$DEVICES_JSON" | jq -r --arg service "${{ env.SERVICE_NAME }}" '
+                      .devices[]? | 
+                      select(
+                        (.hostname // .name | test("^" + $service + "$"; "i")) or
+                        (.hostname // .name | test("^" + $service + "-"; "i")) or
+                        (.hostname // .name | test($service; "i"))
+                      ) | 
+                      .id // empty' | grep -v '^$' || true)
+                    
+                    if [[ -n "$REMAINING_DEVICES" ]]; then
+                      echo "🗑️ Found remaining devices to clean up:"
+                      for device_id in $REMAINING_DEVICES; do
+                        if [[ -n "$device_id" ]]; then
+                          DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown")"')
+                          echo "  Removing: $device_id ($DEVICE_INFO)"
+                          
+                          if [[ "$TAILNET" == "-" ]]; then
+                            DELETE_URL="https://api.tailscale.com/api/v2/device/$device_id"
+                          else
+                            DELETE_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices/$device_id"
+                          fi
+                          
+                          curl -s -X DELETE -H "Authorization: Bearer $CLEANUP_TOKEN" "$DELETE_URL" >/dev/null 2>&1 || true
+                          sleep 1
+                        fi
+                      done
+                      echo "✅ Final cleanup completed"
+                    else
+                      echo "✅ No remaining ${{ env.SERVICE_NAME }} devices found"
+                    fi
+                  fi
+                else
+                  echo "⚠️ Could not get OAuth token for post-destruction cleanup"
+                fi
+              else
+                echo "⚠️ OAuth request failed for post-destruction cleanup"
+              fi
+            else
+              echo "⚠️ OAuth credentials not available for post-destruction cleanup"
+            fi
                   ) | 
                   .id // empty' | grep -v '^$' || true)
                 
@@ -1258,7 +1333,8 @@ jobs:
       - name: 🗑️ Execute Destruction
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
           echo "🗑️ Destroying ${{ env.SERVICE_NAME }}..."
@@ -1324,15 +1400,26 @@ jobs:
                 echo "✅ Server destroyed"
                 
                 # Cleanup Tailscale devices via API after server destruction (comprehensive)
-                if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
-                  echo "🔗 Final comprehensive Tailscale cleanup for service ${{ env.SERVICE_NAME }}..."
+                if [[ -n "$TS_OAUTH_CLIENT_ID" && -n "$TS_OAUTH_SECRET" ]]; then
+                  echo "🔗 Final comprehensive Tailscale cleanup for service ${{ env.SERVICE_NAME }} using OAuth..."
                   
-                  TAILNET="${TAILSCALE_TAILNET}"
-                  if [[ -z "$TAILNET" ]]; then
-                    echo "⚠️ TAILSCALE_TAILNET not set, using default discovery"
-                    DEVICES_URL="https://api.tailscale.com/api/v2/devices"
-                  else
-                    echo "🔍 Using tailnet: $TAILNET"
+                  # Get OAuth token for destruction cleanup
+                  DESTROY_OAUTH_RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
+                    -H "Content-Type: application/x-www-form-urlencoded" \
+                    -d "grant_type=client_credentials" \
+                    -d "client_id=$TS_OAUTH_CLIENT_ID" \
+                    -d "client_secret=$TS_OAUTH_SECRET" 2>/dev/null || echo "CURL_FAILED")
+                  
+                  if [[ "$DESTROY_OAUTH_RESPONSE" != "CURL_FAILED" ]]; then
+                    DESTROY_TOKEN=$(echo "$DESTROY_OAUTH_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null || echo "")
+                    
+                    if [[ -n "$DESTROY_TOKEN" && "$DESTROY_TOKEN" != "empty" ]]; then
+                      TAILNET="${TAILSCALE_TAILNET:-"-"}"
+                      if [[ "$TAILNET" == "-" ]]; then
+                        echo "⚠️ Using default tailnet"
+                        DEVICES_URL="https://api.tailscale.com/api/v2/devices"
+                      else
+                        echo "🔍 Using tailnet: $TAILNET"
                     DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices"
                   fi
                   
@@ -1825,46 +1912,139 @@ jobs:
             sleep 3
           done
           
-          # Get OAuth token
+          # Get OAuth token with better error handling
           echo "🔑 Getting OAuth access token..."
-          OAUTH_TOKEN=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
+          OAUTH_RESPONSE=$(curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \
+            -H "Content-Type: application/x-www-form-urlencoded" \
             -d "grant_type=client_credentials" \
             -d "client_id=$TS_OAUTH_CLIENT_ID" \
-            -d "client_secret=$TS_OAUTH_SECRET" | jq -r .access_token 2>/dev/null || echo "")
+            -d "client_secret=$TS_OAUTH_SECRET" 2>/dev/null || echo "CURL_FAILED")
           
-          if [[ -z "$OAUTH_TOKEN" || "$OAUTH_TOKEN" == "null" ]]; then
-            echo "❌ Failed to get OAuth access token"
+          if [[ "$OAUTH_RESPONSE" == "CURL_FAILED" ]]; then
+            echo "❌ OAuth request failed completely"
             exit 1
           fi
           
-          # Create ephemeral auth key
+          OAUTH_TOKEN=$(echo "$OAUTH_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null || echo "")
+          
+          if [[ -z "$OAUTH_TOKEN" || "$OAUTH_TOKEN" == "null" || "$OAUTH_TOKEN" == "empty" ]]; then
+            echo "❌ Failed to get OAuth access token"
+            echo "🔍 OAuth response: $OAUTH_RESPONSE"
+            
+            # Check for error details
+            ERROR_MSG=$(echo "$OAUTH_RESPONSE" | jq -r '.error_description // .error // empty' 2>/dev/null || echo "")
+            if [[ -n "$ERROR_MSG" ]]; then
+              echo "🔍 OAuth error: $ERROR_MSG"
+            fi
+            exit 1
+          fi
+          
+          echo "✅ OAuth token obtained successfully"
+          
+          # Create ephemeral auth key with improved error handling
           echo "🔑 Creating ephemeral auth key..."
           TAILNET="${TAILSCALE_TAILNET:-"-"}"
           
-          AUTH_KEY_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/$TAILNET/keys" \
+          # Use correct tailnet reference for API
+          if [[ "$TAILNET" == "-" ]]; then
+            API_TAILNET="-"
+          else
+            API_TAILNET="$TAILNET"
+          fi
+          
+          AUTH_KEY_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/$API_TAILNET/keys" \
             -H "Authorization: Bearer $OAUTH_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:ci"]}}},"expirySeconds":3600}')
+            -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:ci"]}}},"expirySeconds":3600}' 2>/dev/null || echo "CURL_FAILED")
+          
+          if [[ "$AUTH_KEY_RESPONSE" == "CURL_FAILED" ]]; then
+            echo "❌ Auth key creation request failed"
+            exit 1
+          fi
           
           AUTH_KEY=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.key // empty' 2>/dev/null || echo "")
           
           if [[ -z "$AUTH_KEY" || "$AUTH_KEY" == "empty" ]]; then
             echo "❌ Failed to create ephemeral auth key"
+            echo "🔍 Auth key response: $AUTH_KEY_RESPONSE"
+            
+            # Check for error details
+            KEY_ERROR=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.message // .error // empty' 2>/dev/null || echo "")
+            if [[ -n "$KEY_ERROR" ]]; then
+              echo "🔍 Auth key error: $KEY_ERROR"
+            fi
             exit 1
           fi
           
-          # Connect to Tailscale
+          echo "✅ Ephemeral auth key created successfully"
+          
+          # Connect to Tailscale with better error handling and retries
           echo "🔗 Connecting to Tailscale..."
-          if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes; then
-            echo "✅ Tailscale connected successfully"
+          
+          # Wait for tailscaled to be fully ready
+          echo "⏳ Ensuring tailscaled is fully ready..."
+          for i in {1..20}; do
+            if systemctl is-active tailscaled >/dev/null 2>&1 && timeout 5 tailscale status >/dev/null 2>&1; then
+              echo "✅ Tailscaled daemon is fully ready"
+              break
+            fi
+            if [[ $i -eq 20 ]]; then
+              echo "❌ Tailscaled failed to become ready"
+              systemctl status tailscaled --no-pager || true
+              exit 1
+            fi
+            echo "Attempt $i/20: Waiting for tailscaled to be ready..."
+            sleep 3
+          done
+          
+          # Attempt Tailscale connection with retries
+          CONNECTION_SUCCESS=false
+          for attempt in {1..3}; do
+            echo "🔗 Tailscale connection attempt $attempt/3..."
             
-            # Get IP
-            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
-            echo "$TAILSCALE_IP" > /tmp/tailscale_ip
-            echo "✅ Tailscale IP: $TAILSCALE_IP"
-          else
-            echo "❌ Tailscale connection failed"
+            if timeout 300 tailscale up --authkey="$AUTH_KEY" --hostname="$SERVICE_NAME" --accept-routes --reset; then
+              echo "✅ Tailscale connected successfully on attempt $attempt"
+              CONNECTION_SUCCESS=true
+              break
+            else
+              echo "❌ Tailscale connection attempt $attempt failed"
+              
+              if [[ $attempt -lt 3 ]]; then
+                echo "🔄 Retrying in 10 seconds..."
+                sleep 10
+                
+                # Logout and reset for clean retry
+                tailscale logout 2>/dev/null || true
+                sleep 5
+              fi
+            fi
+          done
+          
+          if [[ "$CONNECTION_SUCCESS" != "true" ]]; then
+            echo "❌ All Tailscale connection attempts failed"
+            echo "🔍 Tailscale status:"
+            tailscale status || true
+            echo "🔍 Tailscale daemon logs:"
+            journalctl -u tailscaled --no-pager -l --since='5 minutes ago' || true
             exit 1
+          fi
+          
+          # Verify connection and get IP
+          echo "🔍 Verifying Tailscale connection..."
+          for i in {1..10}; do
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+            if [[ "$TAILSCALE_IP" != "pending" && -n "$TAILSCALE_IP" ]]; then
+              echo "✅ Tailscale IP obtained: $TAILSCALE_IP"
+              echo "$TAILSCALE_IP" > /tmp/tailscale_ip
+              break
+            fi
+            echo "Attempt $i/10: Waiting for Tailscale IP..."
+            sleep 3
+          done
+          
+          if [[ "$TAILSCALE_IP" == "pending" || -z "$TAILSCALE_IP" ]]; then
+            echo "⚠️ Could not get Tailscale IP, but connection may still work"
+            echo "pending" > /tmp/tailscale_ip
           fi
           
           # Complete firewall setup
@@ -1988,14 +2168,23 @@ jobs:
             echo '📋 Checking systemd service files:'
             ls -la /etc/systemd/system/stage2-setup.service || echo 'Service file not found'
             echo ''
+            echo '📋 Service file contents:'
+            cat /etc/systemd/system/stage2-setup.service 2>/dev/null || echo 'Could not read service file'
+            echo ''
+            echo '📋 Stage2 script exists:'
+            ls -la /usr/local/bin/stage2-post-reboot.sh || echo 'Stage2 script not found'
+            echo ''
             echo '📋 Service enabled status:'
-            systemctl is-enabled stage2-setup.service || echo 'Service not enabled'
+            systemctl is-enabled stage2-setup.service 2>/dev/null || echo 'Service not enabled'
             echo ''
             echo '📋 Service status details:'
-            systemctl status stage2-setup.service --no-pager || echo 'Service status unavailable'
+            systemctl status stage2-setup.service --no-pager 2>/dev/null || echo 'Service status unavailable'
             echo ''
             echo '📋 Recent systemd logs:'
-            journalctl -u stage2-setup.service --no-pager -l --since='10 minutes ago' || echo 'No logs available'
+            journalctl -u stage2-setup.service --no-pager -l --since='10 minutes ago' 2>/dev/null || echo 'No logs available'
+            echo ''
+            echo '📋 OAuth credential check in stage2 script:'
+            grep -E '(TS_OAUTH|PLACEHOLDER)' /usr/local/bin/stage2-post-reboot.sh | head -5 || echo 'No OAuth lines found'
           " || true
           
           # Quick check if Tailscale is already working
@@ -2084,8 +2273,56 @@ jobs:
             fi
           else
             echo "⚠️ Tailscale not connected - attempting manual stage2 trigger..."
+            
+            # First, check if the script has OAuth credentials
+            echo "🔍 Checking OAuth credentials in stage2 script..."
             ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
-              "timeout 60 /usr/local/bin/stage2-post-reboot.sh || echo 'Manual stage2 execution completed with timeout/error'" || true
+              "if grep -q 'TS_OAUTH_CLIENT_ID_PLACEHOLDER' /usr/local/bin/stage2-post-reboot.sh; then
+                 echo '❌ OAuth placeholders still exist in stage2 script'
+                 echo '🔍 First few OAuth lines:'
+                 grep -n 'TS_OAUTH' /usr/local/bin/stage2-post-reboot.sh | head -3
+                 exit 1
+               else
+                 echo '✅ OAuth placeholders appear to be replaced'
+               fi" || {
+                echo "❌ OAuth placeholder replacement failed - stage2 script is invalid"
+                echo "This suggests the workflow placeholder replacement didn't work correctly"
+                exit 1
+              }
+            
+            # Manual execution with enhanced logging
+            echo "🚀 Executing stage2 script manually with enhanced logging..."
+            ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+              "echo '🔍 Starting manual stage2 execution...'
+               echo '📋 Current environment:'
+               echo 'PATH='\$PATH
+               echo 'SHELL='\$SHELL
+               echo ''
+               echo '🚀 Executing stage2 script:'
+               cd /
+               timeout 300 bash -x /usr/local/bin/stage2-post-reboot.sh 2>&1 | tee /tmp/stage2_manual_output.log
+               STAGE2_EXIT=\${PIPESTATUS[0]}
+               echo ''
+               echo '📊 Stage2 manual execution completed with exit code: '\$STAGE2_EXIT
+               echo '🔍 Last 10 lines of output:'
+               tail -10 /tmp/stage2_manual_output.log
+               exit \$STAGE2_EXIT" || {
+                echo "❌ Manual stage2 execution failed"
+                echo "🔍 Getting detailed error information..."
+                ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
+                  "echo '📋 Stage2 manual output (last 50 lines):'
+                   tail -50 /tmp/stage2_manual_output.log 2>/dev/null || echo 'No output log found'
+                   echo ''
+                   echo '📋 Systemd service logs:'
+                   journalctl -u stage2-setup.service --no-pager -l --since='10 minutes ago'
+                   echo ''
+                   echo '📋 Tailscaled status:'
+                   systemctl status tailscaled --no-pager
+                   echo ''
+                   echo '📋 Current Tailscale status:'
+                   timeout 10 tailscale status || echo 'Tailscale status check failed'" || true
+                echo "⚠️ Manual stage2 trigger failed, but continuing with deployment"
+              }
             
             # Recheck after manual trigger
             TAILSCALE_STATUS=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
