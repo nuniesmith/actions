@@ -1,7 +1,4 @@
-name: 🚀 Unified Service Management (Refactored)
-
-# This is the refactored version of the deploy workflow that uses external shell scripts
-# to reduce the size and complexity of the GitHub Actions workflow file
+name: 🚀 Unified Service Management
 
 on:
   workflow_call:
