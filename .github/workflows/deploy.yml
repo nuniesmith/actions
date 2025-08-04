@@ -1215,6 +1215,10 @@ jobs:
             sleep 30
             
             echo "✅ Server destroyed successfully"
+          else
+            echo "ℹ️ No existing ${{ env.SERVICE_NAME }} server found to destroy"
+            echo "✅ Proceeding with fresh deployment"
+          fi
             
             # Post-destruction Tailscale cleanup (in case any devices were missed)
             echo "🧹 Final Tailscale cleanup after server destruction..."
@@ -1286,19 +1290,9 @@ jobs:
             else
               echo "⚠️ OAuth credentials not available for post-destruction cleanup"
             fi
-                  ) | 
-                  .id // empty' | grep -v '^$' || true)
-                
-                if [[ -n "$REMAINING_DEVICES" ]]; then
-                  echo "🗑️ Found remaining devices to clean up:"
-                  for device_id in $REMAINING_DEVICES; do
-                    DEVICE_INFO=$(echo "$DEVICES_JSON" | jq -r --arg id "$device_id" '.devices[]? | select(.id == $id) | "\(.hostname // .name // "unknown")"')
-                    echo "   Removing: $device_id ($DEVICE_INFO)"
-                    
-                    curl -s -X DELETE -H "Authorization: Bearer $CLEANUP_TOKEN" \
-                      "https://api.tailscale.com/api/v2/device/$device_id" >/dev/null 2>&1 || true
-                  done
-                  echo "✅ Final cleanup completed"
+          else
+            echo "ℹ️ No existing server found for ${{ env.SERVICE_NAME }}"
+          fi
                 else
                   echo "✅ No remaining ${{ env.SERVICE_NAME }} devices found"
                 fi
