@@ -1370,13 +1370,105 @@ jobs:
           fi
 
   # ============================================================================
+  # Verify DNS Updates
+  # ============================================================================
+  verify-dns-updates:
+    name: 🌐 Verify DNS Configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [setup-infrastructure]
+    if: |
+      always() &&
+      needs.setup-infrastructure.result == 'success' &&
+      needs.setup-infrastructure.outputs.tailscale_ip != ''
+      
+    steps:
+      - name: 🌐 Verify Cloudflare DNS Updates
+        env:
+          TAILSCALE_IP: ${{ needs.setup-infrastructure.outputs.tailscale_ip }}
+          SERVER_IP: ${{ needs.setup-infrastructure.outputs.server_ip }}
+          SERVICE_NAME: ${{ inputs.service_name }}
+          DOMAIN_SUFFIX: ${{ inputs.domain_suffix }}
+        run: |
+          echo "🌐 Verifying DNS updates for $SERVICE_NAME.$DOMAIN_SUFFIX"
+          echo "========================================================"
+          echo "Expected Tailscale IP: $TAILSCALE_IP"
+          echo "Server Public IP: $SERVER_IP"
+          echo ""
+          
+          # Check if DNS records were updated by connecting to the server and examining the stage2 logs
+          echo "🔍 Checking stage2 script execution logs for DNS updates..."
+          
+          # Extract DNS-related logs from the server
+          ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP '
+            echo "🔍 Searching for DNS update logs in journalctl..."
+            journalctl --no-pager -u stage2 --since="10 minutes ago" | grep -i "cloudflare\|dns" || echo "No DNS logs in systemd journal"
+            
+            echo ""
+            echo "🔍 Checking for DNS-related logs in system logs..."
+            grep -i "cloudflare\|dns.*record\|updating.*dns" /var/log/messages /var/log/syslog 2>/dev/null | tail -10 || echo "No DNS logs in system logs"
+            
+            echo ""
+            echo "🔍 Checking for stage2 script output files..."
+            if [ -f /tmp/final-stage2-debug.log ]; then
+              echo "Found stage2 debug log, checking for DNS operations..."
+              grep -i "cloudflare\|dns.*record\|updating.*dns\|zone.*id" /tmp/final-stage2-debug.log | tail -15 || echo "No DNS operations found in debug log"
+            else
+              echo "No stage2 debug log found"
+            fi
+            
+            echo ""
+            echo "🔍 Attempting to verify DNS configuration status from server..."
+            # Check if the script variables were set correctly
+            if [ -f /opt/stage2-env.sh ]; then
+              echo "Stage2 environment file found, checking Cloudflare config:"
+              source /opt/stage2-env.sh
+              echo "CLOUDFLARE_EMAIL_ENV length: ${#CLOUDFLARE_EMAIL_ENV:-0}"
+              echo "CLOUDFLARE_API_TOKEN_ENV length: ${#CLOUDFLARE_API_TOKEN_ENV:-0}"
+            else
+              echo "No stage2 environment file found"
+            fi
+          ' || echo "Failed to connect to server for DNS verification"
+          
+          echo ""
+          echo "🔍 External DNS verification..."
+          
+          # Test key DNS records to see if they point to Tailscale IP
+          TEST_RECORDS=("$SERVICE_NAME.$DOMAIN_SUFFIX" "$DOMAIN_SUFFIX" "www.$DOMAIN_SUFFIX")
+          
+          for record in "${TEST_RECORDS[@]}"; do
+            echo -n "Testing $record... "
+            
+            # Use Google DNS API to check the record
+            CURRENT_IP=$(curl -s "https://dns.google/resolve?name=$record&type=A" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('Answer', [{}])[0].get('data', 'NO_RECORD') if data.get('Answer') else 'NO_RECORD')" 2>/dev/null || echo "DNS_QUERY_FAILED")
+            
+            if [[ "$CURRENT_IP" == "$TAILSCALE_IP" ]]; then
+              echo "✅ UPDATED ($CURRENT_IP)"
+            elif [[ "$CURRENT_IP" == "NO_RECORD" ]]; then
+              echo "❌ NO RECORD"
+            elif [[ "$CURRENT_IP" == "DNS_QUERY_FAILED" ]] || [[ "$CURRENT_IP" == "ERROR" ]]; then
+              echo "⚠️ QUERY FAILED"
+            else
+              echo "❌ NOT UPDATED ($CURRENT_IP)"
+            fi
+          done
+          
+          echo ""
+          echo "📋 DNS Update Summary:"
+          echo "If records are not updated, check:"
+          echo "1. CLOUDFLARE_EMAIL and CLOUDFLARE_API_TOKEN secrets are set"
+          echo "2. API token has DNS:Edit permissions for $DOMAIN_SUFFIX zone"
+          echo "3. Stage2 script logs above for error messages"
+          echo "4. Cloudflare API rate limits or connectivity issues"
+
+  # ============================================================================
   # Deploy Service Application  
   # ============================================================================
   deploy-service:
     name: 🚀 Deploy Service
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [preflight-checks, setup-infrastructure]
+    needs: [preflight-checks, setup-infrastructure, verify-dns-updates]
     if: |
       always() && 
       needs.preflight-checks.outputs.should_deploy == 'true' &&
