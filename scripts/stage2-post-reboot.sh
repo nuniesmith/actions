@@ -55,6 +55,21 @@ if [[ -n "${GITHUB_ACTIONS_DOMAIN_NAME:-}" ]]; then
   DOMAIN_NAME="$GITHUB_ACTIONS_DOMAIN_NAME"
 fi
 
+if [[ -n "${GITHUB_ACTIONS_CLOUDFLARE_EMAIL:-}" ]]; then
+  echo "✅ Found CLOUDFLARE_EMAIL in GitHub Actions environment"
+  CLOUDFLARE_EMAIL="$GITHUB_ACTIONS_CLOUDFLARE_EMAIL"
+fi
+
+if [[ -n "${GITHUB_ACTIONS_CLOUDFLARE_API_TOKEN:-}" ]]; then
+  echo "✅ Found CLOUDFLARE_API_TOKEN in GitHub Actions environment"
+  CLOUDFLARE_API_TOKEN="$GITHUB_ACTIONS_CLOUDFLARE_API_TOKEN"
+fi
+
+if [[ -n "${GITHUB_ACTIONS_ADMIN_EMAIL:-}" ]]; then
+  echo "✅ Found ADMIN_EMAIL in GitHub Actions environment"
+  ADMIN_EMAIL="$GITHUB_ACTIONS_ADMIN_EMAIL"
+fi
+
 # Validate that placeholders were replaced, or try environment variables as fallback
 if [[ "$TS_OAUTH_CLIENT_ID" == "TS_OAUTH_CLIENT_ID_PLACEHOLDER" || "$TS_OAUTH_CLIENT_ID" == "***" ]]; then
   echo "⚠️ TS_OAUTH_CLIENT_ID placeholder was not replaced by workflow or is masked"
@@ -91,7 +106,44 @@ if [[ "$SERVICE_NAME" == "SERVICE_NAME_PLACEHOLDER" || "$SERVICE_NAME" == "***" 
   fi
 fi
 
+# Handle optional Cloudflare credentials (don't exit on failure, just warn)
+if [[ "$CLOUDFLARE_EMAIL" == "CLOUDFLARE_EMAIL_PLACEHOLDER" || "$CLOUDFLARE_EMAIL" == "***" ]]; then
+  echo "⚠️ CLOUDFLARE_EMAIL placeholder was not replaced by workflow or is masked"
+  if [[ -n "${CLOUDFLARE_EMAIL_ENV:-}" ]]; then
+    echo "🔄 Using CLOUDFLARE_EMAIL from environment variable"
+    CLOUDFLARE_EMAIL="$CLOUDFLARE_EMAIL_ENV"
+  else
+    echo "ℹ️ No CLOUDFLARE_EMAIL found in environment - DNS updates will be skipped"
+    CLOUDFLARE_EMAIL=""
+  fi
+fi
+
+if [[ "$CLOUDFLARE_API_TOKEN" == "CLOUDFLARE_API_TOKEN_PLACEHOLDER" || "$CLOUDFLARE_API_TOKEN" == "***" ]]; then
+  echo "⚠️ CLOUDFLARE_API_TOKEN placeholder was not replaced by workflow or is masked"
+  if [[ -n "${CLOUDFLARE_API_TOKEN_ENV:-}" ]]; then
+    echo "🔄 Using CLOUDFLARE_API_TOKEN from environment variable"
+    CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN_ENV"
+  else
+    echo "ℹ️ No CLOUDFLARE_API_TOKEN found in environment - DNS updates will be skipped"
+    CLOUDFLARE_API_TOKEN=""
+  fi
+fi
+
+if [[ "$ADMIN_EMAIL" == "ADMIN_EMAIL_PLACEHOLDER" || "$ADMIN_EMAIL" == "***" ]]; then
+  echo "⚠️ ADMIN_EMAIL placeholder was not replaced by workflow or is masked"
+  if [[ -n "${ADMIN_EMAIL_ENV:-}" ]]; then
+    echo "🔄 Using ADMIN_EMAIL from environment variable"
+    ADMIN_EMAIL="$ADMIN_EMAIL_ENV"
+  else
+    echo "ℹ️ No ADMIN_EMAIL found in environment - using default"
+    ADMIN_EMAIL="admin@example.com"
+  fi
+fi
+
 echo "✅ Configuration loaded: SERVICE_NAME=$SERVICE_NAME"
+echo "🔍 Cloudflare configuration status:"
+echo "  • CLOUDFLARE_EMAIL: $(if [[ -n "$CLOUDFLARE_EMAIL" ]]; then echo "configured (${#CLOUDFLARE_EMAIL} chars)"; else echo "not configured"; fi)"
+echo "  • CLOUDFLARE_API_TOKEN: $(if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then echo "configured (${#CLOUDFLARE_API_TOKEN} chars)"; else echo "not configured"; fi)"
 
 echo "📦 Installing firewall packages after reboot..."
 # First, remove old iptables if it exists to avoid conflicts

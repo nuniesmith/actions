@@ -1159,9 +1159,9 @@ jobs:
             echo "📋 Tailscale status output:"
             echo "$TAILSCALE_STATUS"
             
-            # Check if status shows we're logged in
-            if echo "$TAILSCALE_STATUS" | grep -q "Logged in"; then
-              echo "✅ Tailscale shows logged in status"
+            # Check if status shows we're connected (multiple possible indicators)
+            if echo "$TAILSCALE_STATUS" | grep -E "(Logged in|100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}.*nginx)" > /dev/null; then
+              echo "✅ Tailscale shows connected status"
               
               # Now try to get IP address
               TAILSCALE_IP=$(ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ steps.create-server.outputs.server_ip }} \
@@ -1182,7 +1182,16 @@ jobs:
                 TAILSCALE_CONNECTED=true
                 break
               else
-                echo "⏳ Valid IP not yet available (got: '$TAILSCALE_IP'), waiting for IP assignment..."
+                echo "⏳ Valid IP not yet available (got: '$TAILSCALE_IP'), checking if we can extract from status..."
+                # Try to extract IP from status output if direct IP command failed
+                STATUS_IP=$(echo "$TAILSCALE_STATUS" | grep -oE "100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}" | head -1 || echo "")
+                if [[ -n "$STATUS_IP" && "$STATUS_IP" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                  echo "✅ Extracted Tailscale IP from status: $STATUS_IP"
+                  echo "tailscale_ip=$STATUS_IP" >> $GITHUB_OUTPUT
+                  TAILSCALE_CONNECTED=true
+                  break
+                fi
+                echo "⏳ IP assignment still pending, will retry..."
               fi
               
             elif echo "$TAILSCALE_STATUS" | grep -q "Logged out"; then
