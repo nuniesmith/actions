@@ -61,6 +61,76 @@ on:
         required: false
         type: string
         default: '7gram.xyz'
+    
+    secrets:
+      LINODE_CLI_TOKEN:
+        description: 'Linode API token for server management'
+        required: true
+      SERVICE_ROOT_PASSWORD:
+        description: 'Root password for service server'
+        required: true
+      JORDAN_PASSWORD:
+        description: 'Password for jordan user account'
+        required: false
+      ACTIONS_USER_PASSWORD:
+        description: 'Password for actions user account'
+        required: false
+      TAILSCALE_OAUTH_CLIENT_ID:
+        description: 'Tailscale OAuth client ID (Alternative naming)'
+        required: false
+      TAILSCALE_OAUTH_SECRET:
+        description: 'Tailscale OAuth client secret (Alternative naming)'
+        required: false
+      TS_OAUTH_CLIENT_ID:
+        description: 'Tailscale OAuth client ID'
+        required: false
+      TS_OAUTH_SECRET:
+        description: 'Tailscale OAuth client secret'
+        required: false
+      TAILSCALE_TAILNET:
+        description: 'Tailscale tailnet name'
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        description: 'Cloudflare API token for DNS management'
+        required: true
+      CLOUDFLARE_ZONE_ID:
+        description: 'Cloudflare zone ID for optimized API performance'
+        required: false
+      CLOUDFLARE_EMAIL:
+        description: 'Cloudflare email (alternative to API token only)'
+        required: false
+      ADMIN_EMAIL:
+        description: 'Administrator email for SSL certificates'
+        required: false
+      DOCKER_USERNAME:
+        description: 'Docker Hub username'
+        required: false
+      DOCKER_TOKEN:
+        description: 'Docker Hub access token'
+        required: false
+    
+    outputs:
+      server_id:
+        description: 'Created Linode server ID'
+        value: ${{ jobs.setup-infrastructure.outputs.server_id }}
+      server_ip:
+        description: 'Public IP address of the server'
+        value: ${{ jobs.setup-infrastructure.outputs.server_ip }}
+      tailscale_ip:
+        description: 'Tailscale VPN IP address'
+        value: ${{ jobs.setup-infrastructure.outputs.tailscale_ip }}
+      deployment_status:
+        description: 'Overall deployment status'
+        value: ${{ jobs.setup-infrastructure.outputs.deployment_status }}
+      dns_update_result:
+        description: 'DNS update operation result'
+        value: ${{ jobs.update-dns-records.outputs.dns_update_result }}
+      dns_records_updated:
+        description: 'Number of DNS records updated'
+        value: ${{ jobs.update-dns-records.outputs.records_updated }}
+      dns_verification_result:
+        description: 'DNS verification result'
+        value: ${{ jobs.verify-dns-updates.outputs.dns_verification_result }}
 
 env:
   SERVICE_NAME: ${{ inputs.service_name }}
@@ -298,8 +368,8 @@ jobs:
         id: tailscale-setup
         if: steps.linode-deploy.outputs.deployment_status == 'created'
         env:
-          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID || secrets.TS_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET || secrets.TS_OAUTH_SECRET }}
         run: |
           echo "🔗 Setting up Tailscale VPN connection..."
           echo "========================================"
