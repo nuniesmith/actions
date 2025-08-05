@@ -170,8 +170,35 @@ jobs:
           SSH_PUBLIC_KEY=$(cat ~/.ssh/deployment_key.pub)
           SSH_PRIVATE_KEY=$(base64 -w 0 ~/.ssh/deployment_key)
           
-          # Create new server
+          # Check for existing server and handle overwrite
           SERVER_LABEL="${{ env.SERVICE_NAME }}"
+          EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep -E "^[0-9]+\s+$SERVER_LABEL\s+" || true)
+          
+          if [[ -n "$EXISTING_SERVER" ]]; then
+            EXISTING_SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
+            echo "🔍 Found existing server: $SERVER_LABEL (ID: $EXISTING_SERVER_ID)"
+            
+            if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
+              echo "💥 Overwrite enabled - destroying existing server..."
+              linode-cli linodes delete "$EXISTING_SERVER_ID" --text
+              
+              # Wait for server to be deleted
+              echo "⏳ Waiting for server deletion..."
+              for i in {1..20}; do
+                if ! linode-cli linodes view "$EXISTING_SERVER_ID" --text --no-headers 2>/dev/null; then
+                  echo "✅ Server deleted successfully"
+                  break
+                fi
+                sleep 10
+              done
+            else
+              # Create unique label with timestamp
+              TIMESTAMP=$(date +%s)
+              SERVER_LABEL="${{ env.SERVICE_NAME }}-${TIMESTAMP}"
+              echo "⚠️ Server exists but overwrite disabled - using unique label: $SERVER_LABEL"
+            fi
+          fi
+          
           echo "🆕 Creating new server: $SERVER_LABEL"
           
           RESULT=$(linode-cli linodes create \
@@ -186,6 +213,7 @@ jobs:
           
           if [[ -z "$RESULT" ]] || [[ "$RESULT" == *"error"* ]]; then
             echo "❌ Server creation failed!"
+            echo "Error details: $RESULT"
             exit 1
           fi
           
@@ -504,17 +532,25 @@ jobs:
           
           echo "💥 Destroying service infrastructure for ${{ env.SERVICE_NAME }}..."
           
-          # Find and destroy server
+          # Find and destroy server(s)
           SERVER_LABEL="${{ env.SERVICE_NAME }}"
-          SERVER_INFO=$(linode-cli linodes list --text --no-headers | grep "$SERVER_LABEL" || true)
+          
+          # Look for exact match first, then pattern match for timestamped versions
+          SERVER_INFO=$(linode-cli linodes list --text --no-headers | grep -E "^[0-9]+\s+$SERVER_LABEL(\s|-[0-9]+\s)" || true)
           
           if [[ -n "$SERVER_INFO" ]]; then
-            SERVER_ID=$(echo "$SERVER_INFO" | cut -f1)
-            echo "🗑️ Destroying server ID: $SERVER_ID"
-            linode-cli linodes delete "$SERVER_ID" || echo "⚠️ Server may already be deleted"
+            # Handle multiple servers if found
+            echo "$SERVER_INFO" | while read -r server_line; do
+              if [[ -n "$server_line" ]]; then
+                SERVER_ID=$(echo "$server_line" | cut -f1)
+                SERVER_NAME=$(echo "$server_line" | cut -f2)
+                echo "🗑️ Destroying server: $SERVER_NAME (ID: $SERVER_ID)"
+                linode-cli linodes delete "$SERVER_ID" || echo "⚠️ Server $SERVER_ID may already be deleted"
+              fi
+            done
             echo "✅ Server destruction initiated"
           else
-            echo "ℹ️ No server found with label: $SERVER_LABEL"
+            echo "ℹ️ No server found with label pattern: $SERVER_LABEL"
           fi
           
           # Clean up DNS records (set to localhost to disable)
