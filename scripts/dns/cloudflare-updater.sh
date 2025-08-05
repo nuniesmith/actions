@@ -175,6 +175,65 @@ get_service_subdomains() {
         "nginx")
             echo "nginx.$domain"
             echo "proxy.$domain"
+            # Media Services
+            echo "jellyfin.$domain"
+            echo "plex.$domain"
+            echo "emby.$domain"
+            echo "music.$domain"
+            # Download/Management
+            echo "sonarr.$domain"
+            echo "radarr.$domain"
+            echo "lidarr.$domain"
+            echo "qbt.$domain"
+            echo "jackett.$domain"
+            # System Monitoring
+            echo "grafana.$domain"
+            echo "prometheus.$domain"
+            echo "portainer.$domain"
+            echo "uptime.$domain"
+            echo "status.$domain"
+            echo "monitor.$domain"
+            # Development/Tools
+            echo "code.$domain"
+            echo "wiki.$domain"
+            echo "nc.$domain"
+            # AI/ML Services
+            echo "ollama.$domain"
+            echo "sd.$domain"
+            echo "comfy.$domain"
+            echo "whisper.$domain"
+            echo "ai.$domain"
+            # Home Services
+            echo "home.$domain"
+            echo "grocy.$domain"
+            echo "mealie.$domain"
+            # Infrastructure
+            echo "pihole.$domain"
+            echo "dns.$domain"
+            echo "vpn.$domain"
+            echo "remote.$domain"
+            # Sync Services
+            echo "sync-desktop.$domain"
+            echo "sync-freddy.$domain"
+            echo "sync-oryx.$domain"
+            echo "sync-sullivan.$domain"
+            # Books/Media
+            echo "calibre.$domain"
+            echo "calibreweb.$domain"
+            echo "ebooks.$domain"
+            echo "audiobooks.$domain"
+            # Backup/Utilities
+            echo "duplicati.$domain"
+            echo "watchtower.$domain"
+            echo "filebot.$domain"
+            # Communication
+            echo "chat.$domain"
+            echo "mail.$domain"
+            echo "smtp.$domain"
+            echo "imap.$domain"
+            # Additional Services
+            echo "youtube.$domain"
+            echo "abs.$domain"
             ;;
         "ats")
             echo "ats.$domain"
