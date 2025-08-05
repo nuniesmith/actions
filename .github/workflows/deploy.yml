@@ -41,14 +41,22 @@ on:
         required: true
       SERVICE_ROOT_PASSWORD:
         required: true
+      ACTIONS_USER_PASSWORD:
+        required: true
+      JORDAN_PASSWORD:
+        required: true
       TS_OAUTH_CLIENT_ID:
-        required: false
+        required: true
       TS_OAUTH_SECRET:
-        required: false
+        required: true
+      TAILSCALE_TAILNET:
+        required: true
       CLOUDFLARE_API_TOKEN:
         required: true
       CLOUDFLARE_ZONE_ID:
-        required: false
+        required: true
+      ADMIN_EMAIL:
+        required: true
     
     outputs:
       server_id:
@@ -59,6 +67,10 @@ on:
         value: ${{ jobs.infrastructure.outputs.tailscale_ip }}
       deployment_status:
         value: ${{ jobs.service-deploy.outputs.status }}
+      restart_status:
+        value: ${{ jobs.service-restart.outputs.status }}
+      destruction_status:
+        value: ${{ jobs.service-destroy.outputs.status }}
 
 env:
   SERVICE_NAME: ${{ inputs.service_name }}
@@ -98,8 +110,11 @@ jobs:
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
           TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
         run: |
           chmod +x ./scripts/stage0-preflight.sh
           ./scripts/stage0-preflight.sh \
@@ -263,6 +278,7 @@ jobs:
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
         run: |
           echo "🏗️ Running Stage 2 post-reboot setup..."
@@ -392,17 +408,139 @@ jobs:
           echo "status=success" >> $GITHUB_OUTPUT
 
   # ============================================================================
+  # Service Restart
+  # ============================================================================  
+  service-restart:
+    name: 🔄 Service Restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [stage0-preflight, infrastructure]
+    if: |
+      inputs.action_type == 'restart' &&
+      needs.infrastructure.result == 'success'
+    
+    outputs:
+      status: ${{ steps.restart.outputs.status }}
+    
+    steps:
+      - name: 📁 Checkout Actions
+        uses: actions/checkout@v4
+        with:
+          repository: nuniesmith/actions
+          token: ${{ github.token }}
+      
+      - name: 🔄 Restart Service
+        id: restart
+        env:
+          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
+          SSH_PRIVATE_KEY: ${{ needs.infrastructure.outputs.ssh_key }}
+        run: |
+          # Setup SSH key
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/deployment_key
+          chmod 600 ~/.ssh/deployment_key
+          
+          echo "🔄 Restarting ${{ env.SERVICE_NAME }} service..."
+          
+          # Restart service on server
+          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
+            cd /home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }}
+            
+            # Try to restart using docker-compose
+            if [[ -f 'docker-compose.yml' ]]; then
+              docker-compose restart
+            # Try to restart using systemd service
+            elif systemctl list-units --type=service | grep -q '${{ env.SERVICE_NAME }}'; then
+              systemctl restart ${{ env.SERVICE_NAME }}
+            # Try to restart using start.sh
+            elif [[ -f 'start.sh' ]]; then
+              # Stop any running processes
+              pkill -f '${{ env.SERVICE_NAME }}' || true
+              sleep 5
+              # Start again
+              su - ${{ env.SERVICE_NAME }}_user -c 'cd /home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }} && ./start.sh'
+            else
+              echo '❌ No restart method found'
+              exit 1
+            fi
+            
+            echo '✅ Service restart completed'
+          "
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # Service Destruction
+  # ============================================================================  
+  service-destroy:
+    name: 💥 Service Destroy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [stage0-preflight]
+    if: |
+      needs.stage0-preflight.outputs.should_destroy == 'true' &&
+      inputs.action_type == 'destroy'
+    
+    outputs:
+      status: ${{ steps.destroy.outputs.status }}
+    
+    steps:
+      - name: 📁 Checkout Actions
+        uses: actions/checkout@v4
+        with:
+          repository: nuniesmith/actions
+          token: ${{ github.token }}
+      
+      - name: 💥 Destroy Service Infrastructure
+        id: destroy
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+        run: |
+          # Install Linode CLI
+          pip install linode-cli
+          export LINODE_CLI_TOKEN="${{ secrets.LINODE_CLI_TOKEN }}"
+          
+          echo "💥 Destroying service infrastructure for ${{ env.SERVICE_NAME }}..."
+          
+          # Find and destroy server
+          SERVER_LABEL="${{ env.SERVICE_NAME }}"
+          SERVER_INFO=$(linode-cli linodes list --text --no-headers | grep "$SERVER_LABEL" || true)
+          
+          if [[ -n "$SERVER_INFO" ]]; then
+            SERVER_ID=$(echo "$SERVER_INFO" | cut -f1)
+            echo "🗑️ Destroying server ID: $SERVER_ID"
+            linode-cli linodes delete "$SERVER_ID" || echo "⚠️ Server may already be deleted"
+            echo "✅ Server destruction initiated"
+          else
+            echo "ℹ️ No server found with label: $SERVER_LABEL"
+          fi
+          
+          # Clean up DNS records (set to localhost to disable)
+          echo "🌐 Cleaning up DNS records..."
+          chmod +x ./scripts/dns/cloudflare-updater.sh
+          ./scripts/dns/cloudflare-updater.sh update-service \
+            --service "${{ env.SERVICE_NAME }}" \
+            --ip "127.0.0.1" \
+            --domain "${{ inputs.domain_suffix }}" \
+            --token "$CLOUDFLARE_API_TOKEN" \
+            --zone-id "$CLOUDFLARE_ZONE_ID" || echo "⚠️ DNS cleanup may have failed"
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+
+  # ============================================================================
   # Health Checks
   # ============================================================================
   health-check:
     name: 🏥 Health Check
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [infrastructure, service-deploy]
+    needs: [infrastructure]
     if: |
       always() &&
-      (inputs.action_type == 'health-check' ||
-       (inputs.action_type == 'deploy' && needs.service-deploy.result == 'success'))
+      needs.infrastructure.result == 'success' &&
+      inputs.action_type == 'health-check'
     
     steps:
       - name: 📁 Checkout Actions
@@ -415,6 +553,39 @@ jobs:
         env:
           SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
           TAILSCALE_IP: ${{ needs.infrastructure.outputs.tailscale_ip }}
+          SSH_PRIVATE_KEY: ${{ needs.infrastructure.outputs.ssh_key }}
+        run: |
+          if [[ -n "$SERVER_IP" ]]; then
+            chmod +x ./scripts/health/service-health-check.sh
+            ./scripts/health/service-health-check.sh \
+              "${{ env.SERVICE_NAME }}" \
+              "$SERVER_IP" \
+              "$TAILSCALE_IP"
+          fi
+
+  # Post-deployment health check for successful deployments
+  post-deploy-health:
+    name: 🏥 Post-Deploy Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [infrastructure, service-deploy]
+    if: |
+      always() &&
+      inputs.action_type == 'deploy' &&
+      needs.service-deploy.result == 'success'
+    
+    steps:
+      - name: 📁 Checkout Actions
+        uses: actions/checkout@v4
+        with:
+          repository: nuniesmith/actions
+          token: ${{ github.token }}
+      
+      - name: 🏥 Run Post-Deploy Health Checks
+        env:
+          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
+          TAILSCALE_IP: ${{ needs.infrastructure.outputs.tailscale_ip }}
+          SSH_PRIVATE_KEY: ${{ needs.infrastructure.outputs.ssh_key }}
         run: |
           if [[ -n "$SERVER_IP" ]]; then
             chmod +x ./scripts/health/service-health-check.sh
@@ -430,7 +601,7 @@ jobs:
   summary:
     name: 📋 Summary
     runs-on: ubuntu-latest
-    needs: [stage0-preflight, infrastructure, service-deploy, health-check]
+    needs: [stage0-preflight, infrastructure, service-deploy, service-restart, service-destroy, health-check, post-deploy-health]
     if: always()
     
     steps:
@@ -447,7 +618,10 @@ jobs:
           echo "✅ Preflight: ${{ needs.stage0-preflight.result }}"
           echo "🏗️ Infrastructure: ${{ needs.infrastructure.result }}"
           echo "🚀 Service Deploy: ${{ needs.service-deploy.result }}"
+          echo "� Service Restart: ${{ needs.service-restart.result }}"
+          echo "�💥 Service Destroy: ${{ needs.service-destroy.result }}"
           echo "🏥 Health Check: ${{ needs.health-check.result }}"
+          echo "🏥 Post-Deploy Health: ${{ needs.post-deploy-health.result }}"
           
           if [[ "${{ needs.infrastructure.outputs.server_ip }}" ]]; then
             echo ""
@@ -461,6 +635,14 @@ jobs:
             echo ""
             echo "🎉 Overall Status: SUCCESS"
             echo "✅ ${{ env.SERVICE_NAME }} deployment completed!"
+          elif [[ "${{ needs.service-restart.result }}" == "success" ]]; then
+            echo ""
+            echo "🎉 Overall Status: SUCCESS"
+            echo "🔄 ${{ env.SERVICE_NAME }} restart completed!"
+          elif [[ "${{ needs.service-destroy.result }}" == "success" ]]; then
+            echo ""
+            echo "🎉 Overall Status: SUCCESS"
+            echo "💥 ${{ env.SERVICE_NAME }} destruction completed!"
           else
             echo ""
             echo "❌ Overall Status: FAILED"
