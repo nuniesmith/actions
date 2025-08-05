@@ -111,7 +111,6 @@ jobs:
           TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
-          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
@@ -306,7 +305,6 @@ jobs:
           TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
-          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
@@ -317,7 +315,7 @@ jobs:
           cp ./scripts/stage2-post-reboot.sh /tmp/stage2-setup.sh
           
           # Replace placeholders with environment variables (including service name and domain)
-          envsubst '${SERVICE_NAME} ${FULL_DOMAIN} ${TS_OAUTH_CLIENT_ID} ${TS_OAUTH_SECRET} ${TAILSCALE_TAILNET} ${CLOUDFLARE_EMAIL} ${CLOUDFLARE_API_TOKEN} ${CLOUDFLARE_ZONE_ID} ${ADMIN_EMAIL}' < /tmp/stage2-setup.sh > /tmp/stage2-final.sh
+          envsubst '${SERVICE_NAME} ${FULL_DOMAIN} ${TS_OAUTH_CLIENT_ID} ${TS_OAUTH_SECRET} ${TAILSCALE_TAILNET} ${CLOUDFLARE_API_TOKEN} ${CLOUDFLARE_ZONE_ID} ${ADMIN_EMAIL}' < /tmp/stage2-setup.sh > /tmp/stage2-final.sh
           
           # Fallback: Replace any remaining placeholders with sed (in case envsubst misses them)
           sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" /tmp/stage2-final.sh
@@ -331,8 +329,23 @@ jobs:
           scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no \
             /tmp/stage2-final.sh root@$SERVER_IP:/tmp/stage2-post-reboot.sh
           
+          # Create environment file on remote server for the script to source
+          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
+            mkdir -p /opt
+            echo \"export SERVICE_NAME='${{ env.SERVICE_NAME }}'\" > /opt/stage2-env.sh
+            echo \"export FULL_DOMAIN='${{ env.FULL_DOMAIN }}'\" >> /opt/stage2-env.sh
+            echo \"export TS_OAUTH_CLIENT_ID='${{ secrets.TS_OAUTH_CLIENT_ID }}'\" >> /opt/stage2-env.sh
+            echo \"export TS_OAUTH_SECRET='${{ secrets.TS_OAUTH_SECRET }}'\" >> /opt/stage2-env.sh
+            echo \"export TAILSCALE_TAILNET='${{ secrets.TAILSCALE_TAILNET }}'\" >> /opt/stage2-env.sh
+            echo \"export CLOUDFLARE_API_TOKEN='${{ secrets.CLOUDFLARE_API_TOKEN }}'\" >> /opt/stage2-env.sh
+            echo \"export CLOUDFLARE_ZONE_ID='${{ secrets.CLOUDFLARE_ZONE_ID }}'\" >> /opt/stage2-env.sh
+            echo \"export ADMIN_EMAIL='${{ secrets.ADMIN_EMAIL }}'\" >> /opt/stage2-env.sh
+            chmod +x /opt/stage2-env.sh
+          "
+          
+          # Execute the script with environment loaded
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
-            "export SERVICE_NAME='${{ env.SERVICE_NAME }}' && export FULL_DOMAIN='${{ env.FULL_DOMAIN }}' && chmod +x /tmp/stage2-post-reboot.sh && /tmp/stage2-post-reboot.sh"
+            "chmod +x /tmp/stage2-post-reboot.sh && source /opt/stage2-env.sh && /tmp/stage2-post-reboot.sh"
           
           # Get Tailscale IP
           TAILSCALE_IP=$(ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
