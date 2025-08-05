@@ -285,7 +285,7 @@ jobs:
           pip install linode-cli
           
           # Server configuration
-          SERVER_LABEL="${{ env.SERVICE_NAME }}-server-${{ github.run_id }}"
+          SERVER_LABEL="${{ env.SERVICE_NAME }}"
           ROOT_PASSWORD=$(openssl rand -base64 32)
           
           echo "📋 Server Configuration:"
@@ -298,8 +298,8 @@ jobs:
           if [[ "${{ inputs.overwrite_server }}" == "true" || "${{ env.ACTION_TYPE }}" == "destroy" ]]; then
             echo "🗑️ Checking for existing servers to remove..."
             
-            # Find existing servers with similar labels
-            EXISTING_SERVERS=$(linode-cli linodes list --text --no-headers --format="id,label" | grep "${{ env.SERVICE_NAME }}-server" | cut -f1 || true)
+            # Find existing servers with exact service name
+            EXISTING_SERVERS=$(linode-cli linodes list --text --no-headers --format="id,label" | awk '$2 == "${{ env.SERVICE_NAME }}" {print $1}' || true)
             
             if [[ -n "$EXISTING_SERVERS" ]]; then
               echo "🗑️ Found existing servers, removing..."
