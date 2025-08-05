@@ -543,6 +543,9 @@ jobs:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
           # Install Linode CLI
           pip install linode-cli
@@ -569,6 +572,16 @@ jobs:
             echo "✅ Server destruction initiated"
           else
             echo "ℹ️ No server found with label pattern: $SERVER_LABEL"
+          fi
+          
+          # Clean up Tailscale devices
+          echo "🔗 Cleaning up Tailscale devices..."
+          if [[ -n "${TS_OAUTH_CLIENT_ID:-}" && -n "${TS_OAUTH_SECRET:-}" ]]; then
+            chmod +x ./scripts/cleanup/cleanup-resources.sh
+            export TS_OAUTH_CLIENT_ID TS_OAUTH_SECRET TAILSCALE_TAILNET
+            ./scripts/cleanup/cleanup-resources.sh "${{ env.SERVICE_NAME }}" || echo "⚠️ Tailscale cleanup may have failed"
+          else
+            echo "⚠️ Tailscale OAuth credentials not available - skipping Tailscale cleanup"
           fi
           
           # Clean up DNS records (set to localhost to disable)
