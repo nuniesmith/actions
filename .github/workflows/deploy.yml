@@ -392,19 +392,35 @@ jobs:
             echo "OAuth Secret configured: $([ -n "${{ env.TAILSCALE_OAUTH_SECRET }}" ] && echo "YES" || echo "NO")"
             
             # Use OAuth credentials to create auth key
-            # Note: For OAuth, we need to create an auth key first
+            # Try different permission levels until one works
+            echo "🔑 Attempting to create auth key with OAuth..."
+            
+            # Try with full device creation capabilities first
             AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
               -u "${{ env.TAILSCALE_OAUTH_CLIENT_ID }}:${{ env.TAILSCALE_OAUTH_SECRET }}" \
               -H "Content-Type: application/json" \
               -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true}}},\"expirySeconds\":3600}")
             
-            echo "API Response: $AUTH_RESPONSE"
+            echo "OAuth API Response: $AUTH_RESPONSE"
+            
+            # Check if we got a permission error and try with simpler permissions
+            if echo "$AUTH_RESPONSE" | grep -q "not have enough permissions"; then
+              echo "⚠️ OAuth client lacks device creation permissions. Trying basic auth key..."
+              
+              # Try with minimal capabilities - just basic key creation
+              AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+                -u "${{ env.TAILSCALE_OAUTH_CLIENT_ID }}:${{ env.TAILSCALE_OAUTH_SECRET }}" \
+                -H "Content-Type: application/json" \
+                -d "{\"expirySeconds\":3600}")
+              
+              echo "Simplified API Response: $AUTH_RESPONSE"
+            fi
             
             # Extract auth key from response
             AUTH_KEY=$(echo "$AUTH_RESPONSE" | jq -r ".key // empty" 2>/dev/null || echo "")
             
-            if [[ -n "$AUTH_KEY" ]]; then
-              echo "✅ Got Tailscale auth key"
+            if [[ -n "$AUTH_KEY" && "$AUTH_KEY" != "null" ]]; then
+              echo "✅ Successfully created Tailscale auth key via OAuth"
               
               # Connect to Tailscale with descriptive hostname
               tailscale up --auth-key="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes
@@ -420,12 +436,20 @@ jobs:
                 echo "  • Tailscale IP: $TAILSCALE_IP"
                 echo "$TAILSCALE_IP" > /tmp/tailscale_ip
               else
-                echo "❌ Failed to get Tailscale IP"
+                echo "❌ Failed to get Tailscale IP after connection"
                 exit 1
               fi
             else
-              echo "❌ Failed to get Tailscale auth key"
-              echo "Response: $AUTH_RESPONSE"
+              echo "❌ Failed to create Tailscale auth key via OAuth"
+              echo "API Response: $AUTH_RESPONSE"
+              echo ""
+              echo "🔧 Troubleshooting Steps:"
+              echo "1. Check that TS_OAUTH_CLIENT_ID and TS_OAUTH_SECRET are correctly set"
+              echo "2. Verify OAuth client has 'devices:write' permission in Tailscale admin console"
+              echo "3. Ensure OAuth client is not expired or disabled"
+              echo "4. OAuth client should have scopes: devices:write, all:read"
+              echo ""
+              echo "🌐 Tailscale Admin Console: https://login.tailscale.com/admin/settings/oauth"
               exit 1
             fi
           ' || { echo "❌ Tailscale setup failed"; exit 1; }
