@@ -57,7 +57,11 @@ on:
         required: true
       ADMIN_EMAIL:
         required: true
-    
+      SERVICE_NAME:
+        required: true
+      FULL_DOMAIN:
+        required: true
+
     outputs:
       server_id:
         value: ${{ jobs.infrastructure.outputs.server_id }}
@@ -332,11 +336,13 @@ jobs:
           # Create environment file on remote server for the script to source
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
             mkdir -p /opt
-            echo \"export SERVICE_NAME='${{ env.SERVICE_NAME }}'\" > /opt/stage2-env.sh
-            echo \"export FULL_DOMAIN='${{ env.FULL_DOMAIN }}'\" >> /opt/stage2-env.sh
-            echo \"export TS_OAUTH_CLIENT_ID='${{ secrets.TS_OAUTH_CLIENT_ID }}'\" >> /opt/stage2-env.sh
-            echo \"export TS_OAUTH_SECRET='${{ secrets.TS_OAUTH_SECRET }}'\" >> /opt/stage2-env.sh
-            echo \"export TAILSCALE_TAILNET='${{ secrets.TAILSCALE_TAILNET }}'\" >> /opt/stage2-env.sh
+            echo \"export SERVICE_NAME_ENV='${{ env.SERVICE_NAME }}'\" > /opt/stage2-env.sh
+            echo \"export TS_OAUTH_CLIENT_ID_ENV='${{ secrets.TS_OAUTH_CLIENT_ID }}'\" >> /opt/stage2-env.sh
+            echo \"export TS_OAUTH_SECRET_ENV='${{ secrets.TS_OAUTH_SECRET }}'\" >> /opt/stage2-env.sh
+            echo \"export TAILSCALE_TAILNET_ENV='${{ secrets.TAILSCALE_TAILNET }}'\" >> /opt/stage2-env.sh
+            echo \"export CLOUDFLARE_API_TOKEN_ENV='${{ secrets.CLOUDFLARE_API_TOKEN }}'\" >> /opt/stage2-env.sh
+            echo \"export CLOUDFLARE_ZONE_ID_ENV='${{ secrets.CLOUDFLARE_ZONE_ID }}'\" >> /opt/stage2-env.sh
+            echo \"export ADMIN_EMAIL_ENV='${{ secrets.ADMIN_EMAIL }}'\" >> /opt/stage2-env.sh
             echo \"export CLOUDFLARE_API_TOKEN='${{ secrets.CLOUDFLARE_API_TOKEN }}'\" >> /opt/stage2-env.sh
             echo \"export CLOUDFLARE_ZONE_ID='${{ secrets.CLOUDFLARE_ZONE_ID }}'\" >> /opt/stage2-env.sh
             echo \"export ADMIN_EMAIL='${{ secrets.ADMIN_EMAIL }}'\" >> /opt/stage2-env.sh
