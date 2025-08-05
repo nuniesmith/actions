@@ -376,83 +376,75 @@ jobs:
           
           SERVER_IP="${{ steps.linode-deploy.outputs.server_ip }}"
           
+          # Create auth key using GitHub Actions environment (not inside SSH)
+          echo "🔑 Creating Tailscale auth key using OAuth..."
+          
+          # Try with full device creation capabilities first
+          AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+            -u "${TAILSCALE_OAUTH_CLIENT_ID}:${TAILSCALE_OAUTH_SECRET}" \
+            -H "Content-Type: application/json" \
+            -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true}}},\"expirySeconds\":3600}")
+          
+          echo "OAuth API Response: $AUTH_RESPONSE"
+          
+          # Check if we got a permission error and try with simpler permissions
+          if echo "$AUTH_RESPONSE" | grep -q "not have enough permissions"; then
+            echo "⚠️ OAuth client lacks device creation permissions. Trying basic auth key..."
+            
+            # Try with minimal capabilities - just basic key creation
+            AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+              -u "${TAILSCALE_OAUTH_CLIENT_ID}:${TAILSCALE_OAUTH_SECRET}" \
+              -H "Content-Type: application/json" \
+              -d "{\"expirySeconds\":3600}")
+            
+            echo "Simplified API Response: $AUTH_RESPONSE"
+          fi
+          
+          # Extract auth key from response
+          AUTH_KEY=$(echo "$AUTH_RESPONSE" | jq -r ".key // empty" 2>/dev/null || echo "")
+          
+          if [[ -z "$AUTH_KEY" || "$AUTH_KEY" == "null" ]]; then
+            echo "❌ Failed to create Tailscale auth key via OAuth"
+            echo "API Response: $AUTH_RESPONSE"
+            echo ""
+            echo "🔧 Troubleshooting Steps:"
+            echo "1. Check that TS_OAUTH_CLIENT_ID and TS_OAUTH_SECRET are correctly set"
+            echo "2. Verify OAuth client has 'devices:write' permission in Tailscale admin console"
+            echo "3. Ensure OAuth client is not expired or disabled"
+            echo "4. OAuth client should have scopes: devices:write, all:read"
+            echo ""
+            echo "🌐 Tailscale Admin Console: https://login.tailscale.com/admin/settings/oauth"
+            exit 1
+          fi
+          
+          echo "✅ Successfully created Tailscale auth key via OAuth"
+          
           # Install and configure Tailscale on the server
-          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@${SERVER_IP} '
-            echo "📦 Installing Tailscale..."
+          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@${SERVER_IP} "
+            echo '📦 Installing Tailscale...'
             
             # Install Tailscale
             curl -fsSL https://tailscale.com/install.sh | sh
             
-            # Install jq for JSON parsing
-            apt-get update -qq && apt-get install -y jq
+            # Connect to Tailscale with the auth key
+            echo '🔗 Connecting to Tailscale...'
+            tailscale up --auth-key='${AUTH_KEY}' --hostname='${{ env.SERVICE_NAME }}' --accept-routes
             
-            # Get OAuth token for device registration
-            echo "🔑 Authenticating with Tailscale..."
-            echo "OAuth Client ID: ${{ env.TAILSCALE_OAUTH_CLIENT_ID }}"
-            echo "OAuth Secret configured: $([ -n "${{ env.TAILSCALE_OAUTH_SECRET }}" ] && echo "YES" || echo "NO")"
+            # Wait for connection
+            sleep 10
             
-            # Use OAuth credentials to create auth key
-            # Try different permission levels until one works
-            echo "🔑 Attempting to create auth key with OAuth..."
+            # Get Tailscale IP
+            TAILSCALE_IP=\$(tailscale ip -4 2>/dev/null || echo '')
             
-            # Try with full device creation capabilities first
-            AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
-              -u "${{ env.TAILSCALE_OAUTH_CLIENT_ID }}:${{ env.TAILSCALE_OAUTH_SECRET }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true}}},\"expirySeconds\":3600}")
-            
-            echo "OAuth API Response: $AUTH_RESPONSE"
-            
-            # Check if we got a permission error and try with simpler permissions
-            if echo "$AUTH_RESPONSE" | grep -q "not have enough permissions"; then
-              echo "⚠️ OAuth client lacks device creation permissions. Trying basic auth key..."
-              
-              # Try with minimal capabilities - just basic key creation
-              AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
-                -u "${{ env.TAILSCALE_OAUTH_CLIENT_ID }}:${{ env.TAILSCALE_OAUTH_SECRET }}" \
-                -H "Content-Type: application/json" \
-                -d "{\"expirySeconds\":3600}")
-              
-              echo "Simplified API Response: $AUTH_RESPONSE"
-            fi
-            
-            # Extract auth key from response
-            AUTH_KEY=$(echo "$AUTH_RESPONSE" | jq -r ".key // empty" 2>/dev/null || echo "")
-            
-            if [[ -n "$AUTH_KEY" && "$AUTH_KEY" != "null" ]]; then
-              echo "✅ Successfully created Tailscale auth key via OAuth"
-              
-              # Connect to Tailscale with descriptive hostname
-              tailscale up --auth-key="$AUTH_KEY" --hostname="${{ env.SERVICE_NAME }}" --accept-routes
-              
-              # Wait for connection
-              sleep 10
-              
-              # Get Tailscale IP
-              TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "")
-              
-              if [[ -n "$TAILSCALE_IP" ]]; then
-                echo "✅ Tailscale connected successfully"
-                echo "  • Tailscale IP: $TAILSCALE_IP"
-                echo "$TAILSCALE_IP" > /tmp/tailscale_ip
-              else
-                echo "❌ Failed to get Tailscale IP after connection"
-                exit 1
-              fi
+            if [[ -n \"\$TAILSCALE_IP\" ]]; then
+              echo '✅ Tailscale connected successfully'
+              echo '  • Tailscale IP: '\$TAILSCALE_IP
+              echo \$TAILSCALE_IP > /tmp/tailscale_ip
             else
-              echo "❌ Failed to create Tailscale auth key via OAuth"
-              echo "API Response: $AUTH_RESPONSE"
-              echo ""
-              echo "🔧 Troubleshooting Steps:"
-              echo "1. Check that TS_OAUTH_CLIENT_ID and TS_OAUTH_SECRET are correctly set"
-              echo "2. Verify OAuth client has 'devices:write' permission in Tailscale admin console"
-              echo "3. Ensure OAuth client is not expired or disabled"
-              echo "4. OAuth client should have scopes: devices:write, all:read"
-              echo ""
-              echo "🌐 Tailscale Admin Console: https://login.tailscale.com/admin/settings/oauth"
+              echo '❌ Failed to get Tailscale IP after connection'
               exit 1
             fi
-          ' || { echo "❌ Tailscale setup failed"; exit 1; }
+          " || { echo "❌ Tailscale setup failed"; exit 1; }
           
           # Retrieve Tailscale IP from server
           TAILSCALE_IP=$(ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@${SERVER_IP} "cat /tmp/tailscale_ip 2>/dev/null || echo ''")
