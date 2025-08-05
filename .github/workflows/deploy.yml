@@ -262,7 +262,14 @@ jobs:
       deployment_status: ${{ steps.linode-deploy.outputs.deployment_status }}
     
     steps:
-      - name: 🔑 Configure SSH Key
+      - name: � Checkout Actions Repository
+        uses: actions/checkout@v4
+        with:
+          repository: nuniesmith/actions
+          token: ${{ github.token }}
+          path: actions-repo
+      
+      - name: �🔑 Configure SSH Key
         id: ssh-setup
         run: |
           echo "🔑 Setting up SSH deployment key..."
@@ -410,8 +417,20 @@ jobs:
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@${SERVER_IP} "
             echo '📦 Installing Tailscale...'
             
-            # Install Tailscale
-            curl -fsSL https://tailscale.com/install.sh | sh
+            # Install Tailscale (avoiding pacman mirror issues)
+            echo '📦 Installing Tailscale via direct binary...'
+            
+            # Download and install Tailscale binary directly
+            curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.84.0_amd64.tgz | tar xzf - -C /tmp
+            cp /tmp/tailscale_1.84.0_amd64/tailscale /usr/bin/
+            cp /tmp/tailscale_1.84.0_amd64/tailscaled /usr/bin/
+            chmod +x /usr/bin/tailscale /usr/bin/tailscaled
+            
+            # Create systemd service
+            curl -fsSL https://raw.githubusercontent.com/tailscale/tailscale/main/cmd/tailscaled/tailscaled.service -o /etc/systemd/system/tailscaled.service
+            systemctl daemon-reload
+            systemctl enable tailscaled
+            systemctl start tailscaled
             
             # Connect to Tailscale using OAuth
             echo '🔗 Connecting to Tailscale with OAuth...'
