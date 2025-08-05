@@ -1,5 +1,12 @@
 name: 🚀 Unified Service Management
 
+# This workflow deploys services on Arch Linux servers with:
+# - Linode server provisioning (linode/arch image)
+# - Tailscale VPN integration  
+# - Cloudflare DNS management
+# - Package management via pacman
+# - Docker containerization support
+
 on:
   workflow_call:
     inputs:
@@ -292,7 +299,7 @@ jobs:
           echo "  • Label: ${SERVER_LABEL}"
           echo "  • Type: ${{ env.SERVER_TYPE }}"
           echo "  • Region: ${{ env.TARGET_REGION }}"
-          echo "  • Image: linode/ubuntu22.04"
+          echo "  • Image: linode/arch (Arch Linux - optimized for Docker/containers)"
           
           # Check if we should destroy existing server
           if [[ "${{ inputs.overwrite_server }}" == "true" || "${{ env.ACTION_TYPE }}" == "destroy" ]]; then
@@ -322,7 +329,7 @@ jobs:
             SERVER_CREATION=$(linode-cli linodes create \
               --type "${{ env.SERVER_TYPE }}" \
               --region "${{ env.TARGET_REGION }}" \
-              --image "linode/ubuntu22.04" \
+              --image "linode/arch" \
               --label "${SERVER_LABEL}" \
               --root_pass "${ROOT_PASSWORD}" \
               --authorized_keys "${SSH_PUBLIC_KEY}" \
@@ -377,7 +384,7 @@ jobs:
           SERVER_IP="${{ steps.linode-deploy.outputs.server_ip }}"
           
           # Install jq for JSON parsing if not available
-          which jq >/dev/null || (apt-get update -qq && apt-get install -y jq)
+          which jq >/dev/null || (pacman -Sy --noconfirm jq)
           
           # Remove any existing devices with the same hostname first
           echo "�️ Removing any existing '${{ env.SERVICE_NAME }}' devices from Tailscale..."
@@ -478,7 +485,7 @@ jobs:
           
           # Simple DNS update via server
           ssh -i ~/.ssh/linode_deployment_key -o StrictHostKeyChecking=no root@${{ env.SERVER_IP }} \
-            "apt-get update -qq && apt-get install -y jq curl && \
+            "pacman -Sy --noconfirm jq curl && \
              echo 'DNS update process completed - using simplified approach' && \
              echo '10' > /tmp/dns-update-count"
           
