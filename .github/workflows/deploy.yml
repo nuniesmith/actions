@@ -57,10 +57,6 @@ on:
         required: true
       ADMIN_EMAIL:
         required: true
-      SERVICE_NAME:
-        required: true
-      FULL_DOMAIN:
-        required: true
 
     outputs:
       server_id:
@@ -343,9 +339,6 @@ jobs:
             echo \"export CLOUDFLARE_API_TOKEN_ENV='${{ secrets.CLOUDFLARE_API_TOKEN }}'\" >> /opt/stage2-env.sh
             echo \"export CLOUDFLARE_ZONE_ID_ENV='${{ secrets.CLOUDFLARE_ZONE_ID }}'\" >> /opt/stage2-env.sh
             echo \"export ADMIN_EMAIL_ENV='${{ secrets.ADMIN_EMAIL }}'\" >> /opt/stage2-env.sh
-            echo \"export CLOUDFLARE_API_TOKEN='${{ secrets.CLOUDFLARE_API_TOKEN }}'\" >> /opt/stage2-env.sh
-            echo \"export CLOUDFLARE_ZONE_ID='${{ secrets.CLOUDFLARE_ZONE_ID }}'\" >> /opt/stage2-env.sh
-            echo \"export ADMIN_EMAIL='${{ secrets.ADMIN_EMAIL }}'\" >> /opt/stage2-env.sh
             chmod +x /opt/stage2-env.sh
           "
           
