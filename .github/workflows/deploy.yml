@@ -379,29 +379,32 @@ jobs:
           # Create auth key using GitHub Actions environment (not inside SSH)
           echo "🔑 Creating Tailscale auth key using OAuth..."
           
-          # Try with full device creation capabilities first
+          # Install jq for JSON parsing if not available
+          which jq >/dev/null || (apt-get update -qq && apt-get install -y jq)
+          
+          # Start with the simplest auth key creation (no special capabilities)
+          echo "🔑 Attempting basic auth key creation..."
           AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
             -u "${TAILSCALE_OAUTH_CLIENT_ID}:${TAILSCALE_OAUTH_SECRET}" \
             -H "Content-Type: application/json" \
-            -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true}}},\"expirySeconds\":3600}")
+            -d "{\"expirySeconds\":3600}")
           
-          echo "OAuth API Response: $AUTH_RESPONSE"
-          
-          # Check if we got a permission error and try with simpler permissions
-          if echo "$AUTH_RESPONSE" | grep -q "not have enough permissions"; then
-            echo "⚠️ OAuth client lacks device creation permissions. Trying basic auth key..."
-            
-            # Try with minimal capabilities - just basic key creation
-            AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
-              -u "${TAILSCALE_OAUTH_CLIENT_ID}:${TAILSCALE_OAUTH_SECRET}" \
-              -H "Content-Type: application/json" \
-              -d "{\"expirySeconds\":3600}")
-            
-            echo "Simplified API Response: $AUTH_RESPONSE"
-          fi
+          echo "Basic API Response: $AUTH_RESPONSE"
           
           # Extract auth key from response
           AUTH_KEY=$(echo "$AUTH_RESPONSE" | jq -r ".key // empty" 2>/dev/null || echo "")
+          
+          # If basic creation failed, try with device creation capabilities
+          if [[ -z "$AUTH_KEY" || "$AUTH_KEY" == "null" ]]; then
+            echo "🔑 Basic key creation failed, trying with device capabilities..."
+            AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+              -u "${TAILSCALE_OAUTH_CLIENT_ID}:${TAILSCALE_OAUTH_SECRET}" \
+              -H "Content-Type: application/json" \
+              -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true}}},\"expirySeconds\":3600}")
+            
+            echo "Device capabilities API Response: $AUTH_RESPONSE"
+            AUTH_KEY=$(echo "$AUTH_RESPONSE" | jq -r ".key // empty" 2>/dev/null || echo "")
+          fi
           
           if [[ -z "$AUTH_KEY" || "$AUTH_KEY" == "null" ]]; then
             echo "❌ Failed to create Tailscale auth key via OAuth"
