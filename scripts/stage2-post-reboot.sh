@@ -5,7 +5,19 @@ echo "🚀 Stage 2: Post-reboot setup starting..."
 
 # Source environment variables if available
 if [[ -f /opt/stage2-env.sh ]]; then
-  echo "🔧 Loading environment variables from stage2-env.sh..."
+  echo "🔧 Loadi# Set up the chain rules that Docker expects
+iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
+  iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
+  iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
+  iptables -t filter -I FORWARD -j DOCKER-USER
+iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || \
+  iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+iptables -t filter -C FORWARD -o docker0 -j DOCKER-FORWARD 2>/dev/null || \
+  iptables -t filter -I FORWARD -o docker0 -j DOCKER-FORWARD
+iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
+  iptables -t filter -A DOCKER-USER -j RETURNent variables from stage2-env.sh..."
   source /opt/stage2-env.sh
   echo "✅ Environment variables loaded"
   # Check if environment variables are available (safe syntax)
@@ -171,6 +183,7 @@ echo "🔧 Initializing iptables chains for Docker..."
 # Create all necessary Docker chains
 iptables -t nat -N DOCKER 2>/dev/null || true
 iptables -t filter -N DOCKER 2>/dev/null || true
+iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
 iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
 iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
 iptables -t filter -N DOCKER-USER 2>/dev/null || true
@@ -187,16 +200,6 @@ iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || \
 iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
   iptables -t filter -A DOCKER-USER -j RETURN
 
-echo "✅ Docker iptables chains initialized"
-
-iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
-  iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
-iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
-  iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
-iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
-  iptables -t filter -I FORWARD -j DOCKER-USER
-iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || \
-  iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
 echo "✅ Docker iptables chains initialized"
 
 echo "🐳 Starting Docker service..."
@@ -229,8 +232,26 @@ case "$SERVICE_NAME" in
       echo "✅ nginx-network created with subnet 172.22.0.0/16"
     else
       echo "⚠️ Network creation failed, trying fallback method..."
-      # Restart Docker and try again
-      systemctl restart docker
+      # Stop Docker first
+      systemctl stop docker
+      
+      # Re-initialize iptables chains
+      echo "🔧 Re-initializing iptables chains for Docker..."
+      iptables -t nat -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+      iptables -t filter -N DOCKER-USER 2>/dev/null || true
+      
+      # Set up the chain rules
+      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
+        iptables -t filter -I FORWARD -j DOCKER-USER
+      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
+        iptables -t filter -A DOCKER-USER -j RETURN
+      
+      # Restart Docker
+      systemctl start docker
       sleep 15
       docker network create --driver bridge nginx-network || echo "❌ Network creation failed completely"
     fi
@@ -241,7 +262,26 @@ case "$SERVICE_NAME" in
       echo "✅ fks-network created with subnet 172.20.0.0/16"
     else
       echo "⚠️ Network creation failed, trying fallback method..."
-      systemctl restart docker
+      # Stop Docker first
+      systemctl stop docker
+      
+      # Re-initialize iptables chains
+      echo "🔧 Re-initializing iptables chains for Docker..."
+      iptables -t nat -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+      iptables -t filter -N DOCKER-USER 2>/dev/null || true
+      
+      # Set up the chain rules
+      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
+        iptables -t filter -I FORWARD -j DOCKER-USER
+      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
+        iptables -t filter -A DOCKER-USER -j RETURN
+      
+      # Restart Docker
+      systemctl start docker
       sleep 15
       docker network create --driver bridge fks-network || echo "❌ Network creation failed completely"
     fi
@@ -252,7 +292,26 @@ case "$SERVICE_NAME" in
       echo "✅ ats-network created with subnet 172.21.0.0/16"
     else
       echo "⚠️ Network creation failed, trying fallback method..."
-      systemctl restart docker
+      # Stop Docker first
+      systemctl stop docker
+      
+      # Re-initialize iptables chains
+      echo "🔧 Re-initializing iptables chains for Docker..."
+      iptables -t nat -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+      iptables -t filter -N DOCKER-USER 2>/dev/null || true
+      
+      # Set up the chain rules
+      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
+        iptables -t filter -I FORWARD -j DOCKER-USER
+      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
+        iptables -t filter -A DOCKER-USER -j RETURN
+      
+      # Restart Docker
+      systemctl start docker
       sleep 15
       docker network create --driver bridge ats-network || echo "❌ Network creation failed completely"
     fi
@@ -264,7 +323,26 @@ case "$SERVICE_NAME" in
       echo "✅ ${SERVICE_NAME}-network created with subnet 172.23.0.0/16"
     else
       echo "⚠️ Network creation failed, trying fallback method..."
-      systemctl restart docker
+      # Stop Docker first
+      systemctl stop docker
+      
+      # Re-initialize iptables chains
+      echo "🔧 Re-initializing iptables chains for Docker..."
+      iptables -t nat -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER 2>/dev/null || true
+      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+      iptables -t filter -N DOCKER-USER 2>/dev/null || true
+      
+      # Set up the chain rules
+      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
+        iptables -t filter -I FORWARD -j DOCKER-USER
+      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
+        iptables -t filter -A DOCKER-USER -j RETURN
+      
+      # Restart Docker
+      systemctl start docker
       sleep 15
       docker network create --driver bridge ${SERVICE_NAME}-network || echo "❌ Network creation failed completely"
     fi
