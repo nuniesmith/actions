@@ -383,17 +383,25 @@ jobs:
             # Install Tailscale
             curl -fsSL https://tailscale.com/install.sh | sh
             
+            # Install jq for JSON parsing
+            apt-get update -qq && apt-get install -y jq
+            
             # Get OAuth token for device registration
             echo "🔑 Authenticating with Tailscale..."
+            echo "OAuth Client ID: ${{ env.TAILSCALE_OAUTH_CLIENT_ID }}"
+            echo "OAuth Secret configured: $([ -n "${{ env.TAILSCALE_OAUTH_SECRET }}" ] && echo "YES" || echo "NO")"
             
-            # Use OAuth credentials to get auth key
-            AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/device" \
-              -H "Authorization: Bearer ${{ env.TAILSCALE_OAUTH_CLIENT_ID }}:${{ env.TAILSCALE_OAUTH_SECRET }}" \
+            # Use OAuth credentials to create auth key
+            # Note: For OAuth, we need to create an auth key first
+            AUTH_RESPONSE=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+              -u "${{ env.TAILSCALE_OAUTH_CLIENT_ID }}:${{ env.TAILSCALE_OAUTH_SECRET }}" \
               -H "Content-Type: application/json" \
-              -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true}}},\"expirySeconds\":3600}" || echo "{}")
+              -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true}}},\"expirySeconds\":3600}")
+            
+            echo "API Response: $AUTH_RESPONSE"
             
             # Extract auth key from response
-            AUTH_KEY=$(echo "$AUTH_RESPONSE" | grep -o "\"key\":\"[^\"]*\"" | cut -d\" -f4 || echo "")
+            AUTH_KEY=$(echo "$AUTH_RESPONSE" | jq -r ".key // empty" 2>/dev/null || echo "")
             
             if [[ -n "$AUTH_KEY" ]]; then
               echo "✅ Got Tailscale auth key"
