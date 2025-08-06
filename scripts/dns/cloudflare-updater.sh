@@ -172,6 +172,21 @@ get_service_subdomains() {
             echo "auth.$domain"
             echo "trading.$domain"
             ;;
+        "fks-auth")
+            echo "auth.$domain"
+            echo "sso.$domain"
+            ;;
+        "fks-api")
+            echo "api.$domain"
+            echo "data.$domain"
+            echo "trading.$domain"
+            echo "worker.$domain"
+            ;;
+        "fks-web")
+            echo "fks.$domain"
+            echo "app.$domain"
+            echo "www.$domain"
+            ;;
         "nginx")
             echo "nginx.$domain"
             echo "proxy.$domain"
