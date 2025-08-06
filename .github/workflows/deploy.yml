@@ -469,6 +469,21 @@ jobs:
             elif [[ -f 'docker-compose.yml' ]]; then
               docker-compose down 2>/dev/null || true
               docker-compose up -d
+            # Check for service-specific docker-compose files (e.g., docker-compose.auth.yml for fks-auth)
+            elif [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
+              SERVICE_TYPE='${SERVICE_NAME#fks-}'  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
+              if [[ -f \"docker-compose.\$SERVICE_TYPE.yml\" ]]; then
+                echo \"🐳 Using service-specific compose file: docker-compose.\$SERVICE_TYPE.yml\"
+                docker-compose -f \"docker-compose.\$SERVICE_TYPE.yml\" down 2>/dev/null || true
+                docker-compose -f \"docker-compose.\$SERVICE_TYPE.yml\" up -d
+              elif [[ -f 'docker-compose.yml' ]]; then
+                echo \"🐳 Falling back to default docker-compose.yml\"
+                docker-compose down 2>/dev/null || true
+                docker-compose up -d
+              else
+                echo \"❌ No docker-compose file found for service: ${{ env.SERVICE_NAME }}\"
+                exit 1
+              fi
             else
               echo '❌ No deployment method found (start.sh or docker-compose.yml missing)'
               exit 1
@@ -519,6 +534,16 @@ jobs:
             # Try to restart using docker-compose
             if [[ -f 'docker-compose.yml' ]]; then
               docker-compose restart
+            # Check for service-specific docker-compose files for FKS services
+            elif [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
+              SERVICE_TYPE='${SERVICE_NAME#fks-}'  # Extract service type
+              if [[ -f \"docker-compose.\$SERVICE_TYPE.yml\" ]]; then
+                echo \"🔄 Restarting using: docker-compose.\$SERVICE_TYPE.yml\"
+                docker-compose -f \"docker-compose.\$SERVICE_TYPE.yml\" restart
+              else
+                echo \"❌ No compose file found for service: ${{ env.SERVICE_NAME }}\"
+                exit 1
+              fi
             # Try to restart using systemd service
             elif systemctl list-units --type=service | grep -q '${{ env.SERVICE_NAME }}'; then
               systemctl restart ${{ env.SERVICE_NAME }}
