@@ -450,22 +450,31 @@ jobs:
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
             cd /home/${{ env.SERVICE_NAME }}_user
             
-            # Remove existing repo for fresh clone
-            if [[ -d '${{ env.SERVICE_NAME }}' ]]; then
-              rm -rf ${{ env.SERVICE_NAME }}
+                        # Determine the correct directory name (use source repository for multi-service architectures)
+            if [[ "${{ env.SOURCE_REPOSITORY }}" != "${{ env.SERVICE_NAME }}" ]]; then
+              REPO_DIR="${{ env.SOURCE_REPOSITORY }}"
+              echo "📁 Multi-service deployment: Using source repository directory '$REPO_DIR'"
+            else
+              REPO_DIR="${{ env.SERVICE_NAME }}"
+              echo "📁 Single-service deployment: Using service directory '$REPO_DIR'"
             fi
             
-            # Clone the service repository
-            git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git ${{ env.SERVICE_NAME }}
-            cd ${{ env.SERVICE_NAME }}
+            # Remove existing repository directory if overwrite is enabled
+            if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
+              rm -rf "$REPO_DIR"
+            fi
             
-            # Set ownership to service user
-            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }}
+            # Clone the source repository into the correct directory
+            git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git "$REPO_DIR"
+            cd "$REPO_DIR"
+            
+            # Set ownership to service user for the repository directory
+            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/"$REPO_DIR"
             
             # Deploy using start.sh if available
             if [[ -f 'start.sh' ]]; then
               chmod +x start.sh
-              su - ${{ env.SERVICE_NAME }}_user -c 'cd /home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }} && ./start.sh'
+              su - ${{ env.SERVICE_NAME }}_user -c "cd /home/${{ env.SERVICE_NAME }}_user/$REPO_DIR && ./start.sh"
             elif [[ -f 'docker-compose.yml' ]]; then
               docker-compose down 2>/dev/null || true
               docker-compose up -d
@@ -529,7 +538,16 @@ jobs:
           
           # Restart service on server
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
-            cd /home/${{ env.SERVICE_NAME }}_user/${{ env.SERVICE_NAME }}
+            # Determine the correct directory name (use source repository for multi-service architectures)
+            if [[ '${{ env.SOURCE_REPOSITORY }}' != '${{ env.SERVICE_NAME }}' ]]; then
+              REPO_DIR='${{ env.SOURCE_REPOSITORY }}'
+              echo '📁 Multi-service restart: Using source repository directory: \$REPO_DIR'
+            else
+              REPO_DIR='${{ env.SERVICE_NAME }}'
+              echo '📁 Single-service restart: Using service directory: \$REPO_DIR'
+            fi
+            
+            cd /home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR
             
             # Try to restart using docker-compose
             if [[ -f 'docker-compose.yml' ]]; then
