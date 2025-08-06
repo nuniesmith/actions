@@ -34,6 +34,10 @@ on:
         required: false
         type: string
         default: '7gram.xyz'
+      custom_domain:
+        description: 'Override full domain (e.g., api.fkstrading.xyz)'
+        required: false
+        type: string
       overwrite_server:
         description: 'Destroy and recreate server'
         required: false
@@ -80,7 +84,7 @@ env:
   SERVICE_NAME: ${{ inputs.service_name }}
   SOURCE_REPOSITORY: ${{ inputs.source_repository || inputs.service_name }}
   ACTION_TYPE: ${{ inputs.action_type }}
-  FULL_DOMAIN: ${{ inputs.service_name }}.${{ inputs.domain_suffix }}
+  FULL_DOMAIN: ${{ inputs.custom_domain || format('{0}.{1}', inputs.service_name, inputs.domain_suffix) }}
 
 jobs:
   # ============================================================================
