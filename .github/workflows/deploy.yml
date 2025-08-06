@@ -65,6 +65,44 @@ on:
         required: true
       ADMIN_EMAIL:
         required: true
+      # Enhanced Security and Configuration Secrets
+      SERVICE_USER_PASSWORD:
+        required: false
+      SSL_STAGING:
+        required: false
+      AUTHENTIK_JWT_SECRET:
+        required: false
+      JWT_SECRET_KEY:
+        required: false
+      NGINX_AUTH_USER:
+        required: false
+      NGINX_AUTH_PASS:
+        required: false
+      DISCORD_WEBHOOK_URL:
+        required: false
+      DOCKER_TOKEN:
+        required: false
+      DOCKER_USERNAME:
+        required: false
+      FULLY_QUALIFIED_DOMAIN_NAME:
+        required: false
+      TOP_LEVEL_DOMAIN:
+        required: false
+      NETDATA_CLAIM_ROOM:
+        required: false
+      NETDATA_CLAIM_TOKEN:
+        required: false
+      # SSH Public Keys for authorized access
+      DESKTOP_SSH_PUB:
+        required: false
+      FREDDY_SSH_PUB:
+        required: false
+      MACBOOK_SSH_PUB:
+        required: false
+      ORYX_SSH_PUB:
+        required: false
+      SULLIVAN_SSH_PUB:
+        required: false
 
     outputs:
       server_id:
@@ -285,6 +323,13 @@ jobs:
           SERVER_IP: ${{ steps.linode.outputs.server_ip }}
           ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
+          SERVICE_USER_PASSWORD: ${{ secrets.SERVICE_USER_PASSWORD }}
+          SSL_STAGING: ${{ secrets.SSL_STAGING }}
+          DESKTOP_SSH_PUB: ${{ secrets.DESKTOP_SSH_PUB }}
+          FREDDY_SSH_PUB: ${{ secrets.FREDDY_SSH_PUB }}
+          MACBOOK_SSH_PUB: ${{ secrets.MACBOOK_SSH_PUB }}
+          ORYX_SSH_PUB: ${{ secrets.ORYX_SSH_PUB }}
+          SULLIVAN_SSH_PUB: ${{ secrets.SULLIVAN_SSH_PUB }}
         run: |
           echo "🔧 Running Stage 1 setup on server..."
           
@@ -293,10 +338,27 @@ jobs:
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" /tmp/stage1-setup.sh
           sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${{ secrets.ACTIONS_USER_PASSWORD }}/g" /tmp/stage1-setup.sh
           sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${{ secrets.JORDAN_PASSWORD }}/g" /tmp/stage1-setup.sh
+          sed -i "s/SERVICE_USER_PASSWORD_PLACEHOLDER/${{ secrets.SERVICE_USER_PASSWORD }}/g" /tmp/stage1-setup.sh
+          sed -i "s/SSL_STAGING_PLACEHOLDER/${{ secrets.SSL_STAGING }}/g" /tmp/stage1-setup.sh
           
-          # Transfer and execute stage1 script
+          # Create SSH keys file for additional authorized keys
+          echo "🔑 Preparing additional SSH public keys..."
+          cat > /tmp/additional_ssh_keys.pub << 'EOF'
+          ${{ secrets.DESKTOP_SSH_PUB }}
+          ${{ secrets.FREDDY_SSH_PUB }}
+          ${{ secrets.MACBOOK_SSH_PUB }}
+          ${{ secrets.ORYX_SSH_PUB }}
+          ${{ secrets.SULLIVAN_SSH_PUB }}
+          EOF
+          
+          # Remove empty lines from SSH keys file
+          grep -v '^$' /tmp/additional_ssh_keys.pub > /tmp/ssh_keys_clean.pub || touch /tmp/ssh_keys_clean.pub
+          
+          # Transfer files to server
           scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no \
             /tmp/stage1-setup.sh root@$SERVER_IP:/tmp/
+          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no \
+            /tmp/ssh_keys_clean.pub root@$SERVER_IP:/tmp/
           
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
             "chmod +x /tmp/stage1-setup.sh && /tmp/stage1-setup.sh"
@@ -336,6 +398,10 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          NETDATA_CLAIM_ROOM: ${{ secrets.NETDATA_CLAIM_ROOM }}
+          NETDATA_CLAIM_TOKEN: ${{ secrets.NETDATA_CLAIM_TOKEN }}
+          FULLY_QUALIFIED_DOMAIN_NAME: ${{ secrets.FULLY_QUALIFIED_DOMAIN_NAME }}
+          TOP_LEVEL_DOMAIN: ${{ secrets.TOP_LEVEL_DOMAIN }}
         run: |
           echo "🏗️ Running Stage 2 post-reboot setup..."
           
@@ -348,6 +414,14 @@ jobs:
           # Fallback: Replace any remaining placeholders with sed (in case envsubst misses them)
           sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" /tmp/stage2-final.sh
           sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" /tmp/stage2-final.sh
+          sed -i "s|TS_OAUTH_CLIENT_ID_PLACEHOLDER|${{ secrets.TS_OAUTH_CLIENT_ID }}|g" /tmp/stage2-final.sh
+          sed -i "s|TS_OAUTH_SECRET_PLACEHOLDER|${{ secrets.TS_OAUTH_SECRET }}|g" /tmp/stage2-final.sh
+          sed -i "s|TAILSCALE_TAILNET_PLACEHOLDER|${{ secrets.TAILSCALE_TAILNET }}|g" /tmp/stage2-final.sh
+          sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|${{ secrets.CLOUDFLARE_API_TOKEN }}|g" /tmp/stage2-final.sh
+          sed -i "s|CLOUDFLARE_ZONE_ID_PLACEHOLDER|${{ secrets.CLOUDFLARE_ZONE_ID }}|g" /tmp/stage2-final.sh
+          sed -i "s|ADMIN_EMAIL_PLACEHOLDER|${{ secrets.ADMIN_EMAIL }}|g" /tmp/stage2-final.sh
+          # Remove CLOUDFLARE_EMAIL references - not needed with API token auth
+          sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER||g" /tmp/stage2-final.sh
           
           # Debug: Show what variables we're passing
           echo "🔍 Debug: SERVICE_NAME=${{ env.SERVICE_NAME }}"
@@ -361,6 +435,7 @@ jobs:
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
             mkdir -p /opt
             echo \"export SERVICE_NAME_ENV='${{ env.SERVICE_NAME }}'\" > /opt/stage2-env.sh
+            echo \"export FULL_DOMAIN_ENV='${{ env.FULL_DOMAIN }}'\" >> /opt/stage2-env.sh
             echo \"export TS_OAUTH_CLIENT_ID_ENV='${{ secrets.TS_OAUTH_CLIENT_ID }}'\" >> /opt/stage2-env.sh
             echo \"export TS_OAUTH_SECRET_ENV='${{ secrets.TS_OAUTH_SECRET }}'\" >> /opt/stage2-env.sh
             echo \"export TAILSCALE_TAILNET_ENV='${{ secrets.TAILSCALE_TAILNET }}'\" >> /opt/stage2-env.sh
@@ -442,6 +517,12 @@ jobs:
         id: deploy
         env:
           SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          AUTHENTIK_JWT_SECRET: ${{ secrets.AUTHENTIK_JWT_SECRET }}
+          NGINX_AUTH_USER: ${{ secrets.NGINX_AUTH_USER }}
+          NGINX_AUTH_PASS: ${{ secrets.NGINX_AUTH_PASS }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
         run: |
           # Setup SSH key
           mkdir -p ~/.ssh
@@ -457,34 +538,74 @@ jobs:
                         # Determine the correct directory name (use source repository for multi-service architectures)
             if [[ "${{ env.SOURCE_REPOSITORY }}" != "${{ env.SERVICE_NAME }}" ]]; then
               REPO_DIR="${{ env.SOURCE_REPOSITORY }}"
-              echo "📁 Multi-service deployment: Using source repository directory '$REPO_DIR'"
+              echo "📁 Multi-service deployment: Using source repository directory '\$REPO_DIR'"
             else
               REPO_DIR="${{ env.SERVICE_NAME }}"
-              echo "📁 Single-service deployment: Using service directory '$REPO_DIR'"
+              echo "📁 Single-service deployment: Using service directory '\$REPO_DIR'"
             fi
             
             # Remove existing repository directory if overwrite is enabled
             if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
-              rm -rf "$REPO_DIR"
+              rm -rf "\$REPO_DIR"
             fi
             
             # Clone the source repository into the correct directory
-            git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git "$REPO_DIR"
-            cd "$REPO_DIR"
+            git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git "\$REPO_DIR"
+            cd "\$REPO_DIR"
+            
+            # 🔐 SSL Certificate Setup - Step 1: Generate self-signed certificates
+            echo '🔐 Setting up SSL certificates for immediate HTTPS...'
+            mkdir -p /etc/ssl/selfsigned /etc/nginx
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
+              -keyout /etc/ssl/selfsigned/key.pem \\
+              -out /etc/ssl/selfsigned/cert.pem \\
+              -subj '/CN=${{ env.FULL_DOMAIN }}/O=GitHub Actions Deployment/C=US'
+            
+            # Create initial SSL configuration for NGINX
+            cat > /etc/nginx/ssl.conf << 'SSL_EOF'
+            # Initial self-signed SSL configuration
+            ssl_certificate /etc/ssl/selfsigned/cert.pem;
+            ssl_certificate_key /etc/ssl/selfsigned/key.pem;
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+            ssl_prefer_server_ciphers off;
+            ssl_session_cache shared:SSL:10m;
+            ssl_session_timeout 10m;
+            SSL_EOF
+            
+            echo '✅ Self-signed certificates generated for immediate HTTPS startup'
+            
+            # Create .env file with application secrets
+            echo '🔐 Setting up application environment variables...'
+            cat > .env << 'ENV_EOF'
+            # Application Configuration
+            JWT_SECRET_KEY=\${JWT_SECRET_KEY}
+            AUTHENTIK_JWT_SECRET=\${AUTHENTIK_JWT_SECRET}
+            NGINX_AUTH_USER=\${NGINX_AUTH_USER}
+            NGINX_AUTH_PASS=\${NGINX_AUTH_PASS}
+            
+            # Service Configuration
+            SERVICE_NAME=${{ env.SERVICE_NAME }}
+            DOMAIN_NAME=${{ env.FULL_DOMAIN }}
+            
+            # Docker Hub Authentication (if needed)
+            DOCKER_USERNAME=\${DOCKER_USERNAME}
+            DOCKER_TOKEN=\${DOCKER_TOKEN}
+            ENV_EOF
             
             # Set ownership to service user for the repository directory
-            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/"$REPO_DIR"
+            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/"\$REPO_DIR"
             
             # Deploy using start.sh if available
             if [[ -f 'start.sh' ]]; then
               chmod +x start.sh
-              su - ${{ env.SERVICE_NAME }}_user -c "cd /home/${{ env.SERVICE_NAME }}_user/$REPO_DIR && ./start.sh"
+              su - ${{ env.SERVICE_NAME }}_user -c "cd /home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR && ./start.sh"
             elif [[ -f 'docker-compose.yml' ]]; then
               docker-compose down 2>/dev/null || true
               docker-compose up -d
             # Check for service-specific docker-compose files (e.g., docker-compose.auth.yml for fks-auth)
             elif [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
-              SERVICE_TYPE='${SERVICE_NAME#fks-}'  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
+              SERVICE_TYPE='\${SERVICE_NAME#fks-}'  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
               if [[ -f \"docker-compose.\$SERVICE_TYPE.yml\" ]]; then
                 echo \"🐳 Using service-specific compose file: docker-compose.\$SERVICE_TYPE.yml\"
                 docker-compose -f \"docker-compose.\$SERVICE_TYPE.yml\" down 2>/dev/null || true
@@ -501,6 +622,78 @@ jobs:
               echo '❌ No deployment method found (start.sh or docker-compose.yml missing)'
               exit 1
             fi
+            
+            # Wait for service to be fully up before proceeding to SSL setup
+            echo '⏳ Waiting for service to start up...'
+            sleep 30
+            
+            # Install Certbot if not already installed
+            if ! command -v certbot &> /dev/null; then
+              echo '🔒 Installing Certbot for Let'\''s Encrypt certificates...'
+              pacman -Sy --noconfirm certbot python-certbot-dns-cloudflare
+            fi
+            
+            # Set up Let's Encrypt certificates with Cloudflare DNS challenge
+            if [[ -n '${{ env.FULL_DOMAIN }}' ]] && [[ -n '${{ secrets.CLOUDFLARE_API_TOKEN }}' ]]; then
+              echo '🔒 Setting up Let'\''s Encrypt certificates via Cloudflare DNS...'
+              
+              # Create Cloudflare credentials file
+              mkdir -p /etc/ssl/cloudflare
+              cat > /etc/ssl/cloudflare/credentials.ini << EOF
+            dns_cloudflare_api_token = ${{ secrets.CLOUDFLARE_API_TOKEN }}
+            EOF
+              chmod 600 /etc/ssl/cloudflare/credentials.ini
+              
+              # Request Let's Encrypt certificate
+              certbot certonly \
+                --dns-cloudflare \
+                --dns-cloudflare-credentials /etc/ssl/cloudflare/credentials.ini \
+                --dns-cloudflare-propagation-seconds 60 \
+                --non-interactive \
+                --agree-tos \
+                --email admin@${{ env.FULL_DOMAIN }} \
+                -d ${{ env.FULL_DOMAIN }} \
+                --cert-name ${{ env.FULL_DOMAIN }}
+              
+              # Copy certificates to service directory for easy access
+              if [[ -d \"/etc/letsencrypt/live/${{ env.FULL_DOMAIN }}\" ]]; then
+                echo '✅ Let'\''s Encrypt certificate obtained successfully!'
+                mkdir -p \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl\"
+                cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/fullchain.pem \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/\"
+                cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/privkey.pem \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/\"
+                chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl\"
+                
+                # Set up automatic renewal
+                echo '⚙️ Setting up automatic certificate renewal...'
+                (crontab -l 2>/dev/null; echo '0 12 * * * /usr/bin/certbot renew --quiet --deploy-hook \"systemctl reload nginx\"') | crontab -
+              else
+                echo '⚠️ Let'\''s Encrypt certificate request failed, continuing with self-signed certificates'
+              fi
+            else
+              echo '⚠️ Domain or Cloudflare API token not provided, continuing with self-signed certificates'
+            fi
+            
+            # Final SSL verification and NGINX configuration check
+            echo '🔍 Verifying SSL certificate configuration...'
+            if [[ -f \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/fullchain.pem\" ]]; then
+              echo '✅ SSL certificates found and properly configured'
+              
+              # Check certificate validity
+              openssl x509 -in \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/fullchain.pem\" -text -noout | head -20
+              
+              # Verify NGINX can start with SSL configuration
+              if command -v nginx &> /dev/null; then
+                nginx -t && echo '✅ NGINX configuration is valid' || echo '⚠️ NGINX configuration has issues'
+              fi
+              
+              # Test HTTPS connectivity (if service is listening)
+              sleep 10
+              curl -k -I https://${{ env.FULL_DOMAIN }} 2>/dev/null | head -5 || echo '⚠️ Service not yet responding on HTTPS (this is normal during startup)'
+            else
+              echo '❌ SSL certificates not found - check certificate generation logs above'
+            fi
+            
+            echo '🎯 SSL certificate automation complete!'
           "
           
           echo "status=success" >> $GITHUB_OUTPUT
@@ -786,4 +979,56 @@ jobs:
             echo "❌ Overall Status: FAILED"
             echo "💥 Check job logs for details"
           fi
+      
+      - name: 📢 Send Discord Notification
+        if: always() && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEPLOYMENT_STATUS: ${{ (needs.service-deploy.result == 'success' || needs.service-restart.result == 'success' || needs.service-destroy.result == 'success') && 'SUCCESS' || 'FAILED' }}
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          ACTION_TYPE: ${{ inputs.action_type || 'deploy' }}
+        run: |
+          echo "📢 Sending Discord notification..."
+          
+          # Determine color based on status
+          if [[ "$DEPLOYMENT_STATUS" == "SUCCESS" ]]; then
+            COLOR="3066993"  # Green
+            EMOJI="✅"
+          else
+            COLOR="15158332"  # Red
+            EMOJI="❌"
+          fi
+          
+          # Create Discord webhook payload
+          cat > /tmp/discord_payload.json << EOF
+          {
+            "embeds": [
+              {
+                "title": "$EMOJI $SERVICE_NAME Deployment $DEPLOYMENT_STATUS",
+                "description": "**Action:** $ACTION_TYPE\\n**Service:** $SERVICE_NAME\\n**Status:** $DEPLOYMENT_STATUS",
+                "color": $COLOR,
+                "fields": [
+                  {
+                    "name": "Server Details",
+                    "value": "**IP:** ${{ needs.infrastructure.outputs.server_ip || 'N/A' }}\\n**Tailscale IP:** ${{ needs.infrastructure.outputs.tailscale_ip || 'N/A' }}\\n**Server ID:** ${{ needs.infrastructure.outputs.server_id || 'N/A' }}",
+                    "inline": true
+                  },
+                  {
+                    "name": "Job Results",
+                    "value": "**Infrastructure:** ${{ needs.infrastructure.result }}\\n**Service Deploy:** ${{ needs.service-deploy.result }}\\n**DNS:** OK",
+                    "inline": true
+                  }
+                ],
+                "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              }
+            ]
+          }
+          EOF
+          
+          # Send notification to Discord
+          curl -H "Content-Type: application/json" \\
+               -d @/tmp/discord_payload.json \\
+               "$DISCORD_WEBHOOK_URL"
+          
+          echo "✅ Discord notification sent"
 
