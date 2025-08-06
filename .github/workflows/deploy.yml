@@ -10,6 +10,10 @@ on:
         description: 'Service to deploy (fks, nginx, ats, etc.)'
         required: true
         type: string
+      source_repository:
+        description: 'Source repository name (defaults to service_name)'
+        required: false
+        type: string
       action_type:
         description: 'Action: deploy, destroy, health-check, restart'
         required: false
@@ -74,6 +78,7 @@ on:
 
 env:
   SERVICE_NAME: ${{ inputs.service_name }}
+  SOURCE_REPOSITORY: ${{ inputs.source_repository || inputs.service_name }}
   ACTION_TYPE: ${{ inputs.action_type }}
   FULL_DOMAIN: ${{ inputs.service_name }}.${{ inputs.domain_suffix }}
 
@@ -451,7 +456,7 @@ jobs:
             fi
             
             # Clone the service repository
-            git clone https://github.com/nuniesmith/${{ env.SERVICE_NAME }}.git
+            git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git ${{ env.SERVICE_NAME }}
             cd ${{ env.SERVICE_NAME }}
             
             # Set ownership to service user
