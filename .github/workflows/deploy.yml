@@ -150,6 +150,25 @@ jobs:
           repository: nuniesmith/actions
           token: ${{ github.token }}
       
+      - name: 🧹 Pre-deployment Cleanup (when overwriting)
+        if: inputs.overwrite_server == true
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
+        run: |
+          echo "🧹 Cleaning up Tailscale devices for ${{ env.SERVICE_NAME }} before server overwrite..."
+          
+          # Clean up Tailscale devices for the service (including numbered variants)
+          if [[ -n "${TS_OAUTH_CLIENT_ID:-}" && -n "${TS_OAUTH_SECRET:-}" ]]; then
+            chmod +x ./scripts/cleanup/cleanup-resources.sh
+            export TS_OAUTH_CLIENT_ID TS_OAUTH_SECRET TAILSCALE_TAILNET
+            ./scripts/cleanup/cleanup-resources.sh "${{ env.SERVICE_NAME }}" || echo "⚠️ Tailscale cleanup completed with warnings"
+            echo "✅ Pre-deployment Tailscale cleanup completed"
+          else
+            echo "⚠️ Tailscale OAuth credentials not available - skipping Tailscale cleanup"
+          fi
+      
       - name: 🏗️ Create Server and Run Stage 1 Setup
         id: linode
         env:
