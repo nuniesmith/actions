@@ -869,6 +869,28 @@ jobs:
           echo "📁 Available files:"
           ls -la
           
+          # Create Docker networks if needed, now that we have the application context
+          echo "🌐 Setting up Docker networks for ${{ env.SERVICE_NAME }}..."
+          
+          # Create service-specific network to avoid conflicts with Docker's default networks
+          case '${{ env.SERVICE_NAME }}' in
+            "nginx")
+              docker network create --driver bridge --subnet=172.22.0.0/16 nginx-network 2>/dev/null || echo "ℹ️ nginx-network already exists or creation failed"
+              ;;
+            "fks"|"fks-"*)
+              docker network create --driver bridge --subnet=172.20.0.0/16 fks-network 2>/dev/null || echo "ℹ️ fks-network already exists or creation failed"
+              ;;
+            "ats")
+              docker network create --driver bridge --subnet=172.21.0.0/16 ats-network 2>/dev/null || echo "ℹ️ ats-network already exists or creation failed"
+              ;;
+            *)
+              docker network create --driver bridge ${{ env.SERVICE_NAME }}-network 2>/dev/null || echo "ℹ️ ${{ env.SERVICE_NAME }}-network already exists or creation failed"
+              ;;
+          esac
+          
+          echo "🔍 Available Docker networks:"
+          docker network ls
+          
           # Deploy using start.sh if available
           if [[ -f 'start.sh' ]]; then
             echo '🚀 Found start.sh - using custom deployment script'

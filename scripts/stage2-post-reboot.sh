@@ -5,19 +5,7 @@ echo "🚀 Stage 2: Post-reboot setup starting..."
 
 # Source environment variables if available
 if [[ -f /opt/stage2-env.sh ]]; then
-  echo "🔧 Loadi# Set up the chain rules that Docker expects
-iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
-  iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
-iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
-  iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
-iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
-  iptables -t filter -I FORWARD -j DOCKER-USER
-iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || \
-  iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
-iptables -t filter -C FORWARD -o docker0 -j DOCKER-FORWARD 2>/dev/null || \
-  iptables -t filter -I FORWARD -o docker0 -j DOCKER-FORWARD
-iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
-  iptables -t filter -A DOCKER-USER -j RETURNent variables from stage2-env.sh..."
+  echo "🔧 Loading environment variables from stage2-env.sh..."
   source /opt/stage2-env.sh
   echo "✅ Environment variables loaded"
   # Check if environment variables are available (safe syntax)
@@ -219,184 +207,15 @@ done
 echo "⏳ Waiting for Docker iptables initialization..."
 sleep 10
 
-echo "🌐 Creating Docker network for service: $SERVICE_NAME..."
-
-# Clean up any existing networks (but only remove the one we're about to create)
-docker network rm ${SERVICE_NAME}-network 2>/dev/null || true
-
-# Create service-specific network with retry logic
-case "$SERVICE_NAME" in
-  "nginx")
-    echo "🌐 Creating nginx-network..."
-    if docker network create --driver bridge --subnet=172.22.0.0/16 --ip-range=172.22.1.0/24 --gateway=172.22.0.1 nginx-network; then
-      echo "✅ nginx-network created with subnet 172.22.0.0/16"
-    else
-      echo "⚠️ Network creation failed, trying fallback method..."
-      # Stop Docker first
-      systemctl stop docker
-      
-      # Re-initialize iptables chains
-      echo "🔧 Re-initializing iptables chains for Docker..."
-      iptables -t nat -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
-      iptables -t filter -N DOCKER-USER 2>/dev/null || true
-      
-      # Set up the chain rules
-      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
-        iptables -t filter -I FORWARD -j DOCKER-USER
-      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
-        iptables -t filter -A DOCKER-USER -j RETURN
-      
-      # Restart Docker
-      systemctl start docker
-      sleep 15
-      docker network create --driver bridge nginx-network || echo "❌ Network creation failed completely"
-    fi
-    ;;
-  "fks")
-    echo "🌐 Creating fks-network..."
-    if docker network create --driver bridge --subnet=172.20.0.0/16 --ip-range=172.20.1.0/24 --gateway=172.20.0.1 fks-network; then
-      echo "✅ fks-network created with subnet 172.20.0.0/16"
-    else
-      echo "⚠️ Network creation failed, trying fallback method..."
-      # Stop Docker first
-      systemctl stop docker
-      
-      # Re-initialize iptables chains
-      echo "🔧 Re-initializing iptables chains for Docker..."
-      iptables -t nat -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
-      iptables -t filter -N DOCKER-USER 2>/dev/null || true
-      
-      # Set up the chain rules
-      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
-        iptables -t filter -I FORWARD -j DOCKER-USER
-      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
-        iptables -t filter -A DOCKER-USER -j RETURN
-      
-      # Restart Docker
-      systemctl start docker
-      sleep 15
-      docker network create --driver bridge fks-network || echo "❌ Network creation failed completely"
-    fi
-    ;;
-  "ats")
-    echo "🌐 Creating ats-network..."
-    if docker network create --driver bridge --subnet=172.21.0.0/16 --ip-range=172.21.1.0/24 --gateway=172.21.0.1 ats-network; then
-      echo "✅ ats-network created with subnet 172.21.0.0/16"
-    else
-      echo "⚠️ Network creation failed, trying fallback method..."
-      # Stop Docker first
-      systemctl stop docker
-      
-      # Re-initialize iptables chains
-      echo "🔧 Re-initializing iptables chains for Docker..."
-      iptables -t nat -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
-      iptables -t filter -N DOCKER-USER 2>/dev/null || true
-      
-      # Set up the chain rules
-      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
-        iptables -t filter -I FORWARD -j DOCKER-USER
-      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
-        iptables -t filter -A DOCKER-USER -j RETURN
-      
-      # Restart Docker
-      systemctl start docker
-      sleep 15
-      docker network create --driver bridge ats-network || echo "❌ Network creation failed completely"
-    fi
-    ;;
-  *)
-    # Default: create a generic network for the service
-    echo "🌐 Creating ${SERVICE_NAME}-network..."
-    if docker network create --driver bridge --subnet=172.23.0.0/16 --ip-range=172.23.1.0/24 --gateway=172.23.0.1 ${SERVICE_NAME}-network; then
-      echo "✅ ${SERVICE_NAME}-network created with subnet 172.23.0.0/16"
-    else
-      echo "⚠️ Network creation failed, trying fallback method..."
-      # Stop Docker first
-      systemctl stop docker
-      
-      # Re-initialize iptables chains
-      echo "🔧 Re-initializing iptables chains for Docker..."
-      iptables -t nat -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER 2>/dev/null || true
-      iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
-      iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
-      iptables -t filter -N DOCKER-USER 2>/dev/null || true
-      
-      # Set up the chain rules
-      iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || \
-        iptables -t filter -I FORWARD -j DOCKER-USER
-      iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
-        iptables -t filter -A DOCKER-USER -j RETURN
-      
-      # Restart Docker
-      systemctl start docker
-      sleep 15
-      docker network create --driver bridge ${SERVICE_NAME}-network || echo "❌ Network creation failed completely"
-    fi
-    ;;
-esac
-
-echo "🔧 Configuring iptables rules for ${SERVICE_NAME} network..."
-# Basic Docker network access rules (these are usually handled by Docker automatically)
-case "$SERVICE_NAME" in
-  "nginx")
-    # nginx typically needs to communicate outbound for reverse proxy functionality
-    iptables -I DOCKER-USER -s 172.22.0.0/16 -j ACCEPT 2>/dev/null || true
-    ;;
-  "fks")
-    iptables -I DOCKER-USER -s 172.20.0.0/16 -j ACCEPT 2>/dev/null || true
-    ;;
-  "ats")
-    iptables -I DOCKER-USER -s 172.21.0.0/16 -j ACCEPT 2>/dev/null || true
-    ;;
-  *)
-    iptables -I DOCKER-USER -s 172.23.0.0/16 -j ACCEPT 2>/dev/null || true
-    ;;
-esac
-
-echo "✅ Docker network configured for $SERVICE_NAME"
-
-# Create service-specific network configuration
-cat > /opt/docker-networks.conf << EOF
-# Docker network configuration for $SERVICE_NAME service
-SERVICE_NAME="$SERVICE_NAME"
-SERVICE_NETWORK_NAME="${SERVICE_NAME}-network"
-
-# Service-specific network details
-case "\$SERVICE_NAME" in
-  "nginx")
-    SERVICE_NETWORK_SUBNET="172.22.0.0/16"
-    ;;
-  "fks")
-    SERVICE_NETWORK_SUBNET="172.20.0.0/16"
-    ;;
-  "ats")
-    SERVICE_NETWORK_SUBNET="172.21.0.0/16"
-    ;;
-  *)
-    SERVICE_NETWORK_SUBNET="172.23.0.0/16"
-    ;;
-esac
-EOF
-chmod 644 /opt/docker-networks.conf
+# Skip Docker network creation in stage2 - let the application deployment handle it
+echo "ℹ️ Docker network creation will be handled during application deployment"
+echo "� Verifying Docker basic functionality..."
+docker network ls
 
 echo "⏳ Waiting for Docker networking to stabilize..."
 sleep 10
 
-# Verify Docker networks are working before proceeding
+# Verify Docker is working properly before proceeding
 echo "🔍 Verifying Docker network status..."
 docker network ls
 docker info | grep -A 5 "Network:"
