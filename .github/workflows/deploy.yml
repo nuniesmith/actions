@@ -550,183 +550,193 @@ jobs:
           
           echo "🚀 Deploying ${{ env.SERVICE_NAME }} service..."
           
-          # Clone service repository to server
-          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
-            cd /home/${{ env.SERVICE_NAME }}_user
-            
-                        # Determine the correct directory name (use source repository for multi-service architectures)
-            if [[ "${{ env.SOURCE_REPOSITORY }}" != "${{ env.SERVICE_NAME }}" ]]; then
-              REPO_DIR="${{ env.SOURCE_REPOSITORY }}"
-              echo "📁 Multi-service deployment: Using source repository directory '\$REPO_DIR'"
-            else
-              REPO_DIR="${{ env.SERVICE_NAME }}"
-              echo "📁 Single-service deployment: Using service directory '\$REPO_DIR'"
-            fi
-            
-            # Remove existing repository directory if overwrite is enabled
-            if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
-              rm -rf "\$REPO_DIR"
-            fi
-            
-            # Clone the source repository into the correct directory
-            git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git "\$REPO_DIR"
-            cd "\$REPO_DIR"
-            
-            # 🔐 SSL Certificate Setup - Step 1: Generate self-signed certificates
-            echo '🔐 Setting up SSL certificates for immediate HTTPS...'
-            mkdir -p /etc/ssl/selfsigned /etc/nginx
-            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
-              -keyout /etc/ssl/selfsigned/key.pem \\
-              -out /etc/ssl/selfsigned/cert.pem \\
-              -subj '/CN=${{ env.FULL_DOMAIN }}/O=GitHub Actions Deployment/C=US'
-            
-            # Create initial SSL configuration for NGINX
-            cat > /etc/nginx/ssl.conf << 'SSL_EOF'
-            # Initial self-signed SSL configuration
-            ssl_certificate /etc/ssl/selfsigned/cert.pem;
-            ssl_certificate_key /etc/ssl/selfsigned/key.pem;
-            ssl_protocols TLSv1.2 TLSv1.3;
-            ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
-            ssl_prefer_server_ciphers off;
-            ssl_session_cache shared:SSL:10m;
-            ssl_session_timeout 10m;
-            SSL_EOF
-            
-            echo '✅ Self-signed certificates generated for immediate HTTPS startup'
-            
-            # Create .env file with application secrets
-            echo '🔐 Setting up application environment variables...'
-            cat > .env << 'ENV_EOF'
-            # Application Configuration
-            JWT_SECRET_KEY=\${JWT_SECRET_KEY}
-            AUTHENTIK_JWT_SECRET=\${AUTHENTIK_JWT_SECRET}
-            NGINX_AUTH_USER=\${NGINX_AUTH_USER}
-            NGINX_AUTH_PASS=\${NGINX_AUTH_PASS}
-            
-            # Service Configuration
-            SERVICE_NAME=${{ env.SERVICE_NAME }}
-            DOMAIN_NAME=${{ env.FULL_DOMAIN }}
-            
-            # Docker Hub Authentication (if needed)
-            DOCKER_USERNAME=\${DOCKER_USERNAME}
-            DOCKER_TOKEN=\${DOCKER_TOKEN}
-            ENV_EOF
-            
-            # Set ownership to service user for the repository directory
-            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/"\$REPO_DIR"
-            
-            # Change to repository directory for deployment file detection and execution
-            cd /home/${{ env.SERVICE_NAME }}_user/"\$REPO_DIR"
-            
-            echo \"🔍 Checking deployment options in directory: \$(pwd)\"
-            echo \"📁 Available files:\"
-            ls -la
-            
-            # Deploy using start.sh if available
-            if [[ -f 'start.sh' ]]; then
-              echo '🚀 Found start.sh - using custom deployment script'
-              chmod +x start.sh
-              su - ${{ env.SERVICE_NAME }}_user -c "cd /home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR && ./start.sh"
+          # Create deployment script locally to avoid command line length limits
+          cat > /tmp/service-deploy.sh << 'DEPLOY_SCRIPT_EOF'
+          #!/bin/bash
+          set -e
+          
+          cd /home/${{ env.SERVICE_NAME }}_user
+          
+          # Determine the correct directory name (use source repository for multi-service architectures)
+          if [[ "${{ env.SOURCE_REPOSITORY }}" != "${{ env.SERVICE_NAME }}" ]]; then
+            REPO_DIR="${{ env.SOURCE_REPOSITORY }}"
+            echo "📁 Multi-service deployment: Using source repository directory '$REPO_DIR'"
+          else
+            REPO_DIR="${{ env.SERVICE_NAME }}"
+            echo "📁 Single-service deployment: Using service directory '$REPO_DIR'"
+          fi
+          
+          # Remove existing repository directory if overwrite is enabled
+          if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
+            rm -rf "$REPO_DIR"
+          fi
+          
+          # Clone the source repository into the correct directory
+          git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git "$REPO_DIR"
+          cd "$REPO_DIR"
+          
+          # 🔐 SSL Certificate Setup - Step 1: Generate self-signed certificates
+          echo '🔐 Setting up SSL certificates for immediate HTTPS...'
+          mkdir -p /etc/ssl/selfsigned /etc/nginx
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/ssl/selfsigned/key.pem \
+            -out /etc/ssl/selfsigned/cert.pem \
+            -subj '/CN=${{ env.FULL_DOMAIN }}/O=GitHub Actions Deployment/C=US'
+          
+          # Create initial SSL configuration for NGINX
+          cat > /etc/nginx/ssl.conf << 'SSL_EOF'
+          # Initial self-signed SSL configuration
+          ssl_certificate /etc/ssl/selfsigned/cert.pem;
+          ssl_certificate_key /etc/ssl/selfsigned/key.pem;
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+          ssl_prefer_server_ciphers off;
+          ssl_session_cache shared:SSL:10m;
+          ssl_session_timeout 10m;
+          SSL_EOF
+          
+          echo '✅ Self-signed certificates generated for immediate HTTPS startup'
+          
+          # Create .env file with application secrets
+          echo '🔐 Setting up application environment variables...'
+          cat > .env << 'ENV_EOF'
+          # Application Configuration
+          JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+          AUTHENTIK_JWT_SECRET=${{ secrets.AUTHENTIK_JWT_SECRET }}
+          NGINX_AUTH_USER=${{ secrets.NGINX_AUTH_USER }}
+          NGINX_AUTH_PASS=${{ secrets.NGINX_AUTH_PASS }}
+          
+          # Service Configuration
+          SERVICE_NAME=${{ env.SERVICE_NAME }}
+          DOMAIN_NAME=${{ env.FULL_DOMAIN }}
+          
+          # Docker Hub Authentication (if needed)
+          DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN=${{ secrets.DOCKER_TOKEN }}
+          ENV_EOF
+          
+          # Set ownership to service user for the repository directory
+          chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/"$REPO_DIR"
+          
+          # Change to repository directory for deployment file detection and execution
+          cd /home/${{ env.SERVICE_NAME }}_user/"$REPO_DIR"
+          
+          echo "🔍 Checking deployment options in directory: $(pwd)"
+          echo "📁 Available files:"
+          ls -la
+          
+          # Deploy using start.sh if available
+          if [[ -f 'start.sh' ]]; then
+            echo '🚀 Found start.sh - using custom deployment script'
+            chmod +x start.sh
+            su - ${{ env.SERVICE_NAME }}_user -c "cd /home/${{ env.SERVICE_NAME }}_user/$REPO_DIR && ./start.sh"
+          elif [[ -f 'docker-compose.yml' ]]; then
+            echo '🐳 Found docker-compose.yml - using Docker Compose deployment'
+            docker-compose down 2>/dev/null || true
+            docker-compose up -d
+          # Check for service-specific docker-compose files (e.g., docker-compose.auth.yml for fks-auth)
+          elif [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
+            SERVICE_TYPE="${{ env.SERVICE_NAME }}"
+            SERVICE_TYPE="${SERVICE_TYPE#fks-}"  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
+            echo "🔍 FKS service detected: ${{ env.SERVICE_NAME }}, looking for docker-compose.$SERVICE_TYPE.yml"
+            if [[ -f "docker-compose.$SERVICE_TYPE.yml" ]]; then
+              echo "🐳 Using service-specific compose file: docker-compose.$SERVICE_TYPE.yml"
+              docker-compose -f "docker-compose.$SERVICE_TYPE.yml" down 2>/dev/null || true
+              docker-compose -f "docker-compose.$SERVICE_TYPE.yml" up -d
             elif [[ -f 'docker-compose.yml' ]]; then
-              echo '🐳 Found docker-compose.yml - using Docker Compose deployment'
+              echo "🐳 Falling back to default docker-compose.yml"
               docker-compose down 2>/dev/null || true
               docker-compose up -d
-            # Check for service-specific docker-compose files (e.g., docker-compose.auth.yml for fks-auth)
-            elif [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
-              SERVICE_TYPE='\${SERVICE_NAME#fks-}'  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
-              echo \"🔍 FKS service detected: ${{ env.SERVICE_NAME }}, looking for docker-compose.\$SERVICE_TYPE.yml\"
-              if [[ -f \"docker-compose.\$SERVICE_TYPE.yml\" ]]; then
-                echo \"🐳 Using service-specific compose file: docker-compose.\$SERVICE_TYPE.yml\"
-                docker-compose -f \"docker-compose.\$SERVICE_TYPE.yml\" down 2>/dev/null || true
-                docker-compose -f \"docker-compose.\$SERVICE_TYPE.yml\" up -d
-              elif [[ -f 'docker-compose.yml' ]]; then
-                echo \"🐳 Falling back to default docker-compose.yml\"
-                docker-compose down 2>/dev/null || true
-                docker-compose up -d
-              else
-                echo \"❌ No docker-compose file found for service: ${{ env.SERVICE_NAME }}\"
-                exit 1
-              fi
             else
-              echo \"❌ No deployment method found for service: ${{ env.SERVICE_NAME }}\"
-              echo \"🔍 Available files in directory:\"
-              ls -la
-              echo \"📂 Current working directory: \$(pwd)\"
+              echo "❌ No docker-compose file found for service: ${{ env.SERVICE_NAME }}"
               exit 1
             fi
+          else
+            echo "❌ No deployment method found for service: ${{ env.SERVICE_NAME }}"
+            echo "🔍 Available files in directory:"
+            ls -la
+            echo "📂 Current working directory: $(pwd)"
+            exit 1
+          fi
+          
+          # Wait for service to be fully up before proceeding to SSL setup
+          echo '⏳ Waiting for service to start up...'
+          sleep 30
+          
+          # Install Certbot if not already installed
+          if ! command -v certbot &> /dev/null; then
+            echo '🔒 Installing Certbot for Let'\''s Encrypt certificates...'
+            pacman -Sy --noconfirm certbot python-certbot-dns-cloudflare
+          fi
+          
+          # Set up Let's Encrypt certificates with Cloudflare DNS challenge
+          if [[ -n '${{ env.FULL_DOMAIN }}' ]] && [[ -n '${{ secrets.CLOUDFLARE_API_TOKEN }}' ]]; then
+            echo '🔒 Setting up Let'\''s Encrypt certificates via Cloudflare DNS...'
             
-            # Wait for service to be fully up before proceeding to SSL setup
-            echo '⏳ Waiting for service to start up...'
-            sleep 30
+            # Create Cloudflare credentials file
+            mkdir -p /etc/ssl/cloudflare
+            cat > /etc/ssl/cloudflare/credentials.ini << EOF
+          dns_cloudflare_api_token = ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          EOF
+            chmod 600 /etc/ssl/cloudflare/credentials.ini
             
-            # Install Certbot if not already installed
-            if ! command -v certbot &> /dev/null; then
-              echo '🔒 Installing Certbot for Let'\''s Encrypt certificates...'
-              pacman -Sy --noconfirm certbot python-certbot-dns-cloudflare
-            fi
+            # Request Let's Encrypt certificate
+            certbot certonly \
+              --dns-cloudflare \
+              --dns-cloudflare-credentials /etc/ssl/cloudflare/credentials.ini \
+              --dns-cloudflare-propagation-seconds 60 \
+              --non-interactive \
+              --agree-tos \
+              --email admin@${{ env.FULL_DOMAIN }} \
+              -d ${{ env.FULL_DOMAIN }} \
+              --cert-name ${{ env.FULL_DOMAIN }}
             
-            # Set up Let's Encrypt certificates with Cloudflare DNS challenge
-            if [[ -n '${{ env.FULL_DOMAIN }}' ]] && [[ -n '${{ secrets.CLOUDFLARE_API_TOKEN }}' ]]; then
-              echo '🔒 Setting up Let'\''s Encrypt certificates via Cloudflare DNS...'
+            # Copy certificates to service directory for easy access
+            if [[ -d "/etc/letsencrypt/live/${{ env.FULL_DOMAIN }}" ]]; then
+              echo '✅ Let'\''s Encrypt certificate obtained successfully!'
+              mkdir -p "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
+              cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/fullchain.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
+              cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/privkey.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
+              chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
               
-              # Create Cloudflare credentials file
-              mkdir -p /etc/ssl/cloudflare
-              cat > /etc/ssl/cloudflare/credentials.ini << EOF
-            dns_cloudflare_api_token = ${{ secrets.CLOUDFLARE_API_TOKEN }}
-            EOF
-              chmod 600 /etc/ssl/cloudflare/credentials.ini
-              
-              # Request Let's Encrypt certificate
-              certbot certonly \
-                --dns-cloudflare \
-                --dns-cloudflare-credentials /etc/ssl/cloudflare/credentials.ini \
-                --dns-cloudflare-propagation-seconds 60 \
-                --non-interactive \
-                --agree-tos \
-                --email admin@${{ env.FULL_DOMAIN }} \
-                -d ${{ env.FULL_DOMAIN }} \
-                --cert-name ${{ env.FULL_DOMAIN }}
-              
-              # Copy certificates to service directory for easy access
-              if [[ -d \"/etc/letsencrypt/live/${{ env.FULL_DOMAIN }}\" ]]; then
-                echo '✅ Let'\''s Encrypt certificate obtained successfully!'
-                mkdir -p \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl\"
-                cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/fullchain.pem \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/\"
-                cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/privkey.pem \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/\"
-                chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl\"
-                
-                # Set up automatic renewal
-                echo '⚙️ Setting up automatic certificate renewal...'
-                (crontab -l 2>/dev/null; echo '0 12 * * * /usr/bin/certbot renew --quiet --deploy-hook \"systemctl reload nginx\"') | crontab -
-              else
-                echo '⚠️ Let'\''s Encrypt certificate request failed, continuing with self-signed certificates'
-              fi
+              # Set up automatic renewal
+              echo '⚙️ Setting up automatic certificate renewal...'
+              (crontab -l 2>/dev/null; echo '0 12 * * * /usr/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"') | crontab -
             else
-              echo '⚠️ Domain or Cloudflare API token not provided, continuing with self-signed certificates'
+              echo '⚠️ Let'\''s Encrypt certificate request failed, continuing with self-signed certificates'
+            fi
+          else
+            echo '⚠️ Domain or Cloudflare API token not provided, continuing with self-signed certificates'
+          fi
+          
+          # Final SSL verification and NGINX configuration check
+          echo '🔍 Verifying SSL certificate configuration...'
+          if [[ -f "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" ]]; then
+            echo '✅ SSL certificates found and properly configured'
+            
+            # Check certificate validity
+            openssl x509 -in "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" -text -noout | head -20
+            
+            # Verify NGINX can start with SSL configuration
+            if command -v nginx &> /dev/null; then
+              nginx -t && echo '✅ NGINX configuration is valid' || echo '⚠️ NGINX configuration has issues'
             fi
             
-            # Final SSL verification and NGINX configuration check
-            echo '🔍 Verifying SSL certificate configuration...'
-            if [[ -f \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/fullchain.pem\" ]]; then
-              echo '✅ SSL certificates found and properly configured'
-              
-              # Check certificate validity
-              openssl x509 -in \"/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/fullchain.pem\" -text -noout | head -20
-              
-              # Verify NGINX can start with SSL configuration
-              if command -v nginx &> /dev/null; then
-                nginx -t && echo '✅ NGINX configuration is valid' || echo '⚠️ NGINX configuration has issues'
-              fi
-              
-              # Test HTTPS connectivity (if service is listening)
-              sleep 10
-              curl -k -I https://${{ env.FULL_DOMAIN }} 2>/dev/null | head -5 || echo '⚠️ Service not yet responding on HTTPS (this is normal during startup)'
-            else
-              echo '❌ SSL certificates not found - check certificate generation logs above'
-            fi
-            
-            echo '🎯 SSL certificate automation complete!'
-          "
+            # Test HTTPS connectivity (if service is listening)
+            sleep 10
+            curl -k -I https://${{ env.FULL_DOMAIN }} 2>/dev/null | head -5 || echo '⚠️ Service not yet responding on HTTPS (this is normal during startup)'
+          else
+            echo '❌ SSL certificates not found - check certificate generation logs above'
+          fi
+          
+          echo '🎯 SSL certificate automation complete!'
+          DEPLOY_SCRIPT_EOF
+          
+          chmod +x /tmp/service-deploy.sh
+          
+          # Transfer and execute deployment script
+          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no /tmp/service-deploy.sh root@$SERVER_IP:/tmp/
+          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "/tmp/service-deploy.sh"
           
           echo "status=success" >> $GITHUB_OUTPUT
 
