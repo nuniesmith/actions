@@ -981,13 +981,26 @@ jobs:
           fi
       
       - name: 📢 Send Discord Notification
-        if: always() && env.DISCORD_WEBHOOK_URL != ''
+        if: always()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DEPLOYMENT_STATUS: ${{ (needs.service-deploy.result == 'success' || needs.service-restart.result == 'success' || needs.service-destroy.result == 'success') && 'SUCCESS' || 'FAILED' }}
           SERVICE_NAME: ${{ env.SERVICE_NAME }}
           ACTION_TYPE: ${{ inputs.action_type || 'deploy' }}
         run: |
+          echo "📢 Preparing Discord notification..."
+          
+          # Validate webhook URL before proceeding
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "⚠️ Discord webhook URL is empty - skipping notification"
+            exit 0
+          fi
+          
+          if [[ ! "$DISCORD_WEBHOOK_URL" =~ ^https://discord(app)?\.com/api/webhooks/ ]]; then
+            echo "⚠️ Invalid Discord webhook URL format - skipping notification"
+            exit 0
+          fi
+          
           echo "📢 Sending Discord notification..."
           
           # Determine color based on status
@@ -1025,10 +1038,13 @@ jobs:
           }
           EOF
           
-          # Send notification to Discord
-          curl -H "Content-Type: application/json" \\
-               -d @/tmp/discord_payload.json \\
-               "$DISCORD_WEBHOOK_URL"
-          
-          echo "✅ Discord notification sent"
+          # Send notification to Discord with proper error handling
+          if curl -f -H "Content-Type: application/json" \
+               -d @/tmp/discord_payload.json \
+               "$DISCORD_WEBHOOK_URL"; then
+            echo "✅ Discord notification sent successfully"
+          else
+            echo "❌ Failed to send Discord notification (webhook may be invalid or Discord may be unreachable)"
+            exit 0  # Don't fail the workflow for notification failures
+          fi
 
