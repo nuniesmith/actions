@@ -973,16 +973,16 @@ jobs:
             
             # Request Let's Encrypt certificate with error handling
             # Handle multiple domains by converting comma-separated list to multiple -d flags
-            DOMAIN_FLAGS=""
-            IFS=',' read -ra DOMAINS <<< "${{ env.FULL_DOMAIN }}"
-            PRIMARY_DOMAIN=""
-            for domain in "\${DOMAINS[@]}"; do
-              domain=\$(echo "\$domain" | xargs)  # trim whitespace
-              if [[ -z "\$PRIMARY_DOMAIN" ]]; then
-                PRIMARY_DOMAIN="\$domain"
-              fi
-              DOMAIN_FLAGS="\$DOMAIN_FLAGS -d \$domain"
-            done
+            FULL_DOMAIN_STR="${{ env.FULL_DOMAIN }}"
+            
+            # Simple approach: replace commas with -d flags
+            DOMAIN_FLAGS=\$(echo "\$FULL_DOMAIN_STR" | sed 's/,/ -d /g' | sed 's/^/-d /')
+            
+            # Get the primary domain (first one before any comma)
+            PRIMARY_DOMAIN=\$(echo "\$FULL_DOMAIN_STR" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')
+            
+            echo "🔍 Primary domain: \$PRIMARY_DOMAIN"
+            echo "🔍 Domain flags: \$DOMAIN_FLAGS"
             
             if certbot certonly \
               --dns-cloudflare \
