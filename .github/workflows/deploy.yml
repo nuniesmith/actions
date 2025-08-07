@@ -543,12 +543,39 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
         run: |
+          # Debug: Show all infrastructure outputs
+          echo "🔍 DEBUG: Infrastructure job result: ${{ needs.infrastructure.result }}"
+          echo "🔍 DEBUG: Infrastructure outputs:"
+          echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
+          echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
+          echo "  tailscale_ip: '${{ needs.infrastructure.outputs.tailscale_ip }}'"
+          echo "  ssh_key: $(echo '${{ needs.infrastructure.outputs.ssh_key }}' | wc -c) characters"
+          echo "🔍 DEBUG: SERVER_IP env var: '$SERVER_IP'"
+          echo ""
+          
+          # Verify prerequisites
+          if [[ "${{ needs.infrastructure.result }}" != "success" ]]; then
+            echo "❌ ERROR: Infrastructure job did not complete successfully!"
+            echo "Infrastructure result: ${{ needs.infrastructure.result }}"
+            exit 1
+          fi
+          
+          if [[ -z "$SERVER_IP" ]]; then
+            echo "❌ ERROR: SERVER_IP is empty! Cannot deploy without server IP."
+            exit 1
+          fi
+          
+          if [[ -z "${{ needs.infrastructure.outputs.ssh_key }}" ]]; then
+            echo "❌ ERROR: SSH key is empty! Cannot deploy without SSH access."
+            exit 1
+          fi
+          
           # Setup SSH key
           mkdir -p ~/.ssh
           echo "${{ needs.infrastructure.outputs.ssh_key }}" | base64 -d > ~/.ssh/deployment_key
           chmod 600 ~/.ssh/deployment_key
           
-          echo "🚀 Deploying ${{ env.SERVICE_NAME }} service..."
+          echo "🚀 Deploying ${{ env.SERVICE_NAME }} service to server: $SERVER_IP"
           
           # Create deployment script locally to avoid command line length limits
           cat > /tmp/service-deploy.sh << 'DEPLOY_SCRIPT_EOF'
@@ -735,7 +762,10 @@ jobs:
           chmod +x /tmp/service-deploy.sh
           
           # Transfer and execute deployment script
+          echo "📤 Transferring deployment script to server..."
           scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no /tmp/service-deploy.sh root@$SERVER_IP:/tmp/
+          
+          echo "🚀 Executing deployment script on server..."
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "/tmp/service-deploy.sh"
           
           echo "status=success" >> $GITHUB_OUTPUT
