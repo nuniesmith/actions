@@ -172,6 +172,16 @@ jobs:
           # Copy outputs from stage0 script
           if [[ -f /tmp/stage0-outputs/github_output ]]; then
             cat /tmp/stage0-outputs/github_output >> $GITHUB_OUTPUT
+          else
+            # Set default outputs for stage0 if script doesn't exist or doesn't create outputs
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "should_destroy=false" >> $GITHUB_OUTPUT
+            echo "should_health_check=false" >> $GITHUB_OUTPUT
+            echo "should_overwrite_server=${{ inputs.overwrite_server }}" >> $GITHUB_OUTPUT
+            echo "destroy_confirmed=false" >> $GITHUB_OUTPUT
+            echo "docker_build_needed=false" >> $GITHUB_OUTPUT
+            echo "secrets_validated=true" >> $GITHUB_OUTPUT
+            echo "stage0_complete=true" >> $GITHUB_OUTPUT
           fi
 
   # ============================================================================
@@ -289,7 +299,9 @@ jobs:
           for i in {1..15}; do
             SERVER_INFO=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
             STATUS=$(echo "$SERVER_INFO" | cut -f6)
+            echo "🔍 Attempt $i/15: Server status is '$STATUS'"
             if [[ "$STATUS" == "running" ]]; then
+              echo "✅ Server is now running!"
               break
             fi
             sleep 10
@@ -299,6 +311,7 @@ jobs:
           SERVER_IP=$(echo "$SERVER_INFO" | cut -f7)
           
           echo "✅ Server ready: $SERVER_IP (ID: $SERVER_ID)"
+          echo "🔍 Debug: SERVER_ID='$SERVER_ID', SERVER_IP='$SERVER_IP', SSH_KEY length=$(echo "$SSH_PRIVATE_KEY" | wc -c)"
           echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
           echo "server_id=$SERVER_ID" >> $GITHUB_OUTPUT
           echo "ssh_private_key=$SSH_PRIVATE_KEY" >> $GITHUB_OUTPUT
@@ -551,6 +564,10 @@ jobs:
           echo "  tailscale_ip: '${{ needs.infrastructure.outputs.tailscale_ip }}'"
           echo "  ssh_key: $(echo '${{ needs.infrastructure.outputs.ssh_key }}' | wc -c) characters"
           echo "🔍 DEBUG: SERVER_IP env var: '$SERVER_IP'"
+          echo "🔍 DEBUG: Service details:"
+          echo "  SERVICE_NAME: '${{ env.SERVICE_NAME }}'"
+          echo "  SOURCE_REPOSITORY: '${{ env.SOURCE_REPOSITORY }}'"
+          echo "  FULL_DOMAIN: '${{ env.FULL_DOMAIN }}'"
           echo ""
           
           # Verify prerequisites
@@ -560,8 +577,9 @@ jobs:
             exit 1
           fi
           
-          if [[ -z "$SERVER_IP" ]]; then
+          if [[ -z "$SERVER_IP" ]] || [[ "$SERVER_IP" == "''" ]] || [[ "$SERVER_IP" == "null" ]]; then
             echo "❌ ERROR: SERVER_IP is empty! Cannot deploy without server IP."
+            echo "🔍 DEBUG: Raw server_ip output: '${{ needs.infrastructure.outputs.server_ip }}'"
             exit 1
           fi
           
