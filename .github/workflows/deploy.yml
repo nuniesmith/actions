@@ -606,6 +606,13 @@ jobs:
             # Set ownership to service user for the repository directory
             chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/"\$REPO_DIR"
             
+            # Change to repository directory for deployment file detection and execution
+            cd /home/${{ env.SERVICE_NAME }}_user/"\$REPO_DIR"
+            
+            echo \"🔍 Checking deployment options in directory: \$(pwd)\"
+            echo \"📁 Available files:\"
+            ls -la
+            
             # Deploy using start.sh if available
             if [[ -f 'start.sh' ]]; then
               echo '🚀 Found start.sh - using custom deployment script'
