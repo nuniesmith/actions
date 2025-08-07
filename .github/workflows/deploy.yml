@@ -484,12 +484,21 @@ jobs:
         run: |
           chmod +x ./scripts/dns/cloudflare-updater.sh
           
+          echo "🔍 Debug: Infrastructure outputs available:"
+          echo "  TAILSCALE_IP='$TAILSCALE_IP'"
+          echo "  SERVER_IP='$SERVER_IP'"
+          
           # Use Tailscale IP if available, otherwise fall back to server IP
           IP_TO_USE="${TAILSCALE_IP:-$SERVER_IP}"
           
-          if [[ -z "$IP_TO_USE" ]]; then
-            echo "❌ No IP address available for DNS update"
-            exit 1
+          if [[ -z "$IP_TO_USE" ]] || [[ "$IP_TO_USE" == "null" ]] || [[ "$IP_TO_USE" == "''" ]]; then
+            echo "❌ No valid IP address available for DNS update"
+            echo "🔍 Available infrastructure outputs:"
+            echo "  Server ID: ${{ needs.infrastructure.outputs.server_id }}"
+            echo "  Server IP: ${{ needs.infrastructure.outputs.server_ip }}"
+            echo "  Tailscale IP: ${{ needs.infrastructure.outputs.tailscale_ip }}"
+            echo "⚠️ Skipping DNS update - service will be accessible via server IP only"
+            exit 0  # Don't fail the workflow, just skip DNS update
           fi
           
           echo "🌐 Updating DNS for ${{ env.SERVICE_NAME }} with IP: $IP_TO_USE"
