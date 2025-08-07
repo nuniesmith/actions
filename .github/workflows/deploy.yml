@@ -814,19 +814,29 @@ jobs:
             echo '🔒 Installing Certbot for Let'\''s Encrypt certificates...'
             # Update package database first
             pacman -Sy --noconfirm
-            # Install certbot and cloudflare DNS plugin (correct Arch Linux package names)
-            if ! pacman -S --noconfirm certbot certbot-dns-cloudflare; then
+            # Install certbot, cloudflare DNS plugin, and cronie for cron jobs (correct Arch Linux package names)
+            if ! pacman -S --noconfirm certbot certbot-dns-cloudflare cronie; then
               echo '⚠️ Failed to install certbot via pacman, trying alternative approach...'
               # Fallback: Install via pip if pacman fails
-              pacman -S --noconfirm python-pip
+              pacman -S --noconfirm python-pip cronie
               pip install certbot certbot-dns-cloudflare
             fi
+            
+            # Start and enable cronie service for cron jobs
+            systemctl enable --now cronie || echo '⚠️ Failed to start cronie service'
             
             # Verify installation
             if command -v certbot &> /dev/null; then
               echo '✅ Certbot installed successfully'
             else
               echo '⚠️ Certbot installation failed, will continue with self-signed certificates only'
+            fi
+            
+            # Verify crontab is available
+            if command -v crontab &> /dev/null; then
+              echo '✅ Crontab (cronie) installed successfully'
+            else
+              echo '⚠️ Crontab installation failed, automatic renewal will not be set up'
             fi
           fi
           
@@ -867,7 +877,13 @@ jobs:
               
               # Set up automatic renewal
               echo '⚙️ Setting up automatic certificate renewal...'
-              (crontab -l 2>/dev/null; echo '0 12 * * * /usr/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"') | crontab -
+              if command -v crontab >/dev/null 2>&1; then
+                (crontab -l 2>/dev/null; echo '0 12 * * * /usr/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"') | crontab -
+                echo '✅ Certificate renewal cron job set up successfully'
+              else
+                echo '❌ Warning: crontab command not found - manual renewal may be required'
+                echo 'Manual renewal command: certbot renew --quiet --deploy-hook "systemctl reload nginx"'
+              fi
             else
               echo '⚠️ Let'\''s Encrypt certificate request failed, continuing with self-signed certificates'
             fi
