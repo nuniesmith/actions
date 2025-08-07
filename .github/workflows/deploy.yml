@@ -310,6 +310,26 @@ jobs:
           # Extract server IP
           SERVER_IP=$(echo "$SERVER_INFO" | cut -f7)
           
+          # Validate outputs before setting them
+          if [[ -z "$SERVER_ID" ]]; then
+            echo "❌ ERROR: SERVER_ID is empty!"
+            echo "🔍 SERVER_INFO: $SERVER_INFO"
+            echo "🔍 RESULT: $RESULT"
+            exit 1
+          fi
+          
+          if [[ -z "$SERVER_IP" ]]; then
+            echo "❌ ERROR: SERVER_IP is empty!"
+            echo "🔍 SERVER_INFO: $SERVER_INFO"
+            echo "🔍 RESULT: $RESULT"
+            exit 1
+          fi
+          
+          if [[ -z "$SSH_PRIVATE_KEY" ]]; then
+            echo "❌ ERROR: SSH_PRIVATE_KEY is empty!"
+            exit 1
+          fi
+          
           echo "✅ Server ready: $SERVER_IP (ID: $SERVER_ID)"
           echo "🔍 Debug: SERVER_ID='$SERVER_ID', SERVER_IP='$SERVER_IP', SSH_KEY length=$(echo "$SSH_PRIVATE_KEY" | wc -c)"
           echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
@@ -469,6 +489,32 @@ jobs:
           echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
           echo "✅ Stage 2 setup completed"
 
+      - name: 🔍 Debug Infrastructure Outputs
+        run: |
+          echo "🔍 DEBUG: Infrastructure job completion check"
+          echo "  Linode outputs:"
+          echo "    server_id: '${{ steps.linode.outputs.server_id }}'"
+          echo "    server_ip: '${{ steps.linode.outputs.server_ip }}'"
+          echo "    ssh_private_key length: $(echo '${{ steps.linode.outputs.ssh_private_key }}' | wc -c)"
+          echo "  Stage2 outputs:"
+          echo "    tailscale_ip: '${{ steps.stage2.outputs.tailscale_ip }}'"
+          echo ""
+          
+          # Validate critical outputs
+          if [[ -z "${{ steps.linode.outputs.server_ip }}" ]]; then
+            echo "❌ ERROR: server_ip is empty!"
+            echo "🔍 Linode step may have failed or not set outputs properly"
+            exit 1
+          fi
+          
+          if [[ -z "${{ steps.linode.outputs.server_id }}" ]]; then
+            echo "❌ ERROR: server_id is empty!"
+            echo "🔍 Linode step may have failed or not set outputs properly"
+            exit 1
+          fi
+          
+          echo "✅ Infrastructure outputs validation passed"
+
   # ============================================================================
   # DNS Updates
   # ============================================================================
@@ -544,6 +590,28 @@ jobs:
         with:
           repository: nuniesmith/actions
           token: ${{ github.token }}
+      
+      - name: 🔍 Debug Infrastructure Outputs
+        run: |
+          echo "🔍 DEBUG: Infrastructure job result: ${{ needs.infrastructure.result }}"
+          echo "🔍 DEBUG: Infrastructure outputs:"
+          echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
+          echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
+          echo "  tailscale_ip: '${{ needs.infrastructure.outputs.tailscale_ip }}'"
+          echo "  ssh_key: $(echo '${{ needs.infrastructure.outputs.ssh_key }}' | wc -c) characters"
+          echo "🔍 DEBUG: SERVER_IP env var: '${{ needs.infrastructure.outputs.server_ip }}'"
+          echo "🔍 DEBUG: Service details:"
+          echo "  SERVICE_NAME: '${{ inputs.service_name }}'"
+          echo "  SOURCE_REPOSITORY: '${{ inputs.source_repository }}'"
+          echo "  FULL_DOMAIN: '${{ inputs.custom_domain }}'"
+          echo ""
+          
+          # Check if SERVER_IP is empty and exit with error
+          if [[ -z "${{ needs.infrastructure.outputs.server_ip }}" ]]; then
+            echo "❌ ERROR: SERVER_IP is empty! Cannot deploy without server IP."
+            echo "🔍 DEBUG: Raw server_ip output: '${{ needs.infrastructure.outputs.server_ip }}'"
+            exit 1
+          fi
       
       - name: 🚀 Deploy Service
         id: deploy
