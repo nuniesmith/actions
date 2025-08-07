@@ -598,14 +598,17 @@ jobs:
             
             # Deploy using start.sh if available
             if [[ -f 'start.sh' ]]; then
+              echo '🚀 Found start.sh - using custom deployment script'
               chmod +x start.sh
               su - ${{ env.SERVICE_NAME }}_user -c "cd /home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR && ./start.sh"
             elif [[ -f 'docker-compose.yml' ]]; then
+              echo '🐳 Found docker-compose.yml - using Docker Compose deployment'
               docker-compose down 2>/dev/null || true
               docker-compose up -d
             # Check for service-specific docker-compose files (e.g., docker-compose.auth.yml for fks-auth)
             elif [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
               SERVICE_TYPE='\${SERVICE_NAME#fks-}'  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
+              echo \"🔍 FKS service detected: ${{ env.SERVICE_NAME }}, looking for docker-compose.\$SERVICE_TYPE.yml\"
               if [[ -f \"docker-compose.\$SERVICE_TYPE.yml\" ]]; then
                 echo \"🐳 Using service-specific compose file: docker-compose.\$SERVICE_TYPE.yml\"
                 docker-compose -f \"docker-compose.\$SERVICE_TYPE.yml\" down 2>/dev/null || true
@@ -619,7 +622,10 @@ jobs:
                 exit 1
               fi
             else
-              echo '❌ No deployment method found (start.sh or docker-compose.yml missing)'
+              echo \"❌ No deployment method found for service: ${{ env.SERVICE_NAME }}\"
+              echo \"🔍 Available files in directory:\"
+              ls -la
+              echo \"📂 Current working directory: \$(pwd)\"
               exit 1
             fi
             
