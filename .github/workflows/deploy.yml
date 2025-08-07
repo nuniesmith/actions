@@ -466,7 +466,6 @@ jobs:
     needs: [infrastructure]
     if: |
       needs.infrastructure.result == 'success' &&
-      needs.infrastructure.outputs.tailscale_ip != '' &&
       inputs.action_type == 'deploy'
     
     steps:
@@ -481,11 +480,22 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           TAILSCALE_IP: ${{ needs.infrastructure.outputs.tailscale_ip }}
+          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
         run: |
           chmod +x ./scripts/dns/cloudflare-updater.sh
+          
+          # Use Tailscale IP if available, otherwise fall back to server IP
+          IP_TO_USE="${TAILSCALE_IP:-$SERVER_IP}"
+          
+          if [[ -z "$IP_TO_USE" ]]; then
+            echo "❌ No IP address available for DNS update"
+            exit 1
+          fi
+          
+          echo "🌐 Updating DNS for ${{ env.SERVICE_NAME }} with IP: $IP_TO_USE"
           ./scripts/dns/cloudflare-updater.sh update-service \
             --service "${{ env.SERVICE_NAME }}" \
-            --ip "$TAILSCALE_IP" \
+            --ip "$IP_TO_USE" \
             --domain "${{ inputs.domain_suffix }}" \
             --token "$CLOUDFLARE_API_TOKEN" \
             --zone-id "$CLOUDFLARE_ZONE_ID"
