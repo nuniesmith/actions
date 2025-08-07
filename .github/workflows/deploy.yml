@@ -711,11 +711,26 @@ jobs:
           # Install Certbot if not already installed
           if ! command -v certbot &> /dev/null; then
             echo '🔒 Installing Certbot for Let'\''s Encrypt certificates...'
-            pacman -Sy --noconfirm certbot python-certbot-dns-cloudflare
+            # Update package database first
+            pacman -Sy --noconfirm
+            # Install certbot and cloudflare DNS plugin (correct Arch Linux package names)
+            if ! pacman -S --noconfirm certbot certbot-dns-cloudflare; then
+              echo '⚠️ Failed to install certbot via pacman, trying alternative approach...'
+              # Fallback: Install via pip if pacman fails
+              pacman -S --noconfirm python-pip
+              pip install certbot certbot-dns-cloudflare
+            fi
+            
+            # Verify installation
+            if command -v certbot &> /dev/null; then
+              echo '✅ Certbot installed successfully'
+            else
+              echo '⚠️ Certbot installation failed, will continue with self-signed certificates only'
+            fi
           fi
           
           # Set up Let's Encrypt certificates with Cloudflare DNS challenge
-          if [[ -n '${{ env.FULL_DOMAIN }}' ]] && [[ -n '${{ secrets.CLOUDFLARE_API_TOKEN }}' ]]; then
+          if [[ -n '${{ env.FULL_DOMAIN }}' ]] && [[ -n '${{ secrets.CLOUDFLARE_API_TOKEN }}' ]] && command -v certbot &> /dev/null; then
             echo '🔒 Setting up Let'\''s Encrypt certificates via Cloudflare DNS...'
             
             # Create Cloudflare credentials file
@@ -725,20 +740,25 @@ jobs:
           EOF
             chmod 600 /etc/ssl/cloudflare/credentials.ini
             
-            # Request Let's Encrypt certificate
-            certbot certonly \
+            # Request Let's Encrypt certificate with error handling
+            if certbot certonly \
               --dns-cloudflare \
               --dns-cloudflare-credentials /etc/ssl/cloudflare/credentials.ini \
               --dns-cloudflare-propagation-seconds 60 \
               --non-interactive \
               --agree-tos \
-              --email admin@${{ env.FULL_DOMAIN }} \
+              --email ${{ secrets.ADMIN_EMAIL }} \
               -d ${{ env.FULL_DOMAIN }} \
-              --cert-name ${{ env.FULL_DOMAIN }}
+              --cert-name ${{ env.FULL_DOMAIN }}; then
+              
+              echo '✅ Let'\''s Encrypt certificate obtained successfully!'
+            else
+              echo '⚠️ Let'\''s Encrypt certificate request failed, continuing with self-signed certificates'
+            fi
             
             # Copy certificates to service directory for easy access
             if [[ -d "/etc/letsencrypt/live/${{ env.FULL_DOMAIN }}" ]]; then
-              echo '✅ Let'\''s Encrypt certificate obtained successfully!'
+              echo '📋 Copying Let'\''s Encrypt certificates to service directory...'
               mkdir -p "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
               cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/fullchain.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
               cp /etc/letsencrypt/live/${{ env.FULL_DOMAIN }}/privkey.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
@@ -751,16 +771,31 @@ jobs:
               echo '⚠️ Let'\''s Encrypt certificate request failed, continuing with self-signed certificates'
             fi
           else
-            echo '⚠️ Domain or Cloudflare API token not provided, continuing with self-signed certificates'
+            echo '⚠️ Domain, Cloudflare API token not provided, or Certbot not available - continuing with self-signed certificates'
           fi
           
           # Final SSL verification and NGINX configuration check
           echo '🔍 Verifying SSL certificate configuration...'
+          
+          # Check for Let's Encrypt certificates first
           if [[ -f "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" ]]; then
             echo '✅ SSL certificates found and properly configured'
+            echo '🔍 Certificate type: Let'\''s Encrypt (from service directory)'
             
             # Check certificate validity
-            openssl x509 -in "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" -text -noout | head -20
+            openssl x509 -in "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" -text -noout | head -20 || echo '⚠️ Certificate validation failed'
+          elif [[ -f "/etc/ssl/selfsigned/cert.pem" ]]; then
+            echo '✅ Self-signed SSL certificates available'
+            echo '🔍 Certificate type: Self-signed (fallback)'
+            
+            # Copy self-signed certificates to service directory for consistency
+            mkdir -p "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
+            cp /etc/ssl/selfsigned/cert.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem"
+            cp /etc/ssl/selfsigned/key.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/privkey.pem"
+            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
+          else
+            echo '❌ No SSL certificates found - this may cause issues with HTTPS'
+          fi
             
             # Verify NGINX can start with SSL configuration
             if command -v nginx &> /dev/null; then
