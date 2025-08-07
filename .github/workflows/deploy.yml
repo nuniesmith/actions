@@ -1022,8 +1022,6 @@ jobs:
           curl -k -I https://${{ env.FULL_DOMAIN }} 2>/dev/null | head -5 || echo '⚠️ Service not yet responding on HTTPS (this is normal during startup)'
           
           echo '🎯 SSL certificate automation complete!'
-          
-          echo '🎯 SSL certificate automation complete!'
           DEPLOY_SCRIPT_EOF
           
           chmod +x /tmp/service-deploy.sh
