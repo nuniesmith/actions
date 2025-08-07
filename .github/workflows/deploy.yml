@@ -199,8 +199,20 @@ jobs:
       server_ip: ${{ steps.linode.outputs.server_ip }}
       tailscale_ip: ${{ steps.stage2.outputs.tailscale_ip }}
       ssh_key: ${{ steps.linode.outputs.ssh_private_key }}
+      debug_info: "linode_completed:${{ steps.linode.conclusion }},stage2_completed:${{ steps.stage2.conclusion }}"
     
     steps:
+      - name: 🔍 Debug Infrastructure Job Start
+        run: |
+          echo "🔍 DEBUG: Infrastructure job starting..."
+          echo "🔍 DEBUG: Stage0 outputs:"
+          echo "  should_deploy: '${{ needs.stage0-preflight.outputs.should_deploy }}'"
+          echo "  should_destroy: '${{ needs.stage0-preflight.outputs.should_destroy }}'"
+          echo "  stage0_complete: '${{ needs.stage0-preflight.outputs.stage0_complete }}'"
+          echo "🔍 DEBUG: Infrastructure job condition check:"
+          echo "  needs.stage0-preflight.outputs.should_deploy == 'true': ${{ needs.stage0-preflight.outputs.should_deploy == 'true' }}"
+          echo "✅ Infrastructure job is running!"
+      
       - name: 📁 Checkout Actions
         uses: actions/checkout@v4
         with:
@@ -504,16 +516,19 @@ jobs:
           if [[ -z "${{ steps.linode.outputs.server_ip }}" ]]; then
             echo "❌ ERROR: server_ip is empty!"
             echo "🔍 Linode step may have failed or not set outputs properly"
+            echo "🔍 Check if Linode server creation completed successfully"
             exit 1
           fi
           
           if [[ -z "${{ steps.linode.outputs.server_id }}" ]]; then
             echo "❌ ERROR: server_id is empty!"
             echo "🔍 Linode step may have failed or not set outputs properly"
+            echo "🔍 Check if Linode server creation completed successfully"
             exit 1
           fi
           
           echo "✅ Infrastructure outputs validation passed"
+          echo "🔍 All required infrastructure outputs are present"
 
   # ============================================================================
   # DNS Updates
@@ -594,6 +609,7 @@ jobs:
       - name: 🔍 Debug Infrastructure Outputs
         run: |
           echo "🔍 DEBUG: Infrastructure job result: ${{ needs.infrastructure.result }}"
+          echo "🔍 DEBUG: DNS job result: ${{ needs.dns-update.result }}"
           echo "🔍 DEBUG: Infrastructure outputs:"
           echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
           echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
@@ -606,10 +622,27 @@ jobs:
           echo "  FULL_DOMAIN: '${{ inputs.custom_domain }}'"
           echo ""
           
+          # Additional debugging for job status
+          echo "🔍 DEBUG: Job dependencies status:"
+          echo "  infrastructure.result: '${{ needs.infrastructure.result }}'"
+          echo "  dns-update.result: '${{ needs.dns-update.result }}'"
+          echo "  infrastructure.debug_info: '${{ needs.infrastructure.outputs.debug_info }}'"
+          echo ""
+          
+          # Check if infrastructure job actually completed
+          if [[ "${{ needs.infrastructure.result }}" != "success" ]]; then
+            echo "❌ ERROR: Infrastructure job did not complete successfully!"
+            echo "Infrastructure result: ${{ needs.infrastructure.result }}"
+            echo "🔍 This explains why outputs are empty - the infrastructure job failed"
+            exit 1
+          fi
+          
           # Check if SERVER_IP is empty and exit with error
-          if [[ -z "${{ needs.infrastructure.outputs.server_ip }}" ]]; then
-            echo "❌ ERROR: SERVER_IP is empty! Cannot deploy without server IP."
+          if [[ -z "${{ needs.infrastructure.outputs.server_ip }}" ]] || [[ "${{ needs.infrastructure.outputs.server_ip }}" == "null" ]]; then
+            echo "❌ ERROR: SERVER_IP is empty or null! Cannot deploy without server IP."
             echo "🔍 DEBUG: Raw server_ip output: '${{ needs.infrastructure.outputs.server_ip }}'"
+            echo "🔍 DEBUG: This indicates the infrastructure job completed but didn't set outputs properly"
+            echo "🔍 DEBUG: Check the infrastructure job logs for failed steps"
             exit 1
           fi
       
