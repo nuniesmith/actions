@@ -869,28 +869,6 @@ jobs:
           echo "📁 Available files:"
           ls -la
           
-          # Create Docker networks if needed, now that we have the application context
-          echo "🌐 Setting up Docker networks for ${{ env.SERVICE_NAME }}..."
-          
-          # Create service-specific network to avoid conflicts with Docker's default networks
-          case '${{ env.SERVICE_NAME }}' in
-            "nginx")
-              docker network create --driver bridge --subnet=172.22.0.0/16 nginx-network 2>/dev/null || echo "ℹ️ nginx-network already exists or creation failed"
-              ;;
-            "fks"|"fks-"*)
-              docker network create --driver bridge --subnet=172.20.0.0/16 fks-network 2>/dev/null || echo "ℹ️ fks-network already exists or creation failed"
-              ;;
-            "ats")
-              docker network create --driver bridge --subnet=172.21.0.0/16 ats-network 2>/dev/null || echo "ℹ️ ats-network already exists or creation failed"
-              ;;
-            *)
-              docker network create --driver bridge ${{ env.SERVICE_NAME }}-network 2>/dev/null || echo "ℹ️ ${{ env.SERVICE_NAME }}-network already exists or creation failed"
-              ;;
-          esac
-          
-          echo "🔍 Available Docker networks:"
-          docker network ls
-          
           # Configure service-specific environment variables for universal template
           echo '🔧 Configuring service-specific settings for universal template...'
           case '${{ env.SERVICE_NAME }}' in
@@ -939,13 +917,30 @@ jobs:
           # Export service name for template
           export SERVICE_NAME='${{ env.SERVICE_NAME }}'
           
+          echo "✅ Service configuration completed for \$SERVICE_DISPLAY_NAME"
+          echo "🔍 Docker networks will be managed by the service startup script"
+          
           echo "✅ Service configuration completed for $SERVICE_DISPLAY_NAME"
           
           # Deploy using start.sh if available
           if [[ -f 'start.sh' ]]; then
             echo '🚀 Found start.sh - using custom deployment script'
             chmod +x start.sh
-            su - ${{ env.SERVICE_NAME }}_user -c "cd /home/${{ env.SERVICE_NAME }}_user/$REPO_DIR && ./start.sh"
+            
+            # Pass environment variables to service user for universal template
+            su - ${{ env.SERVICE_NAME }}_user -c "
+              export SERVICE_NAME='$SERVICE_NAME'
+              export SERVICE_DISPLAY_NAME='$SERVICE_DISPLAY_NAME'
+              export DEFAULT_HTTP_PORT='$DEFAULT_HTTP_PORT'
+              export DEFAULT_HTTPS_PORT='$DEFAULT_HTTPS_PORT'
+              export SUPPORTS_GPU='$SUPPORTS_GPU'
+              export SUPPORTS_MINIMAL='$SUPPORTS_MINIMAL'
+              export SUPPORTS_DEV='$SUPPORTS_DEV'
+              export HAS_NETDATA='$HAS_NETDATA'
+              export HAS_SSL='$HAS_SSL'
+              export GITHUB_ACTIONS='$GITHUB_ACTIONS'
+              cd /home/${{ env.SERVICE_NAME }}_user/$REPO_DIR && ./start.sh
+            "
           elif [[ -f 'docker-compose.yml' ]]; then
             echo '🐳 Found docker-compose.yml - using Docker Compose deployment'
             docker-compose down 2>/dev/null || true
