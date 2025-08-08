@@ -5,8 +5,32 @@ echo "🚀 Stage 2: Post-reboot setup starting..."
 
 # Source environment variables if available
 if [[ -f /opt/stage2-env.sh ]]; then
-  echo "🔧 Loading environment variables from stage2-env.sh..."
-  source /opt/stage2-env.sh
+  echo "🔧 Loading environment variables from stage2-env.sh..."# Skip Docker network creation in stage2 - let the application deployment handle it
+echo "ℹ️ Docker network creation will be handled during application deployment"
+echo "🧪 Verifying Docker basic functionality..."
+docker network ls
+
+echo "⏳ Waiting for Docker networking to stabilize..."
+sleep 10
+
+# Test Docker network creation to ensure iptables fix worked
+echo "🧪 Testing Docker network creation capability..."
+TEST_NETWORK="test-docker-fix-$(date +%s)"
+if docker network create "$TEST_NETWORK" >/dev/null 2>&1; then
+    echo "✅ Docker network creation test successful"
+    docker network rm "$TEST_NETWORK" >/dev/null 2>&1
+    echo "✅ Docker iptables fix confirmed working"
+else
+    echo "❌ Docker network creation test failed"
+    echo "🔍 Checking Docker daemon logs..."
+    journalctl -u docker --no-pager -l --since="5 minutes ago" | tail -20 || true
+    echo "⚠️ Docker networking may still have issues - check deployment logs"
+fi
+
+# Verify Docker is working properly before proceeding
+echo "🔍 Verifying Docker network status..."
+docker network ls
+docker info | grep -A 5 "Network:"pt/stage2-env.sh
   echo "✅ Environment variables loaded"
   # Check if environment variables are available (safe syntax)
   if [[ -n "${TS_OAUTH_CLIENT_ID_ENV:-}" ]]; then
@@ -168,15 +192,31 @@ ufw default allow outgoing
 ufw allow ssh
 
 echo "🔧 Initializing iptables chains for Docker..."
-# Create all necessary Docker chains
-iptables -t nat -N DOCKER 2>/dev/null || true
-iptables -t filter -N DOCKER 2>/dev/null || true
-iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
-iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
-iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
-iptables -t filter -N DOCKER-USER 2>/dev/null || true
+# Create all necessary Docker chains with improved error handling
+create_docker_chain() {
+    local table="$1"
+    local chain="$2"
+    
+    if ! iptables -t "$table" -L "$chain" >/dev/null 2>&1; then
+        echo "  Creating $table/$chain chain..."
+        iptables -t "$table" -N "$chain" 2>/dev/null || true
+    else
+        echo "  Chain $table/$chain already exists"
+    fi
+}
+
+# Create NAT chains
+create_docker_chain "nat" "DOCKER"
+
+# Create FILTER chains (including the missing DOCKER-CT chain)
+create_docker_chain "filter" "DOCKER"
+create_docker_chain "filter" "DOCKER-ISOLATION-STAGE-1"
+create_docker_chain "filter" "DOCKER-ISOLATION-STAGE-2"
+create_docker_chain "filter" "DOCKER-USER"
+create_docker_chain "filter" "DOCKER-CT"
 
 # Set up the chain rules that Docker expects
+echo "  Setting up Docker chain rules..."
 iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
   iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
 iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \

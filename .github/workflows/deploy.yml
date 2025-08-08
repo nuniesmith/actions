@@ -943,6 +943,63 @@ jobs:
             "
           elif [[ -f 'docker-compose.yml' ]]; then
             echo '🐳 Found docker-compose.yml - using Docker Compose deployment'
+            
+            # Pre-deployment Docker network test and fix
+            echo '🔧 Testing Docker network functionality before deployment...'
+            if ! docker network create test-network-$(date +%s) &>/dev/null; then
+              echo '⚠️ Docker network creation failed - applying iptables fix...'
+              
+              # Apply Docker iptables fix
+              systemctl stop docker.service || true
+              sleep 3
+              
+              # Clean up existing Docker iptables chains
+              iptables -t nat -F DOCKER 2>/dev/null || true
+              iptables -t filter -F DOCKER 2>/dev/null || true
+              iptables -t filter -F DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              iptables -t filter -F DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              iptables -t filter -F DOCKER-USER 2>/dev/null || true
+              iptables -t filter -F DOCKER-CT 2>/dev/null || true
+              
+              iptables -t nat -X DOCKER 2>/dev/null || true
+              iptables -t filter -X DOCKER 2>/dev/null || true
+              iptables -t filter -X DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              iptables -t filter -X DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              iptables -t filter -X DOCKER-USER 2>/dev/null || true
+              iptables -t filter -X DOCKER-CT 2>/dev/null || true
+              
+              # Recreate all required Docker iptables chains
+              iptables -t nat -N DOCKER 2>/dev/null || true
+              iptables -t filter -N DOCKER 2>/dev/null || true
+              iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              iptables -t filter -N DOCKER-USER 2>/dev/null || true
+              iptables -t filter -N DOCKER-CT 2>/dev/null || true
+              
+              # Set up Docker forwarding rules
+              iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+              iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+              iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-USER
+              iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+              iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-USER -j RETURN
+              
+              # Restart Docker
+              systemctl start docker.service
+              sleep 10
+              
+              # Test network creation again
+              if docker network create test-network-fix-$(date +%s) &>/dev/null; then
+                docker network rm test-network-fix-$(date +%s) &>/dev/null || true
+                echo '✅ Docker iptables fix successful'
+              else
+                echo '❌ Docker iptables fix failed - deployment may have issues'
+              fi
+            else
+              # Clean up test network
+              docker network rm test-network-$(date +%s) &>/dev/null || true
+              echo '✅ Docker networking is working properly'
+            fi
+            
             docker-compose down 2>/dev/null || true
             docker-compose up -d
           # Check for service-specific docker-compose files (e.g., docker-compose.auth.yml for fks-auth)
@@ -950,6 +1007,57 @@ jobs:
             SERVICE_TYPE="${{ env.SERVICE_NAME }}"
             SERVICE_TYPE="${SERVICE_TYPE#fks-}"  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
             echo "🔍 FKS service detected: ${{ env.SERVICE_NAME }}, looking for docker-compose.$SERVICE_TYPE.yml"
+            
+            # Pre-deployment Docker network test and fix
+            echo '🔧 Testing Docker network functionality before FKS deployment...'
+            if ! docker network create test-network-$(date +%s) &>/dev/null; then
+              echo '⚠️ Docker network creation failed - applying iptables fix...'
+              
+              # Apply Docker iptables fix for FKS services
+              systemctl stop docker.service || true
+              sleep 3
+              
+              # Clean up existing Docker iptables chains  
+              iptables -t nat -F DOCKER 2>/dev/null || true
+              iptables -t filter -F DOCKER 2>/dev/null || true
+              iptables -t filter -F DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              iptables -t filter -F DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              iptables -t filter -F DOCKER-USER 2>/dev/null || true
+              iptables -t filter -F DOCKER-CT 2>/dev/null || true
+              
+              iptables -t nat -X DOCKER 2>/dev/null || true
+              iptables -t filter -X DOCKER 2>/dev/null || true
+              iptables -t filter -X DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              iptables -t filter -X DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              iptables -t filter -X DOCKER-USER 2>/dev/null || true
+              iptables -t filter -X DOCKER-CT 2>/dev/null || true
+              
+              # Recreate all required Docker iptables chains
+              iptables -t nat -N DOCKER 2>/dev/null || true
+              iptables -t filter -N DOCKER 2>/dev/null || true
+              iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+              iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+              iptables -t filter -N DOCKER-USER 2>/dev/null || true
+              iptables -t filter -N DOCKER-CT 2>/dev/null || true
+              
+              # Set up Docker forwarding rules
+              iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+              iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+              iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-USER
+              iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+              iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-USER -j RETURN
+              
+              # Restart Docker
+              systemctl start docker.service
+              sleep 10
+              
+              echo '✅ Docker iptables fix applied for FKS deployment'
+            else
+              # Clean up test network
+              docker network rm test-network-$(date +%s) &>/dev/null || true
+              echo '✅ Docker networking is working properly for FKS service'
+            fi
+            
             if [[ -f "docker-compose.$SERVICE_TYPE.yml" ]]; then
               echo "🐳 Using service-specific compose file: docker-compose.$SERVICE_TYPE.yml"
               docker-compose -f "docker-compose.$SERVICE_TYPE.yml" down 2>/dev/null || true
