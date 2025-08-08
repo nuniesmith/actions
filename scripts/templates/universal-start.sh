@@ -365,11 +365,15 @@ main() {
         fi
     fi
     
-    # Clean up any existing service network
-    if docker network inspect ${SERVICE_NAME}-network >/dev/null 2>&1; then
-        if [ -z "$(docker network inspect ${SERVICE_NAME}-network -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)" ]; then
-            log "INFO" "Removing existing ${SERVICE_NAME}-network to let docker-compose recreate it..."
-            docker network rm ${SERVICE_NAME}-network 2>/dev/null || true
+    # Clean up any existing service network (skip in deployment environments to avoid iptables conflicts)
+    if [ -n "$GITHUB_ACTIONS" ] || [ "$USER" = "${SERVICE_NAME}_user" ] || [ "$USER" = "root" ]; then
+        log "INFO" "✅ Network cleanup skipped (deployment environment - avoiding iptables conflicts)"
+    else
+        if docker network inspect ${SERVICE_NAME}-network >/dev/null 2>&1; then
+            if [ -z "$(docker network inspect ${SERVICE_NAME}-network -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)" ]; then
+                log "INFO" "Removing existing ${SERVICE_NAME}-network to let docker-compose recreate it..."
+                docker network rm ${SERVICE_NAME}-network 2>/dev/null || true
+            fi
         fi
     fi
     
