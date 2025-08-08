@@ -960,6 +960,7 @@ jobs:
               iptables -t filter -F DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
               iptables -t filter -F DOCKER-USER 2>/dev/null || true
               iptables -t filter -F DOCKER-CT 2>/dev/null || true
+              iptables -t filter -F DOCKER-FORWARD 2>/dev/null || true
               
               iptables -t nat -X DOCKER 2>/dev/null || true
               iptables -t filter -X DOCKER 2>/dev/null || true
@@ -967,6 +968,7 @@ jobs:
               iptables -t filter -X DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
               iptables -t filter -X DOCKER-USER 2>/dev/null || true
               iptables -t filter -X DOCKER-CT 2>/dev/null || true
+              iptables -t filter -X DOCKER-FORWARD 2>/dev/null || true
               
               # Recreate all required Docker iptables chains
               iptables -t nat -N DOCKER 2>/dev/null || true
@@ -975,13 +977,16 @@ jobs:
               iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
               iptables -t filter -N DOCKER-USER 2>/dev/null || true
               iptables -t filter -N DOCKER-CT 2>/dev/null || true
+              iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
               
               # Set up Docker forwarding rules
               iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
               iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
               iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-USER
               iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+              iptables -t filter -C FORWARD -j DOCKER-FORWARD 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-FORWARD
               iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-USER -j RETURN
+              iptables -t filter -C DOCKER-FORWARD -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-FORWARD -j RETURN
               
               # Restart Docker
               systemctl start docker.service
@@ -1039,13 +1044,16 @@ jobs:
               iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
               iptables -t filter -N DOCKER-USER 2>/dev/null || true
               iptables -t filter -N DOCKER-CT 2>/dev/null || true
+              iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
               
               # Set up Docker forwarding rules
               iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
               iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
               iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-USER
               iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+              iptables -t filter -C FORWARD -j DOCKER-FORWARD 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-FORWARD
               iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-USER -j RETURN
+              iptables -t filter -C DOCKER-FORWARD -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-FORWARD -j RETURN
               
               # Restart Docker
               systemctl start docker.service
