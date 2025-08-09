@@ -507,13 +507,13 @@ jobs:
           TOP_LEVEL_DOMAIN: ${{ secrets.TOP_LEVEL_DOMAIN }}
         run: |
           echo "🏗️ Running Stage 2 post-reboot setup..."
-          
+
           # Prepare stage2 script with environment variables
           cp ./scripts/stage2-post-reboot.sh /tmp/stage2-setup.sh
-          
+
           # Replace placeholders with environment variables (including service name and domain)
           envsubst '${SERVICE_NAME} ${FULL_DOMAIN} ${TS_OAUTH_CLIENT_ID} ${TS_OAUTH_SECRET} ${TAILSCALE_TAILNET} ${CLOUDFLARE_API_TOKEN} ${CLOUDFLARE_ZONE_ID} ${ADMIN_EMAIL}' < /tmp/stage2-setup.sh > /tmp/stage2-final.sh
-          
+
           # Fallback: Replace any remaining placeholders with sed (in case envsubst misses them)
           sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" /tmp/stage2-final.sh
           sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" /tmp/stage2-final.sh
@@ -525,15 +525,15 @@ jobs:
           sed -i "s|ADMIN_EMAIL_PLACEHOLDER|${{ secrets.ADMIN_EMAIL }}|g" /tmp/stage2-final.sh
           # Remove CLOUDFLARE_EMAIL references - not needed with API token auth
           sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER||g" /tmp/stage2-final.sh
-          
+
           # Debug: Show what variables we're passing
           echo "🔍 Debug: SERVICE_NAME=${{ env.SERVICE_NAME }}"
           echo "🔍 Debug: FULL_DOMAIN=${{ env.FULL_DOMAIN }}"
-          
+
           # Transfer and execute stage2 script
           scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no \
             /tmp/stage2-final.sh root@$SERVER_IP:/tmp/stage2-post-reboot.sh
-          
+
           # Create environment file on remote server for the script to source
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
             mkdir -p /opt
@@ -547,25 +547,32 @@ jobs:
             echo \"export ADMIN_EMAIL_ENV='${{ secrets.ADMIN_EMAIL }}'\" >> /opt/stage2-env.sh
             chmod +x /opt/stage2-env.sh
           "
-          
+
           # Execute the script with environment loaded
           ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
             "chmod +x /tmp/stage2-post-reboot.sh && source /opt/stage2-env.sh && /tmp/stage2-post-reboot.sh"
-          
-          # Get Tailscale IP with error handling
-          echo "🔗 Getting Tailscale IP..."
-          TAILSCALE_IP=$(ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
-            "tailscale ip -4 2>/dev/null || echo 'pending'")
-          
-          # Validate and set tailscale IP output
-          if [[ -z "$TAILSCALE_IP" ]] || [[ "$TAILSCALE_IP" == "pending" ]] || [[ "$TAILSCALE_IP" == "null" ]]; then
-            echo "⚠️ Tailscale IP not available yet: '$TAILSCALE_IP'"
-            echo "🔍 This is normal during initial setup - Tailscale may still be connecting"
+
+          echo "🔗 Getting Tailscale IP (with retries)..."
+          ATTEMPTS=18   # ~3 minutes (18*10s)
+          SLEEP_SECS=10
+          TAILSCALE_IP=""
+          for i in $(seq 1 $ATTEMPTS); do
+            CANDIDATE=$(ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
+              "tailscale ip -4 2>/dev/null || true")
+            if echo "$CANDIDATE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+              TAILSCALE_IP="$CANDIDATE"
+              echo "✅ Tailscale IPv4 acquired: $TAILSCALE_IP (attempt $i/$ATTEMPTS)"
+              break
+            fi
+            echo "⏳ Tailscale IPv4 not ready yet (attempt $i/$ATTEMPTS). Got: '${CANDIDATE:-empty}'. Retrying in ${SLEEP_SECS}s..."
+            sleep "$SLEEP_SECS"
+          done
+
+          if [[ -z "$TAILSCALE_IP" ]]; then
+            echo "⚠️ Tailscale IPv4 still unavailable after retries; marking as 'pending'"
             TAILSCALE_IP="pending"
-          else
-            echo "✅ Tailscale IP obtained: $TAILSCALE_IP"
           fi
-          
+
           echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
           echo "✅ Stage 2 setup completed"
 
@@ -657,16 +664,27 @@ jobs:
           echo "  TAILSCALE_IP='$TAILSCALE_IP'"
           echo "  SERVER_IP='$SERVER_IP'"
           
-          # Use Tailscale IP if available, otherwise fall back to server IP
-          IP_TO_USE="${TAILSCALE_IP:-$SERVER_IP}"
-          
-          if [[ -z "$IP_TO_USE" ]] || [[ "$IP_TO_USE" == "null" ]] || [[ "$IP_TO_USE" == "''" ]]; then
+          # Prefer a valid IPv4 Tailscale IP; fall back to SERVER_IP when pending/invalid
+          VALID_TS=false
+          if [[ -n "$TAILSCALE_IP" ]] && echo "$TAILSCALE_IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            VALID_TS=true
+          fi
+
+          if [[ "$TAILSCALE_IP" == "pending" ]] || [[ "$TAILSCALE_IP" == "null" ]] || [[ "$TAILSCALE_IP" == "''" ]] || [[ "$VALID_TS" != true ]]; then
+            echo "ℹ️ Tailscale IP not ready or invalid ('$TAILSCALE_IP'); attempting to use SERVER_IP instead"
+            IP_TO_USE="$SERVER_IP"
+          else
+            IP_TO_USE="$TAILSCALE_IP"
+          fi
+
+          # Validate fallback SERVER_IP as IPv4
+          if [[ -z "$IP_TO_USE" ]] || ! echo "$IP_TO_USE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "❌ No valid IP address available for DNS update"
             echo "🔍 Available infrastructure outputs:"
             echo "  Server ID: ${{ needs.infrastructure.outputs.server_id }}"
             echo "  Server IP: ${{ needs.infrastructure.outputs.server_ip }}"
             echo "  Tailscale IP: ${{ needs.infrastructure.outputs.tailscale_ip }}"
-            echo "⚠️ Skipping DNS update - service will be accessible via server IP only"
+            echo "⚠️ Skipping DNS update - waiting for valid IP on future runs"
             exit 0  # Don't fail the workflow, just skip DNS update
           fi
           
