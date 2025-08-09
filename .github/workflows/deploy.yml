@@ -1094,38 +1094,38 @@ jobs:
           
           # Install Certbot if not already installed
           if ! command -v certbot &> /dev/null; then
-            echo '🔒 Installing Certbot for Let'\''s Encrypt certificates...'
+            echo "🔒 Installing Certbot for Let's Encrypt certificates..."
             # Update package database first
             pacman -Sy --noconfirm
             # Install certbot, cloudflare DNS plugin, and cronie for cron jobs (correct Arch Linux package names)
             if ! pacman -S --noconfirm certbot certbot-dns-cloudflare cronie; then
-              echo '⚠️ Failed to install certbot via pacman, trying alternative approach...'
+              echo "⚠️ Failed to install certbot via pacman, trying alternative approach..."
               # Fallback: Install via pip if pacman fails
               pacman -S --noconfirm python-pip cronie
               pip install certbot certbot-dns-cloudflare
             fi
             
             # Start and enable cronie service for cron jobs
-            systemctl enable --now cronie || echo '⚠️ Failed to start cronie service'
+            systemctl enable --now cronie || echo "⚠️ Failed to start cronie service"
             
             # Verify installation
             if command -v certbot &> /dev/null; then
-              echo '✅ Certbot installed successfully'
+              echo "✅ Certbot installed successfully"
             else
-              echo '⚠️ Certbot installation failed, will continue with self-signed certificates only'
+              echo "⚠️ Certbot installation failed, will continue with self-signed certificates only"
             fi
             
             # Verify crontab is available
             if command -v crontab &> /dev/null; then
-              echo '✅ Crontab (cronie) installed successfully'
+              echo "✅ Crontab (cronie) installed successfully"
             else
-              echo '⚠️ Crontab installation failed, automatic renewal will not be set up'
+              echo "⚠️ Crontab installation failed, automatic renewal will not be set up"
             fi
           fi
           
           # Set up Let's Encrypt certificates with Cloudflare DNS challenge
           if [[ -n '${{ env.FULL_DOMAIN }}' ]] && [[ -n '${{ secrets.CLOUDFLARE_API_TOKEN }}' ]] && command -v certbot &> /dev/null; then
-            echo '🔒 Setting up Let'\''s Encrypt certificates via Cloudflare DNS...'
+            echo "🔒 Setting up Let's Encrypt certificates via Cloudflare DNS..."
             
             # Create Cloudflare credentials file
             mkdir -p /etc/ssl/cloudflare
@@ -1157,48 +1157,48 @@ jobs:
               \$DOMAIN_FLAGS \
               --cert-name "\$PRIMARY_DOMAIN"; then
               
-              echo '✅ Let'\''s Encrypt certificate obtained successfully!'
+              echo "✅ Let's Encrypt certificate obtained successfully!"
             else
-              echo '⚠️ Let'\''s Encrypt certificate request failed, continuing with self-signed certificates'
+              echo "⚠️ Let's Encrypt certificate request failed, continuing with self-signed certificates"
             fi
             
             # Copy certificates to service directory for easy access
             if [[ -d "/etc/letsencrypt/live/\$PRIMARY_DOMAIN" ]]; then
-              echo '📋 Copying Let'\''s Encrypt certificates to service directory...'
+              echo "📋 Copying Let's Encrypt certificates to service directory..."
               mkdir -p "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl"
               cp /etc/letsencrypt/live/\$PRIMARY_DOMAIN/fullchain.pem "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/"
               cp /etc/letsencrypt/live/\$PRIMARY_DOMAIN/privkey.pem "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/"
               chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl"
               
               # Set up automatic renewal
-              echo '⚙️ Setting up automatic certificate renewal...'
+              echo "⚙️ Setting up automatic certificate renewal..."
               if command -v crontab >/dev/null 2>&1; then
                 (crontab -l 2>/dev/null; echo '0 12 * * * /usr/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"') | crontab -
-                echo '✅ Certificate renewal cron job set up successfully'
+                echo "✅ Certificate renewal cron job set up successfully"
               else
-                echo '❌ Warning: crontab command not found - manual renewal may be required'
+                echo "❌ Warning: crontab command not found - manual renewal may be required"
                 echo 'Manual renewal command: certbot renew --quiet --deploy-hook "systemctl reload nginx"'
               fi
             else
-              echo '⚠️ Let'\''s Encrypt certificate directory not found, continuing with fallback'
+              echo "⚠️ Let's Encrypt certificate directory not found, continuing with fallback"
             fi
           else
-            echo '⚠️ Domain, Cloudflare API token not provided, or Certbot not available - continuing with self-signed certificates'
+            echo "⚠️ Domain, Cloudflare API token not provided, or Certbot not available - continuing with self-signed certificates"
           fi
           
           # Final SSL verification and NGINX configuration check
-          echo '🔍 Verifying SSL certificate configuration...'
+          echo "🔍 Verifying SSL certificate configuration..."
           
           # Check for Let's Encrypt certificates first
           if [[ -f "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" ]]; then
-            echo '✅ SSL certificates found and properly configured'
-            echo '🔍 Certificate type: Let'\''s Encrypt (from service directory)'
+            echo "✅ SSL certificates found and properly configured"
+            echo "🔍 Certificate type: Let's Encrypt (from service directory)"
             
             # Check certificate validity
-            openssl x509 -in "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" -text -noout | head -20 || echo '⚠️ Certificate validation failed'
+            openssl x509 -in "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" -text -noout | head -20 || echo "⚠️ Certificate validation failed"
           elif [[ -f "/etc/ssl/selfsigned/cert.pem" ]]; then
-            echo '✅ Self-signed SSL certificates available'
-            echo '🔍 Certificate type: Self-signed (fallback)'
+            echo "✅ Self-signed SSL certificates available"
+            echo "🔍 Certificate type: Self-signed (fallback)"
             
             # Copy self-signed certificates to service directory for consistency
             mkdir -p "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
@@ -1206,19 +1206,19 @@ jobs:
             cp /etc/ssl/selfsigned/key.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/privkey.pem"
             chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
           else
-            echo '❌ No SSL certificates found - this may cause issues with HTTPS'
+            echo "❌ No SSL certificates found - this may cause issues with HTTPS"
           fi
             
           # Verify NGINX can start with SSL configuration
           if command -v nginx &> /dev/null; then
-            nginx -t && echo '✅ NGINX configuration is valid' || echo '⚠️ NGINX configuration has issues'
+            nginx -t && echo "✅ NGINX configuration is valid" || echo "⚠️ NGINX configuration has issues"
           fi
           
           # Test HTTPS connectivity (if service is listening)
           sleep 10
-          curl -k -I https://\$PRIMARY_DOMAIN 2>/dev/null | head -5 || echo '⚠️ Service not yet responding on HTTPS (this is normal during startup)'
+          curl -k -I https://\$PRIMARY_DOMAIN 2>/dev/null | head -5 || echo "⚠️ Service not yet responding on HTTPS (this is normal during startup)"
           
-          echo '🎯 SSL certificate automation complete!'
+          echo "🎯 SSL certificate automation complete!"
           DEPLOY_SCRIPT_EOF
           
           chmod +x /tmp/service-deploy.sh
