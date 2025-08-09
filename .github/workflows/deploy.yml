@@ -935,8 +935,97 @@ jobs:
           
           echo "✅ Service configuration completed for $SERVICE_DISPLAY_NAME"
           
-          # Deploy using start.sh if available
-          if [[ -f 'start.sh' ]]; then
+          # Ensure external network for cross-service comms exists (used by fks api/web)
+          if ! docker network inspect fks-external >/dev/null 2>&1; then
+            echo "🌐 Creating external Docker network: fks-external"
+            docker network create --driver bridge fks-external || echo "⚠️ Failed to create fks-external (may already exist)"
+          else
+            echo "🌐 External network fks-external already present"
+          fi
+
+          # Harden forwarding and NAT between Tailscale and Docker bridges for cross-host/container routing (if Tailscale is up)
+          if ip link show tailscale0 >/dev/null 2>&1; then
+            echo '🔐 Configuring iptables for Tailscale ↔ Docker routing...'
+            # Enable IP forwarding
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+            sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || true
+            
+            # Accept established traffic early
+            iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+            
+            # Allow forwarding between tailscale0 and all docker bridges (br-*)
+            iptables -C FORWARD -i tailscale0 -o br+ -j ACCEPT 2>/dev/null || iptables -I FORWARD -i tailscale0 -o br+ -j ACCEPT
+            iptables -C FORWARD -i br+ -o tailscale0 -j ACCEPT 2>/dev/null || iptables -I FORWARD -i br+ -o tailscale0 -j ACCEPT
+            
+            # Ensure DOCKER-USER does not block Tailscale traffic
+            iptables -C DOCKER-USER -i tailscale0 -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER 1 -i tailscale0 -j ACCEPT
+            iptables -C DOCKER-USER -o tailscale0 -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER 1 -o tailscale0 -j ACCEPT
+            
+            # Masquerade RFC1918 ranges egressing via tailscale0 for return-path correctness
+            iptables -t nat -C POSTROUTING -s 10.0.0.0/8 -o tailscale0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o tailscale0 -j MASQUERADE
+            iptables -t nat -C POSTROUTING -s 172.16.0.0/12 -o tailscale0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.16.0.0/12 -o tailscale0 -j MASQUERADE
+            iptables -t nat -C POSTROUTING -s 192.168.0.0/16 -o tailscale0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 192.168.0.0/16 -o tailscale0 -j MASQUERADE
+          else
+            echo 'ℹ️ tailscale0 interface not found; skipping iptables Tailnet routing config for now'
+          fi
+
+          # Prefer FKS service-specific compose files when present (api/auth/web), regardless of start.sh presence
+          if [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
+            SERVICE_TYPE='${{ env.SERVICE_NAME }}'
+            SERVICE_TYPE="${SERVICE_TYPE#fks-}"
+            echo "🔍 FKS service detected (${SERVICE_TYPE}); checking for docker-compose.${SERVICE_TYPE}.yml"
+            if [[ -f "docker-compose.${SERVICE_TYPE}.yml" ]]; then
+              echo "🐳 Using service-specific compose file: docker-compose.${SERVICE_TYPE}.yml"
+              # Pre-deployment Docker network test and fix
+              echo '🔧 Testing Docker network functionality before FKS deployment...'
+              if ! docker network create test-network-$(date +%s) &>/dev/null; then
+                echo '⚠️ Docker network creation failed - applying iptables fix...'
+                systemctl stop docker.service || true
+                sleep 3
+                iptables -t nat -F DOCKER 2>/dev/null || true
+                iptables -t filter -F DOCKER 2>/dev/null || true
+                iptables -t filter -F DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+                iptables -t filter -F DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+                iptables -t filter -F DOCKER-USER 2>/dev/null || true
+                iptables -t filter -F DOCKER-CT 2>/dev/null || true
+                iptables -t nat -X DOCKER 2>/dev/null || true
+                iptables -t filter -X DOCKER 2>/dev/null || true
+                iptables -t filter -X DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+                iptables -t filter -X DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+                iptables -t filter -X DOCKER-USER 2>/dev/null || true
+                iptables -t filter -X DOCKER-CT 2>/dev/null || true
+                iptables -t filter -N DOCKER 2>/dev/null || true
+                iptables -t nat -N DOCKER 2>/dev/null || true
+                iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || true
+                iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || true
+                iptables -t filter -N DOCKER-USER 2>/dev/null || true
+                iptables -t filter -N DOCKER-CT 2>/dev/null || true
+                iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
+                iptables -t filter -N DOCKER-BRIDGE 2>/dev/null || true
+                iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+                iptables -t nat -C OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+                iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-USER
+                iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
+                iptables -t filter -C FORWARD -j DOCKER-FORWARD 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-FORWARD
+                iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-USER -j RETURN
+                iptables -t filter -C DOCKER-FORWARD -j RETURN 2>/dev/null || iptables -t filter -A DOCKER-FORWARD -j RETURN
+                systemctl start docker.service
+                sleep 10
+              else
+                docker network rm test-network-$(date +%s) &>/dev/null || true
+                echo '✅ Docker networking is working properly for FKS service'
+              fi
+
+              docker-compose -f "docker-compose.${SERVICE_TYPE}.yml" down 2>/dev/null || true
+              docker-compose -f "docker-compose.${SERVICE_TYPE}.yml" pull || true
+              docker-compose -f "docker-compose.${SERVICE_TYPE}.yml" up -d
+            else
+              echo "❌ No docker-compose.${SERVICE_TYPE}.yml found for service: ${{ env.SERVICE_NAME }}"
+              exit 1
+            fi
+
+          # Deploy using start.sh if available (fallback for non-fks-* services)
+          elif [[ -f 'start.sh' ]]; then
             echo '🚀 Found start.sh - using custom deployment script'
             chmod +x start.sh
             
