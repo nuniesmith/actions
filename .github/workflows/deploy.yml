@@ -782,6 +782,8 @@ jobs:
           NGINX_AUTH_PASS: ${{ secrets.NGINX_AUTH_PASS }}
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           # Debug: Show all infrastructure outputs
           echo "🔍 DEBUG: Infrastructure job result: ${{ needs.infrastructure.result }}"
@@ -807,29 +809,43 @@ jobs:
           
           echo "🚀 Deploying ${{ env.SERVICE_NAME }} service to server: $SERVER_IP"
           
-          # Create deployment script locally to avoid command line length limits
+          # Prepare local variables to minimize GitHub expression expansion in the script body
+          SVC_NAME="${{ env.SERVICE_NAME }}"
+          SRC_REPO="${{ env.SOURCE_REPOSITORY }}"
+          FULL_DOMAIN_VAL="${{ env.FULL_DOMAIN }}"
+          OVERWRITE_FLAG="${{ inputs.overwrite_server }}"
+          JWT_SECRET_VAL="$JWT_SECRET_KEY"
+          AUTHENTIK_JWT_VAL="$AUTHENTIK_JWT_SECRET"
+          NGINX_USER_VAL="$NGINX_AUTH_USER"
+          NGINX_PASS_VAL="$NGINX_AUTH_PASS"
+          DOCKER_USER_VAL="$DOCKER_USERNAME"
+          DOCKER_TOKEN_VAL="$DOCKER_TOKEN"
+          ADMIN_EMAIL_VAL="$ADMIN_EMAIL"
+          CF_API_TOKEN_VAL="$CLOUDFLARE_API_TOKEN"
+
+          # Create deployment script locally with placeholders to avoid GitHub expression expansion in heredoc
           cat > /tmp/service-deploy.sh << 'DEPLOY_SCRIPT_EOF'
           #!/bin/bash
           set -e
           
-          cd /home/${{ env.SERVICE_NAME }}_user
+          cd /home/__SVC_NAME___user
           
           # Determine the correct directory name (use source repository for multi-service architectures)
-          if [[ "${{ env.SOURCE_REPOSITORY }}" != "${{ env.SERVICE_NAME }}" ]]; then
-            REPO_DIR="${{ env.SOURCE_REPOSITORY }}"
+          if [[ "__SRC_REPO__" != "__SVC_NAME__" ]]; then
+            REPO_DIR="__SRC_REPO__"
             echo "📁 Multi-service deployment: Using source repository directory '$REPO_DIR'"
           else
-            REPO_DIR="${{ env.SERVICE_NAME }}"
+            REPO_DIR="__SVC_NAME__"
             echo "📁 Single-service deployment: Using service directory '$REPO_DIR'"
           fi
           
           # Remove existing repository directory if overwrite is enabled
-          if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
+          if [[ "__OVERWRITE__" == "true" ]]; then
             rm -rf "$REPO_DIR"
           fi
           
           # Clone the source repository into the correct directory
-          git clone https://github.com/nuniesmith/${{ env.SOURCE_REPOSITORY }}.git "$REPO_DIR"
+          git clone https://github.com/nuniesmith/__SRC_REPO__.git "$REPO_DIR"
           cd "$REPO_DIR"
           
           # 🔐 SSL Certificate Setup - Step 1: Generate self-signed certificates
@@ -838,7 +854,7 @@ jobs:
           openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
             -keyout /etc/ssl/selfsigned/key.pem \
             -out /etc/ssl/selfsigned/cert.pem \
-            -subj '/CN=${{ env.FULL_DOMAIN }}/O=GitHub Actions Deployment/C=US'
+            -subj '/CN=__FULL_DOMAIN__/O=GitHub Actions Deployment/C=US'
           
           # Create initial SSL configuration for NGINX
           cat > /etc/nginx/ssl.conf << 'SSL_EOF'
@@ -858,25 +874,25 @@ jobs:
           echo '🔐 Setting up application environment variables...'
           cat > .env << 'ENV_EOF'
           # Application Configuration
-          JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
-          AUTHENTIK_JWT_SECRET=${{ secrets.AUTHENTIK_JWT_SECRET }}
-          NGINX_AUTH_USER=${{ secrets.NGINX_AUTH_USER }}
-          NGINX_AUTH_PASS=${{ secrets.NGINX_AUTH_PASS }}
+          JWT_SECRET_KEY=__JWT_SECRET__
+          AUTHENTIK_JWT_SECRET=__AUTHENTIK_JWT__
+          NGINX_AUTH_USER=__NGINX_AUTH_USER__
+          NGINX_AUTH_PASS=__NGINX_AUTH_PASS__
           
           # Service Configuration
-          SERVICE_NAME=${{ env.SERVICE_NAME }}
-          DOMAIN_NAME=${{ env.FULL_DOMAIN }}
+          SERVICE_NAME=__SVC_NAME__
+          DOMAIN_NAME=__FULL_DOMAIN__
           
           # Docker Hub Authentication (if needed)
-          DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}
-          DOCKER_TOKEN=${{ secrets.DOCKER_TOKEN }}
+          DOCKER_USERNAME=__DOCKER_USERNAME__
+          DOCKER_TOKEN=__DOCKER_TOKEN__
           ENV_EOF
           
           # Set ownership to service user for the repository directory
-          chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user /home/${{ env.SERVICE_NAME }}_user/"$REPO_DIR"
+          chown -R __SVC_NAME___user:__SVC_NAME___user /home/__SVC_NAME___user/"$REPO_DIR"
           
           # Change to repository directory for deployment file detection and execution
-          cd /home/${{ env.SERVICE_NAME }}_user/"$REPO_DIR"
+          cd /home/__SVC_NAME___user/"$REPO_DIR"
           
           echo "🔍 Checking deployment options in directory: $(pwd)"
           echo "📁 Available files:"
@@ -884,7 +900,7 @@ jobs:
           
           # Configure service-specific environment variables for universal template
           echo '🔧 Configuring service-specific settings for universal template...'
-          case '${{ env.SERVICE_NAME }}' in
+          case '__SVC_NAME__' in
             "nginx")
               export SERVICE_DISPLAY_NAME="Nginx Reverse Proxy"
               export DEFAULT_HTTP_PORT="80"
@@ -916,7 +932,7 @@ jobs:
               export HAS_SSL="true"
               ;;
             *)
-              export SERVICE_DISPLAY_NAME="${{ env.SERVICE_NAME }}"
+              export SERVICE_DISPLAY_NAME="__SVC_NAME__"
               export DEFAULT_HTTP_PORT="80"
               export DEFAULT_HTTPS_PORT="443"
               export SUPPORTS_GPU="false"
@@ -928,7 +944,7 @@ jobs:
           esac
           
           # Export service name for template
-          export SERVICE_NAME='${{ env.SERVICE_NAME }}'
+          export SERVICE_NAME='__SVC_NAME__'
           
           echo "✅ Service configuration completed for \$SERVICE_DISPLAY_NAME"
           echo "🔍 Docker networks will be managed by the service startup script"
@@ -970,8 +986,8 @@ jobs:
           fi
 
           # Prefer FKS service-specific compose files when present (api/auth/web), regardless of start.sh presence
-          if [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
-            SERVICE_TYPE='${{ env.SERVICE_NAME }}'
+          if [[ '__SVC_NAME__' =~ ^fks- ]]; then
+            SERVICE_TYPE='__SVC_NAME__'
             SERVICE_TYPE="${SERVICE_TYPE#fks-}"
             echo "🔍 FKS service detected (${SERVICE_TYPE}); checking for docker-compose.${SERVICE_TYPE}.yml"
             if [[ -f "docker-compose.${SERVICE_TYPE}.yml" ]]; then
@@ -1020,7 +1036,7 @@ jobs:
               docker-compose -f "docker-compose.${SERVICE_TYPE}.yml" pull || true
               docker-compose -f "docker-compose.${SERVICE_TYPE}.yml" up -d
             else
-              echo "❌ No docker-compose.${SERVICE_TYPE}.yml found for service: ${{ env.SERVICE_NAME }}"
+              echo "❌ No docker-compose.${SERVICE_TYPE}.yml found for service: __SVC_NAME__"
               exit 1
             fi
 
@@ -1030,7 +1046,7 @@ jobs:
             chmod +x start.sh
             
             # Pass environment variables to service user for universal template
-            su - ${{ env.SERVICE_NAME }}_user -c "
+            su - __SVC_NAME___user -c "
               export SERVICE_NAME='$SERVICE_NAME'
               export SERVICE_DISPLAY_NAME='$SERVICE_DISPLAY_NAME'
               export DEFAULT_HTTP_PORT='$DEFAULT_HTTP_PORT'
@@ -1041,7 +1057,7 @@ jobs:
               export HAS_NETDATA='$HAS_NETDATA'
               export HAS_SSL='$HAS_SSL'
               export GITHUB_ACTIONS='$GITHUB_ACTIONS'
-              cd /home/${{ env.SERVICE_NAME }}_user/$REPO_DIR && ./start.sh
+              cd /home/__SVC_NAME___user/$REPO_DIR && ./start.sh
             "
           elif [[ -f 'docker-compose.yml' ]]; then
             echo '🐳 Found docker-compose.yml - using Docker Compose deployment'
@@ -1111,10 +1127,10 @@ jobs:
             docker-compose down 2>/dev/null || true
             docker-compose up -d
           # Check for service-specific docker-compose files (e.g., docker-compose.auth.yml for fks-auth)
-          elif [[ '${{ env.SERVICE_NAME }}' =~ ^fks- ]]; then
-            SERVICE_TYPE="${{ env.SERVICE_NAME }}"
+          elif [[ '__SVC_NAME__' =~ ^fks- ]]; then
+            SERVICE_TYPE="__SVC_NAME__"
             SERVICE_TYPE="${SERVICE_TYPE#fks-}"  # Extract 'auth', 'api', 'web' from 'fks-auth', etc.
-            echo "🔍 FKS service detected: ${{ env.SERVICE_NAME }}, looking for docker-compose.$SERVICE_TYPE.yml"
+            echo "🔍 FKS service detected: __SVC_NAME__, looking for docker-compose.$SERVICE_TYPE.yml"
             
             # Pre-deployment Docker network test and fix
             echo '🔧 Testing Docker network functionality before FKS deployment...'
@@ -1179,11 +1195,11 @@ jobs:
               docker-compose down 2>/dev/null || true
               docker-compose up -d
             else
-              echo "❌ No docker-compose file found for service: ${{ env.SERVICE_NAME }}"
+              echo "❌ No docker-compose file found for service: __SVC_NAME__"
               exit 1
             fi
           else
-            echo "❌ No deployment method found for service: ${{ env.SERVICE_NAME }}"
+            echo "❌ No deployment method found for service: __SVC_NAME__"
             echo "🔍 Available files in directory:"
             ls -la
             echo "📂 Current working directory: $(pwd)"
@@ -1226,19 +1242,19 @@ jobs:
           fi
           
           # Set up Let's Encrypt certificates with Cloudflare DNS challenge
-          if [[ -n '${{ env.FULL_DOMAIN }}' ]] && [[ -n '${{ secrets.CLOUDFLARE_API_TOKEN }}' ]] && command -v certbot &> /dev/null; then
+          if [[ -n '__FULL_DOMAIN__' ]] && [[ -n '__CF_API_TOKEN__' ]] && command -v certbot &> /dev/null; then
             echo "🔒 Setting up Let's Encrypt certificates via Cloudflare DNS..."
             
             # Create Cloudflare credentials file
             mkdir -p /etc/ssl/cloudflare
             cat > /etc/ssl/cloudflare/credentials.ini << EOF
-          dns_cloudflare_api_token = ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          dns_cloudflare_api_token = __CF_API_TOKEN__
           EOF
             chmod 600 /etc/ssl/cloudflare/credentials.ini
             
             # Request Let's Encrypt certificate with error handling
             # Handle multiple domains by converting comma-separated list to multiple -d flags
-            FULL_DOMAIN_STR="${{ env.FULL_DOMAIN }}"
+            FULL_DOMAIN_STR="__FULL_DOMAIN__"
             
             # Simple approach: replace commas with -d flags
             DOMAIN_FLAGS=$(echo "$FULL_DOMAIN_STR" | sed 's/,/ -d /g' | sed 's/^/-d /')
@@ -1255,7 +1271,7 @@ jobs:
               --dns-cloudflare-propagation-seconds 60 \
               --non-interactive \
               --agree-tos \
-              --email ${{ secrets.ADMIN_EMAIL }} \
+              --email __ADMIN_EMAIL__ \
               $DOMAIN_FLAGS \
               --cert-name "$PRIMARY_DOMAIN"; then
               
@@ -1267,10 +1283,10 @@ jobs:
             # Copy certificates to service directory for easy access
             if [[ -d "/etc/letsencrypt/live/$PRIMARY_DOMAIN" ]]; then
               echo "📋 Copying Let's Encrypt certificates to service directory..."
-              mkdir -p "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
-              cp /etc/letsencrypt/live/$PRIMARY_DOMAIN/fullchain.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
-              cp /etc/letsencrypt/live/$PRIMARY_DOMAIN/privkey.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
-              chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
+              mkdir -p "/home/__SVC_NAME___user/$REPO_DIR/ssl"
+              cp /etc/letsencrypt/live/$PRIMARY_DOMAIN/fullchain.pem "/home/__SVC_NAME___user/$REPO_DIR/ssl/"
+              cp /etc/letsencrypt/live/$PRIMARY_DOMAIN/privkey.pem "/home/__SVC_NAME___user/$REPO_DIR/ssl/"
+              chown -R __SVC_NAME___user:__SVC_NAME___user "/home/__SVC_NAME___user/$REPO_DIR/ssl"
               
               # Set up automatic renewal
               echo "⚙️ Setting up automatic certificate renewal..."
@@ -1292,21 +1308,21 @@ jobs:
           echo "🔍 Verifying SSL certificate configuration..."
           
           # Check for Let's Encrypt certificates first
-          if [[ -f "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" ]]; then
+          if [[ -f "/home/__SVC_NAME___user/$REPO_DIR/ssl/fullchain.pem" ]]; then
             echo "✅ SSL certificates found and properly configured"
             echo "🔍 Certificate type: Let's Encrypt (from service directory)"
             
             # Check certificate validity
-            openssl x509 -in "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem" -text -noout | head -20 || echo "⚠️ Certificate validation failed"
+            openssl x509 -in "/home/__SVC_NAME___user/$REPO_DIR/ssl/fullchain.pem" -text -noout | head -20 || echo "⚠️ Certificate validation failed"
           elif [[ -f "/etc/ssl/selfsigned/cert.pem" ]]; then
             echo "✅ Self-signed SSL certificates available"
             echo "🔍 Certificate type: Self-signed (fallback)"
             
             # Copy self-signed certificates to service directory for consistency
-            mkdir -p "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
-            cp /etc/ssl/selfsigned/cert.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/fullchain.pem"
-            cp /etc/ssl/selfsigned/key.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/privkey.pem"
-            chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
+            mkdir -p "/home/__SVC_NAME___user/$REPO_DIR/ssl"
+            cp /etc/ssl/selfsigned/cert.pem "/home/__SVC_NAME___user/$REPO_DIR/ssl/fullchain.pem"
+            cp /etc/ssl/selfsigned/key.pem "/home/__SVC_NAME___user/$REPO_DIR/ssl/privkey.pem"
+            chown -R __SVC_NAME___user:__SVC_NAME___user "/home/__SVC_NAME___user/$REPO_DIR/ssl"
           else
             echo "❌ No SSL certificates found - this may cause issues with HTTPS"
           fi
@@ -1323,6 +1339,20 @@ jobs:
           echo "🎯 SSL certificate automation complete!"
           DEPLOY_SCRIPT_EOF
           
+          # Replace placeholders with actual values to avoid using GitHub expressions inside the script
+          sed -i "s|__SVC_NAME__|$SVC_NAME|g" /tmp/service-deploy.sh
+          sed -i "s|__SRC_REPO__|$SRC_REPO|g" /tmp/service-deploy.sh
+          sed -i "s|__FULL_DOMAIN__|$FULL_DOMAIN_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__OVERWRITE__|$OVERWRITE_FLAG|g" /tmp/service-deploy.sh
+          sed -i "s|__JWT_SECRET__|$JWT_SECRET_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__AUTHENTIK_JWT__|$AUTHENTIK_JWT_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__NGINX_AUTH_USER__|$NGINX_USER_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__NGINX_AUTH_PASS__|$NGINX_PASS_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__DOCKER_USERNAME__|$DOCKER_USER_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__DOCKER_TOKEN__|$DOCKER_TOKEN_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__CF_API_TOKEN__|$CF_API_TOKEN_VAL|g" /tmp/service-deploy.sh
+          sed -i "s|__ADMIN_EMAIL__|$ADMIN_EMAIL_VAL|g" /tmp/service-deploy.sh
+
           chmod +x /tmp/service-deploy.sh
           
           # Transfer and execute deployment script
