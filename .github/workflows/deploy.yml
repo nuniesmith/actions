@@ -1139,13 +1139,13 @@ jobs:
             FULL_DOMAIN_STR="${{ env.FULL_DOMAIN }}"
             
             # Simple approach: replace commas with -d flags
-            DOMAIN_FLAGS=\$(echo "\$FULL_DOMAIN_STR" | sed 's/,/ -d /g' | sed 's/^/-d /')
+            DOMAIN_FLAGS=$(echo "$FULL_DOMAIN_STR" | sed 's/,/ -d /g' | sed 's/^/-d /')
             
             # Get the primary domain (first one before any comma)
-            PRIMARY_DOMAIN=\$(echo "\$FULL_DOMAIN_STR" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')
+            PRIMARY_DOMAIN=$(echo "$FULL_DOMAIN_STR" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             
-            echo "🔍 Primary domain: \$PRIMARY_DOMAIN"
-            echo "🔍 Domain flags: \$DOMAIN_FLAGS"
+            echo "🔍 Primary domain: $PRIMARY_DOMAIN"
+            echo "🔍 Domain flags: $DOMAIN_FLAGS"
             
             if certbot certonly \
               --dns-cloudflare \
@@ -1154,8 +1154,8 @@ jobs:
               --non-interactive \
               --agree-tos \
               --email ${{ secrets.ADMIN_EMAIL }} \
-              \$DOMAIN_FLAGS \
-              --cert-name "\$PRIMARY_DOMAIN"; then
+              $DOMAIN_FLAGS \
+              --cert-name "$PRIMARY_DOMAIN"; then
               
               echo "✅ Let's Encrypt certificate obtained successfully!"
             else
@@ -1163,12 +1163,12 @@ jobs:
             fi
             
             # Copy certificates to service directory for easy access
-            if [[ -d "/etc/letsencrypt/live/\$PRIMARY_DOMAIN" ]]; then
+            if [[ -d "/etc/letsencrypt/live/$PRIMARY_DOMAIN" ]]; then
               echo "📋 Copying Let's Encrypt certificates to service directory..."
-              mkdir -p "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl"
-              cp /etc/letsencrypt/live/\$PRIMARY_DOMAIN/fullchain.pem "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/"
-              cp /etc/letsencrypt/live/\$PRIMARY_DOMAIN/privkey.pem "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl/"
-              chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/\$REPO_DIR/ssl"
+              mkdir -p "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
+              cp /etc/letsencrypt/live/$PRIMARY_DOMAIN/fullchain.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
+              cp /etc/letsencrypt/live/$PRIMARY_DOMAIN/privkey.pem "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl/"
+              chown -R ${{ env.SERVICE_NAME }}_user:${{ env.SERVICE_NAME }}_user "/home/${{ env.SERVICE_NAME }}_user/$REPO_DIR/ssl"
               
               # Set up automatic renewal
               echo "⚙️ Setting up automatic certificate renewal..."
@@ -1216,7 +1216,7 @@ jobs:
           
           # Test HTTPS connectivity (if service is listening)
           sleep 10
-          curl -k -I https://\$PRIMARY_DOMAIN 2>/dev/null | head -5 || echo "⚠️ Service not yet responding on HTTPS (this is normal during startup)"
+          curl -k -I https://$PRIMARY_DOMAIN 2>/dev/null | head -5 || echo "⚠️ Service not yet responding on HTTPS (this is normal during startup)"
           
           echo "🎯 SSL certificate automation complete!"
           DEPLOY_SCRIPT_EOF
