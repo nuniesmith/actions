@@ -978,6 +978,7 @@ jobs:
               iptables -t filter -N DOCKER-USER 2>/dev/null || true
               iptables -t filter -N DOCKER-CT 2>/dev/null || true
               iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
+              iptables -t filter -N DOCKER-BRIDGE 2>/dev/null || true
               
               # Set up Docker forwarding rules
               iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
@@ -1045,6 +1046,7 @@ jobs:
               iptables -t filter -N DOCKER-USER 2>/dev/null || true
               iptables -t filter -N DOCKER-CT 2>/dev/null || true
               iptables -t filter -N DOCKER-FORWARD 2>/dev/null || true
+              iptables -t filter -N DOCKER-BRIDGE 2>/dev/null || true
               
               # Set up Docker forwarding rules
               iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j DOCKER

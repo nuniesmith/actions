@@ -525,6 +525,7 @@ iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || echo "DOCKER-ISOLA
 iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || echo "DOCKER-ISOLATION-STAGE-2 chain already exists"
 iptables -t filter -N DOCKER-USER 2>/dev/null || echo "DOCKER-USER chain already exists"
 iptables -t filter -N DOCKER-FORWARD 2>/dev/null || echo "DOCKER-FORWARD chain already exists"
+iptables -t filter -N DOCKER-BRIDGE 2>/dev/null || echo "DOCKER-BRIDGE chain already exists"
 
 # Add Docker chains to FORWARD chain if not already present
 echo "🔗 Setting up Docker chain forwarding rules..."
