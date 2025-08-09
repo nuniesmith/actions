@@ -703,14 +703,11 @@ jobs:
     name: 🚀 Service Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [infrastructure, dns-update]
+    needs: [infrastructure]
     if: |
       always() &&
       needs.infrastructure.result == 'success' &&
-      inputs.action_type == 'deploy' &&
-      needs.infrastructure.outputs.server_ip != 'EXTRACTION_FAILED' &&
-      needs.infrastructure.outputs.server_ip != 'SERVER_CREATION_FAILED' &&
-      needs.infrastructure.outputs.server_ip != ''
+      inputs.action_type == 'deploy'
     
     outputs:
       status: ${{ steps.deploy.outputs.status }}
@@ -725,7 +722,6 @@ jobs:
       - name: 🔍 Debug Infrastructure Outputs
         run: |
           echo "🔍 DEBUG: Infrastructure job result: ${{ needs.infrastructure.result }}"
-          echo "🔍 DEBUG: DNS job result: ${{ needs.dns-update.result }}"
           echo "🔍 DEBUG: Infrastructure outputs:"
           echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
           echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
@@ -741,7 +737,6 @@ jobs:
           # Additional debugging for job status
           echo "🔍 DEBUG: Job dependencies status:"
           echo "  infrastructure.result: '${{ needs.infrastructure.result }}'"
-          echo "  dns-update.result: '${{ needs.dns-update.result }}'"
           echo "  infrastructure.debug_info: '${{ needs.infrastructure.outputs.debug_info }}'"
           echo ""
           
