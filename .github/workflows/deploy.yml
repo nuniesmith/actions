@@ -631,7 +631,12 @@ jobs:
           echo "  Linode outputs:"
           echo "    server_id: '${{ steps.linode.outputs.server_id }}'"
           echo "    server_ip: '${{ steps.linode.outputs.server_ip }}'"
-          echo "    ssh_private_key length: $(echo '${{ steps.linode.outputs.ssh_private_key }}' | wc -c)"
+          # Avoid expanding/printing the private key to prevent large expression evaluations
+          if [[ -n "${{ steps.linode.outputs.ssh_private_key }}" ]]; then
+            echo "    ssh_private_key: present"
+          else
+            echo "    ssh_private_key: missing"
+          fi
           echo "  Stage2 outputs:"
           echo "    tailscale_ip: '${{ steps.stage2.outputs.tailscale_ip }}'"
           echo ""
@@ -752,7 +757,12 @@ jobs:
           echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
           echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
           echo "  tailscale_ip: '${{ needs.infrastructure.outputs.tailscale_ip }}'"
-          echo "  ssh_key: $(echo '${{ needs.infrastructure.outputs.ssh_key }}' | wc -c) characters"
+          # Do not expand the ssh_key content here to avoid expression size issues
+          if [[ -n "${{ needs.infrastructure.outputs.ssh_key }}" ]]; then
+            echo "  ssh_key: present"
+          else
+            echo "  ssh_key: missing"
+          fi
           echo "🔍 DEBUG: SERVER_IP env var: '${{ needs.infrastructure.outputs.server_ip }}'"
           echo "🔍 DEBUG: Service details:"
           echo "  SERVICE_NAME: '${{ inputs.service_name }}'"
@@ -876,7 +886,11 @@ jobs:
           echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
           echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
           echo "  tailscale_ip: '${{ needs.infrastructure.outputs.tailscale_ip }}'"
-          echo "  ssh_key: $(echo '${{ needs.infrastructure.outputs.ssh_key }}' | wc -c) characters"
+          if [[ -n "${{ needs.infrastructure.outputs.ssh_key }}" ]]; then
+            echo "  ssh_key: present"
+          else
+            echo "  ssh_key: missing"
+          fi
           echo "🔍 DEBUG: SERVER_IP env var: '$SERVER_IP'"
           echo "🔍 DEBUG: Service details:"
           echo "  SERVICE_NAME: '${{ env.SERVICE_NAME }}'"
