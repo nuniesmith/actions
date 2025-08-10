@@ -172,12 +172,6 @@ jobs:
       stage0_complete: ${{ steps.stage0.outputs.stage0_complete }}
     
     steps:
-      - name: 📦 Checkout Actions Repository
-        uses: actions/checkout@v4
-        with:
-          repository: nuniesmith/actions
-          token: ${{ github.token }}
-
       - name: ✅ Run Stage 0 - Preflight Checks
         id: stage0
         env:
@@ -192,18 +186,21 @@ jobs:
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
         run: |
-          chmod +x ./scripts/stage0-preflight.sh
-          ./scripts/stage0-preflight.sh \
-            "${{ env.SERVICE_NAME }}" \
-            "${{ env.ACTION_TYPE }}" \
-            "${{ inputs.overwrite_server }}" \
-            "true"
-          
+          set -euo pipefail
+          chmod +x ./scripts/stage0-preflight.sh || true
+          # Run if present, else fall back to defaults
+          if [[ -x ./scripts/stage0-preflight.sh ]]; then
+            ./scripts/stage0-preflight.sh \
+              "${{ env.SERVICE_NAME }}" \
+              "${{ env.ACTION_TYPE }}" \
+              "${{ inputs.overwrite_server }}" \
+              "true"
+          fi
+
           # Copy outputs from stage0 script
           if [[ -f /tmp/stage0-outputs/github_output ]]; then
             cat /tmp/stage0-outputs/github_output >> $GITHUB_OUTPUT
           else
-            # Set default outputs for stage0 if script doesn't exist or doesn't create outputs
             echo "should_deploy=true" >> $GITHUB_OUTPUT
             echo "should_destroy=false" >> $GITHUB_OUTPUT
             echo "should_health_check=false" >> $GITHUB_OUTPUT
@@ -800,8 +797,68 @@ jobs:
           
           echo "✅ Infrastructure validation passed - proceeding with deployment"
       
-      - name: 🚀 Deploy Service
+      - name: 🚀 Deploy nginx via start.sh (parity with local)
         id: deploy
+        if: env.SERVICE_NAME == 'nginx'
+        env:
+          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
+          SSH_PRIVATE_KEY_B64: ${{ needs.infrastructure.outputs.ssh_key }}
+        run: |
+          set -euo pipefail
+          # Prepare SSH key
+          mkdir -p ~/.ssh
+          if echo "$SSH_PRIVATE_KEY_B64" | base64 -d >/dev/null 2>&1; then
+            echo "$SSH_PRIVATE_KEY_B64" | base64 -d > ~/.ssh/deployment_key
+          else
+            printf "%s" "$SSH_PRIVATE_KEY_B64" > ~/.ssh/deployment_key
+          fi
+          chmod 600 ~/.ssh/deployment_key
+
+          echo "🚀 Connecting to $SERVER_IP and running nginx/start.sh"
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deployment_key root@"$SERVER_IP" bash -s <<'REMOTE'
+          set -euo pipefail
+          # Ensure git and curl are available
+          if ! command -v git >/dev/null 2>&1; then
+            if command -v pacman >/dev/null 2>&1; then
+              pacman -Sy --noconfirm git || true
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y git || true
+            fi
+          fi
+
+          # Clone/update repo to /opt/nginx
+          REPO_DIR=/opt/nginx
+          if [ ! -d "$REPO_DIR/.git" ]; then
+            mkdir -p "$REPO_DIR"
+            rm -rf "$REPO_DIR"/* 2>/dev/null || true
+            git clone --depth=1 https://github.com/nuniesmith/nginx.git "$REPO_DIR"
+          else
+            git -C "$REPO_DIR" fetch --depth=1 origin
+            git -C "$REPO_DIR" reset --hard origin/main
+          fi
+
+          cd "$REPO_DIR"
+          chmod +x ./start.sh || true
+
+          # Run start.sh exactly like local
+          ./start.sh --pull --force-recreate || {
+            echo "start.sh failed; showing docker compose status/logs"
+            (docker compose ps || docker-compose ps) || true
+            (docker compose logs --tail=200 || docker-compose logs --tail=200) || true
+            exit 1
+          }
+
+          # Brief health ping
+          (curl -fsS -m 5 http://localhost/health || curl -fsS -m 5 http://localhost) >/dev/null 2>&1 || true
+
+          # Show running containers
+          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
+          REMOTE
+
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: 🚀 Deploy Service (generic)
+        if: env.SERVICE_NAME != 'nginx'
         env:
           SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
           JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
