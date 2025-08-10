@@ -142,7 +142,7 @@ on:
       tailscale_ip:
         value: ${{ jobs.infrastructure.outputs.tailscale_ip }}
       deployment_status:
-        value: ${{ jobs.service-deploy.outputs.status }}
+        value: ${{ jobs.infrastructure.outputs.deployment_status }}
       restart_status:
         value: ${{ jobs.service-restart.outputs.status }}
       destruction_status:
@@ -224,8 +224,9 @@ jobs:
     outputs:
       server_id: ${{ steps.linode.outputs.server_id }}
       server_ip: ${{ steps.linode.outputs.server_ip }}
-      tailscale_ip: ${{ steps.stage2.outputs.tailscale_ip }}
+      tailscale_ip: ${{ steps.linode.outputs.tailscale_ip }}
       ssh_key: ${{ steps.linode.outputs.ssh_private_key }}
+      deployment_status: ${{ steps.deploy.outputs.status }}
     
     steps:
       - name: 🔍 Debug Infrastructure Job Start
@@ -272,179 +273,23 @@ jobs:
           ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
         run: |
-          # Install Linode CLI
-          pip install linode-cli
-          export LINODE_CLI_TOKEN="${{ secrets.LINODE_CLI_TOKEN }}"
-          
-          echo "🏗️ Creating Linode server for ${{ env.SERVICE_NAME }}..."
-          
-          # Generate SSH key for this deployment
-          ssh-keygen -t rsa -b 4096 -f ~/.ssh/deployment_key -N "" -C "github-actions-${{ env.SERVICE_NAME }}"
-          SSH_PUBLIC_KEY=$(cat ~/.ssh/deployment_key.pub)
-          SSH_PRIVATE_KEY=$(base64 -w 0 ~/.ssh/deployment_key)
-          
-          # Check for existing server and handle overwrite
-          SERVER_LABEL="${{ env.SERVICE_NAME }}"
-          EXISTING_SERVER=$(linode-cli linodes list --text --no-headers | grep -E "^[0-9]+\s+$SERVER_LABEL\s+" || true)
-          
-          if [[ -n "$EXISTING_SERVER" ]]; then
-            EXISTING_SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
-            echo "🔍 Found existing server: $SERVER_LABEL (ID: $EXISTING_SERVER_ID)"
-            
-            if [[ "${{ inputs.overwrite_server }}" == "true" ]]; then
-              echo "💥 Overwrite enabled - destroying existing server..."
-              linode-cli linodes delete "$EXISTING_SERVER_ID" --text
-              
-              # Wait for server to be deleted
-              echo "⏳ Waiting for server deletion..."
-              for i in {1..20}; do
-                if ! linode-cli linodes view "$EXISTING_SERVER_ID" --text --no-headers 2>/dev/null; then
-                  echo "✅ Server deleted successfully"
-                  break
-                fi
-                sleep 10
-              done
-            else
-              # Create unique label with timestamp
-              TIMESTAMP=$(date +%s)
-              SERVER_LABEL="${{ env.SERVICE_NAME }}-${TIMESTAMP}"
-              echo "⚠️ Server exists but overwrite disabled - using unique label: $SERVER_LABEL"
-            fi
-          fi
-          
-          echo "🆕 Creating new server: $SERVER_LABEL"
-          
-          RESULT=$(linode-cli linodes create \
-            --type "${{ inputs.server_type }}" \
-            --region "${{ inputs.target_region }}" \
-            --image "linode/arch" \
-            --label "$SERVER_LABEL" \
-            --root_pass "${{ secrets.SERVICE_ROOT_PASSWORD }}" \
-            --authorized_keys "$SSH_PUBLIC_KEY" \
-            --backups_enabled=false \
-            --text --no-headers)
-          
-          if [[ -z "$RESULT" ]] || [[ "$RESULT" == *"error"* ]]; then
-            echo "❌ Server creation failed!"
-            echo "Error details: $RESULT"
-            exit 1
-          fi
-          
-          SERVER_ID=$(echo "$RESULT" | cut -f1)
-          
-          # Wait for server to be running and get IP
-          echo "⏳ Waiting for server to be ready..."
-          for i in {1..15}; do
-            SERVER_INFO=$(linode-cli linodes view "$SERVER_ID" --text --no-headers)
-            STATUS=$(echo "$SERVER_INFO" | cut -f6)
-            echo "🔍 Attempt $i/15: Server status is '$STATUS'"
-            if [[ "$STATUS" == "running" ]]; then
-              echo "✅ Server is now running!"
-              break
-            fi
-            sleep 10
-          done
-          
-          # Debug: Show the complete server info structure
-          echo "🔍 DEBUG: Complete server info structure:"
-          echo "$SERVER_INFO" | cat -n
-          echo "🔍 DEBUG: Field breakdown:"
-          echo "Field 1 (ID): $(echo "$SERVER_INFO" | cut -f1)"
-          echo "Field 2: $(echo "$SERVER_INFO" | cut -f2)"
-          echo "Field 3: $(echo "$SERVER_INFO" | cut -f3)"
-          echo "Field 4: $(echo "$SERVER_INFO" | cut -f4)"
-          echo "Field 5: $(echo "$SERVER_INFO" | cut -f5)"
-          echo "Field 6 (Status): $(echo "$SERVER_INFO" | cut -f6)"
-          echo "Field 7 (IP): $(echo "$SERVER_INFO" | cut -f7)"
-          echo "Field 8: $(echo "$SERVER_INFO" | cut -f8)"
-          
-          # Extract server IP with fallback methods
-          SERVER_IP=$(echo "$SERVER_INFO" | cut -f7)
-          
-          # If field 7 is empty, try alternative extraction methods
-          if [[ -z "$SERVER_IP" ]] || [[ "$SERVER_IP" == "null" ]]; then
-            echo "⚠️ Field 7 is empty, trying alternative extraction methods..."
-            
-            # Try using linode-cli to get IPs specifically
-            IP_INFO=$(linode-cli linodes ips-list "$SERVER_ID" --text --no-headers 2>/dev/null || true)
-            if [[ -n "$IP_INFO" ]]; then
-              SERVER_IP=$(echo "$IP_INFO" | head -1 | cut -f1)
-              echo "🔍 Extracted IP from ips-list: '$SERVER_IP'"
-            fi
-            
-            # If still empty, try JSON format as a last resort
-            if [[ -z "$SERVER_IP" ]] || [[ "$SERVER_IP" == "null" ]]; then
-              echo "⚠️ Trying JSON format extraction..."
-              JSON_INFO=$(linode-cli linodes view "$SERVER_ID" --json 2>/dev/null || echo "[]")
-              SERVER_IP=$(echo "$JSON_INFO" | grep -o '"ipv4":\s*\[\s*"[^"]*"' | grep -o '[0-9.]*' | head -1 || true)
-              echo "🔍 Extracted IP from JSON: '$SERVER_IP'"
-            fi
-          fi
-          
-          # Validate outputs before setting them with improved error handling
-          echo "🔍 Validating extracted values before setting outputs..."
-          
-          VALIDATION_FAILED=false
-          
-          if [[ -z "$SERVER_ID" ]]; then
-            echo "❌ ERROR: SERVER_ID is empty!"
-            echo "🔍 SERVER_INFO: $SERVER_INFO"
-            echo "🔍 RESULT: $RESULT"
-            VALIDATION_FAILED=true
-          else
-            echo "✅ SERVER_ID is valid: '$SERVER_ID'"
-          fi
-          
-          if [[ -z "$SERVER_IP" ]] || [[ "$SERVER_IP" == "null" ]]; then
-            echo "❌ ERROR: SERVER_IP is empty or null!"
-            echo "🔍 SERVER_INFO: $SERVER_INFO"
-            echo "🔍 RESULT: $RESULT"
-            echo "🔍 Extracted SERVER_IP: '$SERVER_IP'"
-            VALIDATION_FAILED=true
-          else
-            echo "✅ SERVER_IP is valid: '$SERVER_IP'"
-          fi
-          
-          if [[ -z "$SSH_PRIVATE_KEY" ]]; then
-            echo "❌ ERROR: SSH_PRIVATE_KEY is empty!"
-            VALIDATION_FAILED=true
-          else
-            echo "✅ SSH_PRIVATE_KEY is present ($(echo "$SSH_PRIVATE_KEY" | wc -c) characters)"
-          fi
-          
-          # Set outputs regardless to allow downstream debugging
-          echo "🔍 Setting outputs (even if validation failed for debugging purposes)..."
-          echo "server_ip=${SERVER_IP:-'EXTRACTION_FAILED'}" >> $GITHUB_OUTPUT
-          echo "server_id=${SERVER_ID:-'EXTRACTION_FAILED'}" >> $GITHUB_OUTPUT
-          echo "ssh_private_key=${SSH_PRIVATE_KEY:-'KEY_GENERATION_FAILED'}" >> $GITHUB_OUTPUT
-          
-          if [[ "$VALIDATION_FAILED" == "true" ]]; then
-            echo "❌ Server creation validation failed - check Linode CLI output format"
-            echo "🔍 This may be due to changes in Linode CLI output format"
-            echo "🔍 Debug: SERVER_ID='$SERVER_ID', SERVER_IP='$SERVER_IP', SSH_KEY length=$(echo "$SSH_PRIVATE_KEY" | wc -c)"
-            exit 1
-          fi
-          
-          echo "✅ Server ready: $SERVER_IP (ID: $SERVER_ID)"
-          echo "🔍 Debug: SERVER_ID='$SERVER_ID', SERVER_IP='$SERVER_IP', SSH_KEY length=$(echo "$SSH_PRIVATE_KEY" | wc -c)"
+          chmod +x ./scripts/linode/create-server.sh
+          # This script sets server_ip, server_id, ssh_private_key via $GITHUB_OUTPUT
+          ./scripts/linode/create-server.sh \
+            "${{ env.SERVICE_NAME }}" \
+            "${{ inputs.server_type }}" \
+            "${{ inputs.target_region }}" \
+            "${{ inputs.overwrite_server }}"
       
       - name: ⏳ Wait for SSH Access
         if: steps.linode.outputs.server_ip != 'EXTRACTION_FAILED' && steps.linode.outputs.server_ip != ''
         run: |
-          echo "⏳ Waiting for SSH access to ${{ steps.linode.outputs.server_ip }}..."
-          
-          # Test SSH connectivity
-          for i in {1..15}; do
-            if timeout 10 ssh -i ~/.ssh/deployment_key -v -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-               root@${{ steps.linode.outputs.server_ip }} "echo 'SSH ready'"; then
-              echo "✅ SSH connection successful"
-              break
-            fi
-            echo "Attempt $i/15: Waiting for SSH..."
-            sleep 15
-          done
+          echo "⏳ Waiting for SSH access to ${{ steps.linode.outputs.server_ip }} using helper script..."
+          chmod +x ./scripts/linode/wait-for-ssh.sh
+          ./scripts/linode/wait-for-ssh.sh "${{ steps.linode.outputs.server_ip }}"
 
       - name: 🔧 Run Stage 1 Setup Script
+        id: deploy
         if: steps.linode.outputs.server_ip != 'EXTRACTION_FAILED' && steps.linode.outputs.server_ip != ''
         env:
           SERVER_IP: ${{ steps.linode.outputs.server_ip }}
@@ -481,586 +326,17 @@ jobs:
           # Remove empty lines from SSH keys file
           grep -v '^$' /tmp/additional_ssh_keys.pub > /tmp/ssh_keys_clean.pub || touch /tmp/ssh_keys_clean.pub
           
-          # Transfer files to server
-          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no \
-            /tmp/stage1-setup.sh root@$SERVER_IP:/tmp/
-          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no \
-            /tmp/ssh_keys_clean.pub root@$SERVER_IP:/tmp/
-          
-          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
-            "chmod +x /tmp/stage1-setup.sh && /tmp/stage1-setup.sh"
-          
-          echo "✅ Stage 1 setup completed"
+              echo "✅ Prerequisites validated - proceeding with service deployment via scripts/deployment/deploy-service.sh"
 
-      - name: 🔄 Reboot Server for Kernel Updates
-        if: steps.linode.outputs.server_ip != 'EXTRACTION_FAILED' && steps.linode.outputs.server_ip != ''
-        env:
-          SERVER_IP: ${{ steps.linode.outputs.server_ip }}
-        run: |
-          echo "🔄 Rebooting server for kernel updates and service initialization..."
-          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "reboot" || true
-          
-          echo "⏳ Waiting for server to come back online..."
-          sleep 45
-          
-          # Wait for SSH to be available again
-          for i in {1..20}; do
-            if ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-               root@$SERVER_IP "echo 'SSH ready after reboot'"; then
-              echo "✅ Server is back online after reboot"
-              break
-            fi
-            echo "Attempt $i/20: Waiting for server to come back online..."
-            sleep 15
-          done
+              # Setup SSH key
+              mkdir -p ~/.ssh
+              echo "${{ steps.linode.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/deployment_key
+              chmod 600 ~/.ssh/deployment_key
 
-      - name: 🏗️ Run Stage 2 Post-Reboot Setup
-        if: steps.linode.outputs.server_ip != 'EXTRACTION_FAILED' && steps.linode.outputs.server_ip != ''
-        id: stage2
-        env:
-          SERVER_IP: ${{ steps.linode.outputs.server_ip }}
-          SERVICE_NAME: ${{ env.SERVICE_NAME }}
-          FULL_DOMAIN: ${{ env.FULL_DOMAIN }}
-          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
-          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
-          NETDATA_CLAIM_ROOM: ${{ secrets.NETDATA_CLAIM_ROOM }}
-          NETDATA_CLAIM_TOKEN: ${{ secrets.NETDATA_CLAIM_TOKEN }}
-          FULLY_QUALIFIED_DOMAIN_NAME: ${{ secrets.FULLY_QUALIFIED_DOMAIN_NAME }}
-          TOP_LEVEL_DOMAIN: ${{ secrets.TOP_LEVEL_DOMAIN }}
-        run: |
-          echo "🏗️ Running Stage 2 post-reboot setup..."
+              chmod +x ./scripts/deployment/deploy-service.sh
+              ./scripts/deployment/deploy-service.sh "${{ env.SERVICE_NAME }}" "${{ steps.linode.outputs.server_ip }}"
 
-          # Prepare stage2 script with environment variables
-          cp ./scripts/stage2-post-reboot.sh /tmp/stage2-setup.sh
-
-          # Replace placeholders with environment variables (including service name and domain)
-          envsubst '${SERVICE_NAME} ${FULL_DOMAIN} ${TS_OAUTH_CLIENT_ID} ${TS_OAUTH_SECRET} ${TAILSCALE_TAILNET} ${CLOUDFLARE_API_TOKEN} ${CLOUDFLARE_ZONE_ID} ${ADMIN_EMAIL}' < /tmp/stage2-setup.sh > /tmp/stage2-final.sh
-
-          # Fallback: Replace any remaining placeholders with sed (in case envsubst misses them)
-          sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" /tmp/stage2-final.sh
-          sed -i "s|DOMAIN_NAME_PLACEHOLDER|${{ env.FULL_DOMAIN }}|g" /tmp/stage2-final.sh
-          sed -i "s|TS_OAUTH_CLIENT_ID_PLACEHOLDER|${{ secrets.TS_OAUTH_CLIENT_ID }}|g" /tmp/stage2-final.sh
-          sed -i "s|TS_OAUTH_SECRET_PLACEHOLDER|${{ secrets.TS_OAUTH_SECRET }}|g" /tmp/stage2-final.sh
-          sed -i "s|TAILSCALE_TAILNET_PLACEHOLDER|${{ secrets.TAILSCALE_TAILNET }}|g" /tmp/stage2-final.sh
-          sed -i "s|CLOUDFLARE_API_TOKEN_PLACEHOLDER|${{ secrets.CLOUDFLARE_API_TOKEN }}|g" /tmp/stage2-final.sh
-          sed -i "s|CLOUDFLARE_ZONE_ID_PLACEHOLDER|${{ secrets.CLOUDFLARE_ZONE_ID }}|g" /tmp/stage2-final.sh
-          sed -i "s|ADMIN_EMAIL_PLACEHOLDER|${{ secrets.ADMIN_EMAIL }}|g" /tmp/stage2-final.sh
-          # Remove CLOUDFLARE_EMAIL references - not needed with API token auth
-          sed -i "s|CLOUDFLARE_EMAIL_PLACEHOLDER||g" /tmp/stage2-final.sh
-
-          # Debug: Show what variables we're passing
-          echo "🔍 Debug: SERVICE_NAME=${{ env.SERVICE_NAME }}"
-          echo "🔍 Debug: FULL_DOMAIN=${{ env.FULL_DOMAIN }}"
-
-          # Transfer and execute stage2 script
-          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no \
-            /tmp/stage2-final.sh root@$SERVER_IP:/tmp/stage2-post-reboot.sh
-
-          # Create environment file on remote server for the script to source
-          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP "
-            mkdir -p /opt
-            echo \"export SERVICE_NAME_ENV='${{ env.SERVICE_NAME }}'\" > /opt/stage2-env.sh
-            echo \"export FULL_DOMAIN_ENV='${{ env.FULL_DOMAIN }}'\" >> /opt/stage2-env.sh
-            echo \"export TS_OAUTH_CLIENT_ID_ENV='${{ secrets.TS_OAUTH_CLIENT_ID }}'\" >> /opt/stage2-env.sh
-            echo \"export TS_OAUTH_SECRET_ENV='${{ secrets.TS_OAUTH_SECRET }}'\" >> /opt/stage2-env.sh
-            echo \"export TAILSCALE_TAILNET_ENV='${{ secrets.TAILSCALE_TAILNET }}'\" >> /opt/stage2-env.sh
-            echo \"export CLOUDFLARE_API_TOKEN_ENV='${{ secrets.CLOUDFLARE_API_TOKEN }}'\" >> /opt/stage2-env.sh
-            echo \"export CLOUDFLARE_ZONE_ID_ENV='${{ secrets.CLOUDFLARE_ZONE_ID }}'\" >> /opt/stage2-env.sh
-            echo \"export ADMIN_EMAIL_ENV='${{ secrets.ADMIN_EMAIL }}'\" >> /opt/stage2-env.sh
-            chmod +x /opt/stage2-env.sh
-          "
-
-          # Execute the script with environment loaded
-          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
-            "chmod +x /tmp/stage2-post-reboot.sh && source /opt/stage2-env.sh && /tmp/stage2-post-reboot.sh"
-
-          echo "🔗 Getting Tailscale IP (with retries)..."
-          ATTEMPTS=18   # ~3 minutes (18*10s)
-          SLEEP_SECS=10
-          TAILSCALE_IP=""
-          for i in $(seq 1 $ATTEMPTS); do
-            CANDIDATE=$(ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@$SERVER_IP \
-              "tailscale ip -4 2>/dev/null || true")
-            if echo "$CANDIDATE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-              TAILSCALE_IP="$CANDIDATE"
-              echo "✅ Tailscale IPv4 acquired: $TAILSCALE_IP (attempt $i/$ATTEMPTS)"
-              break
-            fi
-            echo "⏳ Tailscale IPv4 not ready yet (attempt $i/$ATTEMPTS). Got: '${CANDIDATE:-empty}'. Retrying in ${SLEEP_SECS}s..."
-            sleep "$SLEEP_SECS"
-          done
-
-          if [[ -z "$TAILSCALE_IP" ]]; then
-            echo "⚠️ Tailscale IPv4 still unavailable after retries; marking as 'pending'"
-            TAILSCALE_IP="pending"
-          fi
-
-          echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
-          echo "✅ Stage 2 setup completed"
-
-      - name: 🔧 Set Fallback Outputs
-        if: always()
-        run: |
-          echo "🔧 Ensuring outputs are set for downstream jobs..."
-          
-          # Check if outputs were set by previous steps and set defaults if missing
-          if [[ -z "${{ steps.linode.outputs.server_ip }}" ]]; then
-            echo "⚠️ Setting fallback server_ip output"
-            echo "server_ip=SERVER_CREATION_FAILED" >> $GITHUB_OUTPUT
-          fi
-          
-          if [[ -z "${{ steps.linode.outputs.server_id }}" ]]; then
-            echo "⚠️ Setting fallback server_id output"
-            echo "server_id=SERVER_CREATION_FAILED" >> $GITHUB_OUTPUT
-          fi
-          
-          if [[ "${{ steps.stage2.outcome }}" != "success" || -z "${{ steps.stage2.outputs.tailscale_ip }}" ]]; then
-            echo "⚠️ Setting fallback tailscale_ip output"
-            echo "tailscale_ip=TAILSCALE_SETUP_FAILED" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "✅ Fallback outputs configured"
-
-      - name: 🔍 Debug Infrastructure Outputs
-        run: |
-          echo "🔍 DEBUG: Infrastructure job completion check"
-          echo "  Linode outputs:"
-          echo "    server_id: '${{ steps.linode.outputs.server_id }}'"
-          echo "    server_ip: '${{ steps.linode.outputs.server_ip }}'"
-          # Avoid expanding/printing the private key to prevent large expression evaluations
-          if [[ -n "${{ steps.linode.outputs.ssh_private_key }}" ]]; then
-            echo "    ssh_private_key: present"
-          else
-            echo "    ssh_private_key: missing"
-          fi
-          echo "  Stage2 outputs:"
-          echo "    tailscale_ip: '${{ steps.stage2.outputs.tailscale_ip }}'"
-          echo ""
-          
-          # Validate critical outputs - warn but don't fail the job
-          if [[ -z "${{ steps.linode.outputs.server_ip }}" ]]; then
-            echo "⚠️ WARNING: server_ip is empty!"
-            echo "🔍 Linode step may have failed or not set outputs properly"
-            echo "🔍 Check if Linode server creation completed successfully"
-            echo "🔍 Job will continue but deployment may fail"
-          else
-            echo "✅ server_ip is present: '${{ steps.linode.outputs.server_ip }}'"
-          fi
-          
-          if [[ -z "${{ steps.linode.outputs.server_id }}" ]]; then
-            echo "⚠️ WARNING: server_id is empty!"
-            echo "🔍 Linode step may have failed or not set outputs properly"
-            echo "🔍 Check if Linode server creation completed successfully"
-            echo "🔍 Job will continue but deployment may fail"
-          else
-            echo "✅ server_id is present: '${{ steps.linode.outputs.server_id }}'"
-          fi
-          
-          echo "✅ Infrastructure outputs validation completed (warnings only, no failures)"
-          echo "🔍 Infrastructure job will complete successfully to allow downstream jobs to handle empty outputs"
-
-  # ============================================================================
-  # DNS Updates
-  # ============================================================================
-  dns-update:
-    name: 🌐 DNS Updates
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: [infrastructure]
-    if: |
-      needs.infrastructure.result == 'success' &&
-      inputs.action_type == 'deploy'
-    
-    steps:
-      - name: 📁 Checkout Actions
-        uses: actions/checkout@v4
-        with:
-          repository: nuniesmith/actions
-          token: ${{ github.token }}
-      
-      - name: 🌐 Update DNS Records
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-          TAILSCALE_IP: ${{ needs.infrastructure.outputs.tailscale_ip }}
-          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
-        run: |
-          chmod +x ./scripts/dns/cloudflare-updater.sh
-          
-          echo "🔍 Debug: Infrastructure outputs available:"
-          echo "  TAILSCALE_IP='$TAILSCALE_IP'"
-          echo "  SERVER_IP='$SERVER_IP'"
-          
-          # Prefer a valid IPv4 Tailscale IP; fall back to SERVER_IP when pending/invalid
-          VALID_TS=false
-          if [[ -n "$TAILSCALE_IP" ]] && echo "$TAILSCALE_IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-            VALID_TS=true
-          fi
-
-          if [[ "$TAILSCALE_IP" == "pending" ]] || [[ "$TAILSCALE_IP" == "null" ]] || [[ "$TAILSCALE_IP" == "''" ]] || [[ "$VALID_TS" != true ]]; then
-            echo "ℹ️ Tailscale IP not ready or invalid ('$TAILSCALE_IP'); attempting to use SERVER_IP instead"
-            IP_TO_USE="$SERVER_IP"
-          else
-            IP_TO_USE="$TAILSCALE_IP"
-          fi
-
-          # Validate fallback SERVER_IP as IPv4
-          if [[ -z "$IP_TO_USE" ]] || ! echo "$IP_TO_USE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "❌ No valid IP address available for DNS update"
-            echo "🔍 Available infrastructure outputs:"
-            echo "  Server ID: ${{ needs.infrastructure.outputs.server_id }}"
-            echo "  Server IP: ${{ needs.infrastructure.outputs.server_ip }}"
-            echo "  Tailscale IP: ${{ needs.infrastructure.outputs.tailscale_ip }}"
-            echo "⚠️ Skipping DNS update - waiting for valid IP on future runs"
-            exit 0  # Don't fail the workflow, just skip DNS update
-          fi
-          
-          echo "🌐 Updating DNS for ${{ env.SERVICE_NAME }} with IP: $IP_TO_USE"
-          ./scripts/dns/cloudflare-updater.sh update-service \
-            --service "${{ env.SERVICE_NAME }}" \
-            --ip "$IP_TO_USE" \
-            --domain "${{ inputs.domain_suffix }}" \
-            --token "$CLOUDFLARE_API_TOKEN" \
-            --zone-id "$CLOUDFLARE_ZONE_ID"
-
-  # ============================================================================
-  # Service Deployment
-  # ============================================================================
-  service-deploy:
-    name: 🚀 Service Deploy
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: [infrastructure]
-    if: |
-      always() &&
-      needs.infrastructure.result == 'success' &&
-      inputs.action_type == 'deploy'
-    
-    outputs:
-      status: ${{ steps.deploy.outputs.status }}
-    
-    steps:
-      - name: 📁 Checkout Actions
-        uses: actions/checkout@v4
-        with:
-          repository: nuniesmith/actions
-          token: ${{ github.token }}
-      
-      - name: 🔍 Debug Infrastructure Outputs
-        run: |
-          echo "🔍 DEBUG: Infrastructure job result: ${{ needs.infrastructure.result }}"
-          echo "🔍 DEBUG: Infrastructure outputs:"
-          echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
-          echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
-          echo "  tailscale_ip: '${{ needs.infrastructure.outputs.tailscale_ip }}'"
-          # Do not expand the ssh_key content here to avoid expression size issues
-          if [[ -n "${{ needs.infrastructure.outputs.ssh_key }}" ]]; then
-            echo "  ssh_key: present"
-          else
-            echo "  ssh_key: missing"
-          fi
-          echo "🔍 DEBUG: SERVER_IP env var: '${{ needs.infrastructure.outputs.server_ip }}'"
-          echo "🔍 DEBUG: Service details:"
-          echo "  SERVICE_NAME: '${{ inputs.service_name }}'"
-          echo "  SOURCE_REPOSITORY: '${{ inputs.source_repository }}'"
-          echo "  FULL_DOMAIN: '${{ inputs.custom_domain }}'"
-          echo ""
-          
-          # Additional debugging for job status
-          echo "🔍 DEBUG: Job dependencies status:"
-          echo "  infrastructure.result: '${{ needs.infrastructure.result }}'"
-          echo ""
-          
-          # Check if infrastructure job actually completed
-          if [[ "${{ needs.infrastructure.result }}" != "success" ]]; then
-            echo "❌ ERROR: Infrastructure job did not complete successfully!"
-            echo "Infrastructure result: ${{ needs.infrastructure.result }}"
-            echo "🔍 This explains why outputs are empty - the infrastructure job failed"
-            exit 1
-          fi
-          
-          # Check for specific failure conditions from infrastructure outputs
-          SERVER_IP="${{ needs.infrastructure.outputs.server_ip }}"
-          
-          if [[ -z "$SERVER_IP" ]] || [[ "$SERVER_IP" == "null" ]]; then
-            echo "❌ ERROR: SERVER_IP is empty or null! Cannot deploy without server IP."
-            echo "🔍 DEBUG: Raw server_ip output: '$SERVER_IP'"
-            echo "🔍 DEBUG: This indicates the infrastructure job completed but didn't set outputs properly"
-            echo "🔍 DEBUG: Check the infrastructure job logs for failed steps"
-            exit 1
-          fi
-          
-          if [[ "$SERVER_IP" == "EXTRACTION_FAILED" ]] || [[ "$SERVER_IP" == "SERVER_CREATION_FAILED" ]]; then
-            echo "❌ ERROR: Server creation failed! Cannot deploy without a valid server."
-            echo "🔍 DEBUG: Server IP extraction failed during infrastructure setup"
-            echo "🔍 DEBUG: Check the infrastructure job logs for Linode API errors"
-            echo "🔍 DEBUG: This may be due to:"
-            echo "  - Invalid Linode CLI token"
-            echo "  - Insufficient Linode account quota"
-            echo "  - Changes in Linode CLI output format"
-            exit 1
-          fi
-          
-          echo "✅ Infrastructure validation passed - proceeding with deployment"
-      
-      - name: 🚀 Deploy nginx via start.sh (parity with local)
-        id: deploy
-        if: env.SERVICE_NAME == 'nginx'
-        env:
-          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
-          SSH_PRIVATE_KEY_B64: ${{ needs.infrastructure.outputs.ssh_key }}
-        run: |
-          set -euo pipefail
-          # Prepare SSH key
-          mkdir -p ~/.ssh
-          if echo "$SSH_PRIVATE_KEY_B64" | base64 -d >/dev/null 2>&1; then
-            echo "$SSH_PRIVATE_KEY_B64" | base64 -d > ~/.ssh/deployment_key
-          else
-            printf "%s" "$SSH_PRIVATE_KEY_B64" > ~/.ssh/deployment_key
-          fi
-          chmod 600 ~/.ssh/deployment_key
-
-          echo "🚀 Connecting to $SERVER_IP and running nginx/start.sh"
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deployment_key root@"$SERVER_IP" bash -s <<'REMOTE'
-          set -euo pipefail
-          # Ensure git and curl are available
-          if ! command -v git >/dev/null 2>&1; then
-            if command -v pacman >/dev/null 2>&1; then
-              pacman -Sy --noconfirm git || true
-            elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update && apt-get install -y git || true
-            fi
-          fi
-
-          # Clone/update repo to /opt/nginx
-          REPO_DIR=/opt/nginx
-          if [ ! -d "$REPO_DIR/.git" ]; then
-            mkdir -p "$REPO_DIR"
-            rm -rf "$REPO_DIR"/* 2>/dev/null || true
-            git clone --depth=1 https://github.com/nuniesmith/nginx.git "$REPO_DIR"
-          else
-            git -C "$REPO_DIR" fetch --depth=1 origin
-            git -C "$REPO_DIR" reset --hard origin/main
-          fi
-
-          cd "$REPO_DIR"
-          chmod +x ./start.sh || true
-
-          # Run start.sh exactly like local
-          ./start.sh --pull --force-recreate || {
-            echo "start.sh failed; showing docker compose status/logs"
-            (docker compose ps || docker-compose ps) || true
-            (docker compose logs --tail=200 || docker-compose logs --tail=200) || true
-            exit 1
-          }
-
-          # Brief health ping
-          (curl -fsS -m 5 http://localhost/health || curl -fsS -m 5 http://localhost) >/dev/null 2>&1 || true
-
-          # Show running containers
-          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
-          REMOTE
-
-          echo "status=success" >> $GITHUB_OUTPUT
-
-      - name: 🚀 Deploy Service (generic)
-        if: env.SERVICE_NAME != 'nginx'
-        env:
-          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
-          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-          AUTHENTIK_JWT_SECRET: ${{ secrets.AUTHENTIK_JWT_SECRET }}
-          NGINX_AUTH_USER: ${{ secrets.NGINX_AUTH_USER }}
-          NGINX_AUTH_PASS: ${{ secrets.NGINX_AUTH_PASS }}
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
-          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          # Debug: Show all infrastructure outputs
-          echo "🔍 DEBUG: Infrastructure job result: ${{ needs.infrastructure.result }}"
-          echo "🔍 DEBUG: Infrastructure outputs:"
-          echo "  server_ip: '${{ needs.infrastructure.outputs.server_ip }}'"
-          echo "  server_id: '${{ needs.infrastructure.outputs.server_id }}'"
-          echo "  tailscale_ip: '${{ needs.infrastructure.outputs.tailscale_ip }}'"
-          if [[ -n "${{ needs.infrastructure.outputs.ssh_key }}" ]]; then
-            echo "  ssh_key: present"
-          else
-            echo "  ssh_key: missing"
-          fi
-          echo "🔍 DEBUG: SERVER_IP env var: '$SERVER_IP'"
-          echo "🔍 DEBUG: Service details:"
-          echo "  SERVICE_NAME: '${{ env.SERVICE_NAME }}'"
-          echo "  SOURCE_REPOSITORY: '${{ env.SOURCE_REPOSITORY }}'"
-          echo "  FULL_DOMAIN: '${{ env.FULL_DOMAIN }}'"
-          echo ""
-          
-          # Since we've already validated in the condition and debug step, proceed with deployment
-          echo "✅ Prerequisites validated - proceeding with service deployment"
-          
-          # Setup SSH key
-          mkdir -p ~/.ssh
-          echo "${{ needs.infrastructure.outputs.ssh_key }}" | base64 -d > ~/.ssh/deployment_key
-          chmod 600 ~/.ssh/deployment_key
-          
-          # Setup local variables to minimize GitHub expression expansion in the script body
-          SVC_NAME="${{ env.SERVICE_NAME }}"
-          SRC_REPO="${{ env.SOURCE_REPOSITORY }}"
-          FULL_DOMAIN_VAL="${{ env.FULL_DOMAIN }}"
-          OVERWRITE_FLAG="${{ inputs.overwrite_server }}"
-          JWT_SECRET_VAL="$JWT_SECRET_KEY"
-          AUTHENTIK_JWT_VAL="$AUTHENTIK_JWT_SECRET"
-          NGINX_USER_VAL="$NGINX_AUTH_USER"
-          NGINX_PASS_VAL="$NGINX_AUTH_PASS"
-          DOCKER_USER_VAL="$DOCKER_USERNAME"
-          DOCKER_TOKEN_VAL="$DOCKER_TOKEN"
-          ADMIN_EMAIL_VAL="$ADMIN_EMAIL"
-          CF_API_TOKEN_VAL="$CLOUDFLARE_API_TOKEN"
-
-          # Create deployment script locally with placeholders to avoid GitHub expressions inside the heredoc
-          cat > /tmp/service-deploy.sh << 'DEPLOY_SCRIPT_EOF'
-          #!/bin/bash
-          set -e
-          
-          cd /home/__SVC_NAME___user
-          
-          # Determine the correct directory name (use source repository for multi-service architectures)
-          if [[ "__SRC_REPO__" != "__SVC_NAME__" ]]; then
-            REPO_DIR="__SRC_REPO__"
-            echo "📁 Multi-service deployment: Using source repository directory '$REPO_DIR'"
-          else
-            REPO_DIR="__SVC_NAME__"
-            echo "📁 Single-service deployment: Using service directory '$REPO_DIR'"
-          fi
-          
-          # Remove existing repository directory if overwrite is enabled
-          if [[ "__OVERWRITE__" == "true" ]]; then
-            rm -rf "$REPO_DIR"
-          fi
-          
-          # Clone the source repository into the correct directory
-          git clone https://github.com/nuniesmith/__SRC_REPO__.git "$REPO_DIR"
-          cd "$REPO_DIR"
-          
-          # 🔐 SSL Certificate Setup - Step 1: Generate self-signed certificates
-          echo '🔐 Setting up SSL certificates for immediate HTTPS...'
-          mkdir -p /etc/ssl/selfsigned /etc/nginx
-          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout /etc/ssl/selfsigned/key.pem \
-            -out /etc/ssl/selfsigned/cert.pem \
-            -subj '/CN=__FULL_DOMAIN__/O=GitHub Actions Deployment/C=US'
-          
-          # Create initial SSL configuration for NGINX
-          cat > /etc/nginx/ssl.conf << 'SSL_EOF'
-          # Initial self-signed SSL configuration
-          ssl_certificate /etc/ssl/selfsigned/cert.pem;
-          ssl_certificate_key /etc/ssl/selfsigned/key.pem;
-          ssl_protocols TLSv1.2 TLSv1.3;
-          ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
-          ssl_prefer_server_ciphers off;
-          ssl_session_cache shared:SSL:10m;
-          ssl_session_timeout 10m;
-          SSL_EOF
-          
-          echo '✅ Self-signed certificates generated for immediate HTTPS startup'
-          
-          # Create .env file with application secrets
-          echo '🔐 Setting up application environment variables...'
-          cat > .env << 'ENV_EOF'
-          # Application Configuration
-          JWT_SECRET_KEY=__JWT_SECRET__
-          AUTHENTIK_JWT_SECRET=__AUTHENTIK_JWT__
-          NGINX_AUTH_USER=__NGINX_AUTH_USER__
-          NGINX_AUTH_PASS=__NGINX_AUTH_PASS__
-          
-          # Service Configuration
-          SERVICE_NAME=__SVC_NAME__
-          DOMAIN_NAME=__FULL_DOMAIN__
-          
-          # Docker Hub Authentication (if needed)
-          DOCKER_USERNAME=__DOCKER_USERNAME__
-          DOCKER_TOKEN=__DOCKER_TOKEN__
-          ENV_EOF
-          
-          # Set ownership to service user for the repository directory
-          chown -R __SVC_NAME___user:__SVC_NAME___user /home/__SVC_NAME___user/"$REPO_DIR"
-          
-          # Change to repository directory for deployment file detection and execution
-          cd /home/__SVC_NAME___user/"$REPO_DIR"
-          
-          echo "🔍 Checking deployment options in directory: $(pwd)"
-          echo "📁 Available files:"
-          ls -la
-          
-          # Configure service-specific environment variables for universal template
-          echo '🔧 Configuring service-specific settings for universal template...'
-          case '__SVC_NAME__' in
-            "nginx")
-              export SERVICE_DISPLAY_NAME="Nginx Reverse Proxy"
-              export DEFAULT_HTTP_PORT="80"
-              export DEFAULT_HTTPS_PORT="443"
-              export SUPPORTS_GPU="false"
-              export SUPPORTS_MINIMAL="false"
-              export SUPPORTS_DEV="false"
-              export HAS_NETDATA="true"
-              export HAS_SSL="true"
-              ;;
-            "ats")
-              export SERVICE_DISPLAY_NAME="ATS Game Server"
-              export DEFAULT_HTTP_PORT="80"
-              export DEFAULT_HTTPS_PORT="443"
-              export SUPPORTS_GPU="false"
-              export SUPPORTS_MINIMAL="false"
-              export SUPPORTS_DEV="false"
-              export HAS_NETDATA="true"
-              export HAS_SSL="true"
-              ;;
-            "fks"|"fks-"*)
-              export SERVICE_DISPLAY_NAME="FKS Trading Systems"
-              export DEFAULT_HTTP_PORT="3000"
-              export DEFAULT_HTTPS_PORT="443"
-              export SUPPORTS_GPU="true"
-              export SUPPORTS_MINIMAL="true"
-              export SUPPORTS_DEV="true"
-              export HAS_NETDATA="false"
-              export HAS_SSL="true"
-              ;;
-            *)
-              export SERVICE_DISPLAY_NAME="__SVC_NAME__"
-              export DEFAULT_HTTP_PORT="80"
-              export DEFAULT_HTTPS_PORT="443"
-              export SUPPORTS_GPU="false"
-              export SUPPORTS_MINIMAL="false"
-              export SUPPORTS_DEV="false"
-              export HAS_NETDATA="false"
-              export HAS_SSL="false"
-              ;;
-          esac
-          
-          # Export service name for template
-          export SERVICE_NAME='__SVC_NAME__'
-          
-          echo "✅ Service configuration completed for \$SERVICE_DISPLAY_NAME"
-          echo "🔍 Docker networks will be managed by the service startup script"
-          
-          echo "✅ Service configuration completed for $SERVICE_DISPLAY_NAME"
-          
-          # Ensure external network for cross-service comms exists (used by fks api/web)
-          if ! docker network inspect fks-external >/dev/null 2>&1; then
-            echo "🌐 Creating external Docker network: fks-external"
-            docker network create --driver bridge fks-external || echo "⚠️ Failed to create fks-external (may already exist)"
-          else
-            echo "🌐 External network fks-external already present"
-          fi
-
-          # Harden forwarding and NAT between Tailscale and Docker bridges for cross-host/container routing (if Tailscale is up)
-          if ip link show tailscale0 >/dev/null 2>&1; then
-            echo '🔐 Configuring iptables for Tailscale ↔ Docker routing...'
-            # Enable IP forwarding
-            sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+              echo "status=success" >> $GITHUB_OUTPUT
             sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || true
             
             # Accept established traffic early
@@ -1823,11 +1099,11 @@ jobs:
     name: 🏥 Post-Deploy Health Check
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [infrastructure, service-deploy]
+    needs: [infrastructure]
     if: |
       always() &&
       inputs.action_type == 'deploy' &&
-      needs.service-deploy.result == 'success'
+      needs.infrastructure.result == 'success'
     
     steps:
       - name: 📁 Checkout Actions
@@ -1856,9 +1132,8 @@ jobs:
   summary:
     name: 📋 Summary
     runs-on: ubuntu-latest
-    needs: [stage0-preflight, infrastructure, service-deploy, service-restart, service-destroy, health-check, post-deploy-health]
+    needs: [stage0-preflight, infrastructure, service-restart, service-destroy, health-check, post-deploy-health]
     if: always()
-    
     steps:
       - name: 📋 Deployment Summary
         run: |
@@ -1872,12 +1147,11 @@ jobs:
           echo "📊 Job Job Results:"
           echo "✅ Preflight: ${{ needs.stage0-preflight.result }}"
           echo "🏗️ Infrastructure: ${{ needs.infrastructure.result }}"
-          echo "🚀 Service Deploy: ${{ needs.service-deploy.result }}"
+          echo "🚀 Deploy: ${{ needs.infrastructure.result }}"
           echo "🔄 Service Restart: ${{ needs.service-restart.result }}"
           echo "💥 Service Destroy: ${{ needs.service-destroy.result }}"
           echo "🏥 Health Check: ${{ needs.health-check.result }}"
           echo "🏥 Post-Deploy Health: ${{ needs.post-deploy-health.result }}"
-          
           if [[ "${{ needs.infrastructure.outputs.server_ip }}" ]]; then
             echo ""
             echo "🖥️ Server Details:"
@@ -1885,8 +1159,7 @@ jobs:
             echo "   🔗 Tailscale IP: ${{ needs.infrastructure.outputs.tailscale_ip }}"
             echo "   🆔 Server ID: ${{ needs.infrastructure.outputs.server_id }}"
           fi
-          
-          if [[ "${{ needs.service-deploy.result }}" == "success" ]]; then
+          if [[ "${{ needs.infrastructure.result }}" == "success" ]]; then
             echo ""
             echo "🎉 Overall Status: SUCCESS"
             echo "✅ ${{ env.SERVICE_NAME }} deployment completed!"
@@ -1903,40 +1176,33 @@ jobs:
             echo "❌ Overall Status: FAILED"
             echo "💥 Check job logs for details"
           fi
-      
       - name: 📢 Send Discord Notification
         if: always()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          DEPLOYMENT_STATUS: ${{ (needs.service-deploy.result == 'success' || needs.service-restart.result == 'success' || needs.service-destroy.result == 'success') && 'SUCCESS' || 'FAILED' }}
+          DEPLOYMENT_STATUS: ${{ (needs.infrastructure.result == 'success' || needs.service-restart.result == 'success' || needs.service-destroy.result == 'success') && 'SUCCESS' || 'FAILED' }}
           SERVICE_NAME: ${{ env.SERVICE_NAME }}
           ACTION_TYPE: ${{ inputs.action_type || 'deploy' }}
         run: |
           echo "📢 Preparing Discord notification..."
-          
           # Validate webhook URL before proceeding
           if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
             echo "⚠️ Discord webhook URL is empty - skipping notification"
             exit 0
           fi
-          
           if [[ ! "$DISCORD_WEBHOOK_URL" =~ ^https://discord(app)?\.com/api/webhooks/ ]]; then
             echo "⚠️ Invalid Discord webhook URL format - skipping notification"
             exit 0
           fi
-          
           echo "📢 Sending Discord notification..."
-          
           # Determine color based on status
           if [[ "$DEPLOYMENT_STATUS" == "SUCCESS" ]]; then
-            COLOR="3066993"  # Green
+            COLOR="3066993"
             EMOJI="✅"
           else
-            COLOR="15158332"  # Red
+            COLOR="15158332"
             EMOJI="❌"
           fi
-          
-          # Create Discord webhook payload
           cat > /tmp/discord_payload.json << EOF
           {
             "embeds": [
@@ -1952,7 +1218,7 @@ jobs:
                   },
                   {
                     "name": "Job Results",
-                    "value": "**Infrastructure:** ${{ needs.infrastructure.result }}\\n**Service Deploy:** ${{ needs.service-deploy.result }}\\n**DNS:** OK",
+                    "value": "**Infrastructure:** ${{ needs.infrastructure.result }}\\n**Deploy:** ${{ needs.infrastructure.result }}\\n**DNS:** OK",
                     "inline": true
                   }
                 ],
@@ -1961,13 +1227,9 @@ jobs:
             ]
           }
           EOF
-          
-          # Send notification to Discord with proper error handling
-          if curl -f -H "Content-Type: application/json" \
-               -d @/tmp/discord_payload.json \
-               "$DISCORD_WEBHOOK_URL"; then
+          if curl -f -H "Content-Type: application/json" -d @/tmp/discord_payload.json "$DISCORD_WEBHOOK_URL"; then
             echo "✅ Discord notification sent successfully"
           else
             echo "❌ Failed to send Discord notification (webhook may be invalid or Discord may be unreachable)"
-            exit 0  # Don't fail the workflow for notification failures
+            exit 0
           fi
