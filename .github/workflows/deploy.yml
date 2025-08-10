@@ -43,6 +43,32 @@ on:
         required: false
         type: boolean
         default: false
+      deployment_mode:
+        description: 'Deployment mode: single (default), multi (matrix), or home (static servers)'
+        required: false
+        type: string
+        default: 'single'
+      instance_matrix:
+        description: 'JSON array of instance names for multi mode, e.g. ["api","web","auth"]'
+        required: false
+        type: string
+        default: '[]'
+      home_target_host:
+        description: 'Host to SSH for home mode (hostname or IP)'
+        required: false
+        type: string
+      home_service_user:
+        description: 'Service user on home server (e.g., freddy_user)'
+        required: false
+        type: string
+      home_repo_url:
+        description: 'Repo URL for home deploy (defaults to https://github.com/nuniesmith/<service>.git)'
+        required: false
+        type: string
+      jump_host:
+        description: 'Optional SSH jump host for home deployments (e.g., nginx.7gram.xyz)'
+        required: false
+        type: string
     
     secrets:
       LINODE_CLI_TOKEN:
@@ -103,6 +129,10 @@ on:
         required: false
       SULLIVAN_SSH_PUB:
         required: false
+      SSH_PRIVATE_KEY:
+        required: false
+      HOME_ROOT_SSH_KEY:
+        required: false
 
     outputs:
       server_id:
@@ -129,7 +159,7 @@ jobs:
   # Stage 0: Preflight Checks & Validation  
   # ============================================================================
   stage0-preflight:
-    name: � Stage 0 - Preflight Checks
+    name: 🚦 Stage 0 - Preflight Checks
     runs-on: ubuntu-latest
     outputs:
       should_deploy: ${{ steps.stage0.outputs.should_deploy }}
@@ -142,13 +172,13 @@ jobs:
       stage0_complete: ${{ steps.stage0.outputs.stage0_complete }}
     
     steps:
-      - name: � Checkout Actions Repository
+      - name: 📦 Checkout Actions Repository
         uses: actions/checkout@v4
         with:
           repository: nuniesmith/actions
           token: ${{ github.token }}
 
-      - name: � Run Stage 0 - Preflight Checks
+      - name: ✅ Run Stage 0 - Preflight Checks
         id: stage0
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
@@ -192,14 +222,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [stage0-preflight]
-    if: needs.stage0-preflight.outputs.should_deploy == 'true'
+    if: needs.stage0-preflight.outputs.should_deploy == 'true' && inputs.deployment_mode != 'multi' && inputs.deployment_mode != 'home'
     
     outputs:
       server_id: ${{ steps.linode.outputs.server_id }}
       server_ip: ${{ steps.linode.outputs.server_ip }}
       tailscale_ip: ${{ steps.stage2.outputs.tailscale_ip }}
       ssh_key: ${{ steps.linode.outputs.ssh_private_key }}
-      debug_info: "linode_completed:${{ steps.linode.conclusion }},stage2_completed:${{ steps.stage2.conclusion }}"
     
     steps:
       - name: 🔍 Debug Infrastructure Job Start
@@ -737,7 +766,6 @@ jobs:
           # Additional debugging for job status
           echo "🔍 DEBUG: Job dependencies status:"
           echo "  infrastructure.result: '${{ needs.infrastructure.result }}'"
-          echo "  infrastructure.debug_info: '${{ needs.infrastructure.outputs.debug_info }}'"
           echo ""
           
           # Check if infrastructure job actually completed
@@ -807,9 +835,7 @@ jobs:
           echo "${{ needs.infrastructure.outputs.ssh_key }}" | base64 -d > ~/.ssh/deployment_key
           chmod 600 ~/.ssh/deployment_key
           
-          echo "🚀 Deploying ${{ env.SERVICE_NAME }} service to server: $SERVER_IP"
-          
-          # Prepare local variables to minimize GitHub expression expansion in the script body
+          # Setup local variables to minimize GitHub expression expansion in the script body
           SVC_NAME="${{ env.SERVICE_NAME }}"
           SRC_REPO="${{ env.SOURCE_REPOSITORY }}"
           FULL_DOMAIN_VAL="${{ env.FULL_DOMAIN }}"
@@ -823,7 +849,7 @@ jobs:
           ADMIN_EMAIL_VAL="$ADMIN_EMAIL"
           CF_API_TOKEN_VAL="$CLOUDFLARE_API_TOKEN"
 
-          # Create deployment script locally with placeholders to avoid GitHub expression expansion in heredoc
+          # Create deployment script locally with placeholders to avoid GitHub expressions inside the heredoc
           cat > /tmp/service-deploy.sh << 'DEPLOY_SCRIPT_EOF'
           #!/bin/bash
           set -e
@@ -985,7 +1011,7 @@ jobs:
             echo 'ℹ️ tailscale0 interface not found; skipping iptables Tailnet routing config for now'
           fi
 
-          # Prefer FKS service-specific compose files when present (api/auth/web), regardless of start.sh presence
+          # Prefer FKS service-specific compose files when present (e.g., api/auth/web), regardless of start.sh presence
           if [[ '__SVC_NAME__' =~ ^fks- ]]; then
             SERVICE_TYPE='__SVC_NAME__'
             SERVICE_TYPE="${SERVICE_TYPE#fks-}"
@@ -1560,6 +1586,167 @@ jobs:
               "$TAILSCALE_IP"
           fi
 
+  # ============================================================================
+  # Home Deploy (Static Servers via SSH)
+  # ============================================================================
+  home-deploy:
+    name: 🏠 Home Deploy
+    runs-on: ubuntu-latest
+    needs: [stage0-preflight]
+    if: needs.stage0-preflight.outputs.should_deploy == 'true' && inputs.deployment_mode == 'home' && inputs.action_type == 'deploy'
+    steps:
+      - name: 📁 Checkout Actions
+        uses: actions/checkout@v4
+        with:
+          repository: nuniesmith/actions
+          token: ${{ github.token }}
+
+      - name: 🔐 Prepare SSH keys
+        id: ssh
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # Primary key for actions_user or jump host hops
+          if [[ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]]; then
+            echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+          fi
+          # Optional root key for direct root bootstrap
+          if [[ -n "${{ secrets.HOME_ROOT_SSH_KEY }}" ]]; then
+            echo "${{ secrets.HOME_ROOT_SSH_KEY }}" > ~/.ssh/id_root
+            chmod 600 ~/.ssh/id_root
+          fi
+          touch ~/.ssh/known_hosts
+          if [[ -n "${{ inputs.jump_host }}" ]]; then
+            ssh-keyscan -H "${{ inputs.jump_host }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          fi
+          ssh-keyscan -H "${{ inputs.home_target_host }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: 🚀 Bootstrap and deploy on home server
+        env:
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          HOME_HOST: ${{ inputs.home_target_host }}
+          HOME_SVC_USER: ${{ inputs.home_service_user }}
+          HOME_REPO_URL: ${{ inputs.home_repo_url || format('https://github.com/nuniesmith/{0}.git', env.SERVICE_NAME) }}
+          ACTIONS_USER_PASSWORD: ${{ secrets.ACTIONS_USER_PASSWORD }}
+          SERVICE_USER_PASSWORD: ${{ secrets.SERVICE_USER_PASSWORD }}
+        run: |
+          set -e
+
+          # Build SSH base args with optional ProxyJump
+          SSH_BASE=("-o" "StrictHostKeyChecking=no")
+          if [[ -n "${{ inputs.jump_host }}" ]]; then
+            SSH_BASE+=("-J" "actions_user@${{ inputs.jump_host }}")
+          fi
+
+          # Prefer root if root key is present, else use actions_user
+          if [[ -s ~/.ssh/id_root ]]; then
+            REMOTE_USER=root
+            KEYFILE=~/.ssh/id_root
+          else
+            REMOTE_USER=actions_user
+            KEYFILE=~/.ssh/id_rsa
+          fi
+
+          # Create bootstrap script
+          cat > /tmp/home_bootstrap.sh << 'BOOTSTRAP_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SERVICE_NAME="${SERVICE_NAME}"
+          HOME_SVC_USER="${HOME_SVC_USER}"
+          HOME_REPO_URL="${HOME_REPO_URL}"
+          ACTIONS_USER_PASSWORD="${ACTIONS_USER_PASSWORD:-}"
+          SERVICE_USER_PASSWORD="${SERVICE_USER_PASSWORD:-}"
+
+          # Create users and groups
+          ensure_user() {
+            local user="$1"; local pass="$2"; local groups="$3"
+            if ! id -u "$user" >/dev/null 2>&1; then
+              useradd -m -s /bin/bash "$user"
+            fi
+            if [[ -n "$pass" ]]; then
+              echo "$user:$pass" | chpasswd || true
+            fi
+            if [[ -n "$groups" ]]; then
+              usermod -aG "$groups" "$user" || true
+            fi
+          }
+
+          # Ensure sudo installed
+          if ! command -v sudo >/dev/null 2>&1; then
+            if command -v pacman >/dev/null 2>&1; then
+              pacman -Sy --noconfirm sudo
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y sudo
+            fi
+          fi
+
+          # Ensure docker installed
+          if ! command -v docker >/dev/null 2>&1; then
+            if command -v pacman >/dev/null 2>&1; then
+              pacman -Sy --noconfirm docker
+              systemctl enable --now docker
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y ca-certificates curl gnupg lsb-release
+              install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/$(. /etc/os-release; echo "$ID")/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              chmod a+r /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") $(. /etc/os-release; echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+              apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              systemctl enable --now docker
+            fi
+          fi
+
+          # Users: actions_user (sudo), service user (docker)
+          ensure_user actions_user "${ACTIONS_USER_PASSWORD}" wheel || ensure_user actions_user "${ACTIONS_USER_PASSWORD}" sudo || true
+          ensure_user "${HOME_SVC_USER}" "${SERVICE_USER_PASSWORD}" docker
+
+          # Ensure docker group membership active
+          usermod -aG docker actions_user || true
+
+          # Repo directory
+          APP_DIR="/home/${HOME_SVC_USER}/${SERVICE_NAME}"
+          mkdir -p "$APP_DIR"
+          chown -R ${HOME_SVC_USER}:${HOME_SVC_USER} "/home/${HOME_SVC_USER}"
+
+          # Clone or update repo
+          if [[ ! -d "$APP_DIR/.git" ]]; then
+            sudo -u ${HOME_SVC_USER} git clone "$HOME_REPO_URL" "$APP_DIR"
+          else
+            cd "$APP_DIR" && sudo -u ${HOME_SVC_USER} git pull --ff-only
+          fi
+
+          # Provide a default start.sh if missing
+          if [[ ! -x "$APP_DIR/start.sh" ]]; then
+            cat > "$APP_DIR/start.sh" << 'START_EOF'
+          #!/usr/bin/env bash
+          set -e
+          if [[ -f docker-compose.yml ]] || [[ -f docker-compose.yaml ]]; then
+            docker compose pull || true
+            docker compose up -d
+          else
+            echo "No docker-compose.yml found; nothing to start."
+          fi
+          START_EOF
+            chown ${HOME_SVC_USER}:${HOME_SVC_USER} "$APP_DIR/start.sh"
+            chmod +x "$APP_DIR/start.sh"
+          fi
+
+          # Run start.sh as service user
+          cd "$APP_DIR"
+          sudo -u ${HOME_SVC_USER} bash -lc "./start.sh"
+
+          echo "Home deployment completed for ${SERVICE_NAME} at ${APP_DIR}"
+          BOOTSTRAP_EOF
+
+          chmod +x /tmp/home_bootstrap.sh
+
+          # Execute bootstrap remotely
+          scp -i "$KEYFILE" "${SSH_BASE[@]}" /tmp/home_bootstrap.sh "$REMOTE_USER@${{ inputs.home_target_host }}:/tmp/" >/dev/null 2>&1 || true
+          ssh -i "$KEYFILE" "${SSH_BASE[@]}" "$REMOTE_USER@${{ inputs.home_target_host }}" "bash /tmp/home_bootstrap.sh"
+
   # Post-deployment health check for successful deployments
   post-deploy-health:
     name: 🏥 Post-Deploy Health Check
@@ -1611,12 +1798,12 @@ jobs:
           echo "🌍 Region: ${{ inputs.target_region }}"
           echo "🔗 Domain: ${{ env.FULL_DOMAIN }}"
           echo ""
-          echo "📊 Job Results:"
+          echo "📊 Job Job Results:"
           echo "✅ Preflight: ${{ needs.stage0-preflight.result }}"
           echo "🏗️ Infrastructure: ${{ needs.infrastructure.result }}"
           echo "🚀 Service Deploy: ${{ needs.service-deploy.result }}"
-          echo "� Service Restart: ${{ needs.service-restart.result }}"
-          echo "�💥 Service Destroy: ${{ needs.service-destroy.result }}"
+          echo "🔄 Service Restart: ${{ needs.service-restart.result }}"
+          echo "💥 Service Destroy: ${{ needs.service-destroy.result }}"
           echo "🏥 Health Check: ${{ needs.health-check.result }}"
           echo "🏥 Post-Deploy Health: ${{ needs.post-deploy-health.result }}"
           
@@ -1713,4 +1900,3 @@ jobs:
             echo "❌ Failed to send Discord notification (webhook may be invalid or Discord may be unreachable)"
             exit 0  # Don't fail the workflow for notification failures
           fi
-
