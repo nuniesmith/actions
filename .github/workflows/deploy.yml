@@ -297,11 +297,6 @@ jobs:
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
           SERVICE_USER_PASSWORD: ${{ secrets.SERVICE_USER_PASSWORD }}
           SSL_STAGING: ${{ secrets.SSL_STAGING }}
-          DESKTOP_SSH_PUB: ${{ secrets.DESKTOP_SSH_PUB }}
-          FREDDY_SSH_PUB: ${{ secrets.FREDDY_SSH_PUB }}
-          MACBOOK_SSH_PUB: ${{ secrets.MACBOOK_SSH_PUB }}
-          ORYX_SSH_PUB: ${{ secrets.ORYX_SSH_PUB }}
-          SULLIVAN_SSH_PUB: ${{ secrets.SULLIVAN_SSH_PUB }}
         run: |
           echo "🔧 Running Stage 1 setup on server..."
           
@@ -314,17 +309,9 @@ jobs:
           sed -i "s/SSL_STAGING_PLACEHOLDER/${{ secrets.SSL_STAGING }}/g" /tmp/stage1-setup.sh
           
           # Create SSH keys file for additional authorized keys
-          echo "🔑 Preparing additional SSH public keys..."
-          cat > /tmp/additional_ssh_keys.pub << 'EOF'
-          ${{ secrets.DESKTOP_SSH_PUB }}
-          ${{ secrets.FREDDY_SSH_PUB }}
-          ${{ secrets.MACBOOK_SSH_PUB }}
-          ${{ secrets.ORYX_SSH_PUB }}
-          ${{ secrets.SULLIVAN_SSH_PUB }}
-          EOF
-          
-          # Remove empty lines from SSH keys file
-          grep -v '^$' /tmp/additional_ssh_keys.pub > /tmp/ssh_keys_clean.pub || touch /tmp/ssh_keys_clean.pub
+          echo "🔑 Skipping injection of additional SSH public keys to reduce expression size"
+          # Create an empty file to keep downstream scripts simple
+          : > /tmp/ssh_keys_clean.pub
           
               echo "✅ Prerequisites validated - proceeding with service deployment via scripts/deployment/deploy-service.sh"
 
@@ -337,6 +324,10 @@ jobs:
               ./scripts/deployment/deploy-service.sh "${{ env.SERVICE_NAME }}" "${{ steps.linode.outputs.server_ip }}"
 
               echo "status=success" >> $GITHUB_OUTPUT
+          # Build remote deployment script (executed on the server later)
+          cat > /tmp/service-deploy.sh << 'DEPLOY_SCRIPT_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
             sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || true
             
             # Accept established traffic early
@@ -1180,56 +1171,19 @@ jobs:
         if: always()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          DEPLOYMENT_STATUS: ${{ (needs.infrastructure.result == 'success' || needs.service-restart.result == 'success' || needs.service-destroy.result == 'success') && 'SUCCESS' || 'FAILED' }}
           SERVICE_NAME: ${{ env.SERVICE_NAME }}
           ACTION_TYPE: ${{ inputs.action_type || 'deploy' }}
+          SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
+          TAILSCALE_IP: ${{ needs.infrastructure.outputs.tailscale_ip }}
+          SERVER_ID: ${{ needs.infrastructure.outputs.server_id }}
+          INFRA_RESULT: ${{ needs.infrastructure.result }}
+          RESTART_RESULT: ${{ needs.service-restart.result }}
+          DESTROY_RESULT: ${{ needs.service-destroy.result }}
+          HEALTH_RESULT: ${{ needs.health-check.result }}
+          POST_HEALTH_RESULT: ${{ needs.post-deploy-health.result }}
         run: |
-          echo "📢 Preparing Discord notification..."
-          # Validate webhook URL before proceeding
-          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
-            echo "⚠️ Discord webhook URL is empty - skipping notification"
-            exit 0
-          fi
-          if [[ ! "$DISCORD_WEBHOOK_URL" =~ ^https://discord(app)?\.com/api/webhooks/ ]]; then
-            echo "⚠️ Invalid Discord webhook URL format - skipping notification"
-            exit 0
-          fi
-          echo "📢 Sending Discord notification..."
-          # Determine color based on status
-          if [[ "$DEPLOYMENT_STATUS" == "SUCCESS" ]]; then
-            COLOR="3066993"
-            EMOJI="✅"
-          else
-            COLOR="15158332"
-            EMOJI="❌"
-          fi
-          cat > /tmp/discord_payload.json << EOF
-          {
-            "embeds": [
-              {
-                "title": "$EMOJI $SERVICE_NAME Deployment $DEPLOYMENT_STATUS",
-                "description": "**Action:** $ACTION_TYPE\\n**Service:** $SERVICE_NAME\\n**Status:** $DEPLOYMENT_STATUS",
-                "color": $COLOR,
-                "fields": [
-                  {
-                    "name": "Server Details",
-                    "value": "**IP:** ${{ needs.infrastructure.outputs.server_ip || 'N/A' }}\\n**Tailscale IP:** ${{ needs.infrastructure.outputs.tailscale_ip || 'N/A' }}\\n**Server ID:** ${{ needs.infrastructure.outputs.server_id || 'N/A' }}",
-                    "inline": true
-                  },
-                  {
-                    "name": "Job Results",
-                    "value": "**Infrastructure:** ${{ needs.infrastructure.result }}\\n**Deploy:** ${{ needs.infrastructure.result }}\\n**DNS:** OK",
-                    "inline": true
-                  }
-                ],
-                "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-              }
-            ]
-          }
-          EOF
-          if curl -f -H "Content-Type: application/json" -d @/tmp/discord_payload.json "$DISCORD_WEBHOOK_URL"; then
-            echo "✅ Discord notification sent successfully"
-          else
-            echo "❌ Failed to send Discord notification (webhook may be invalid or Discord may be unreachable)"
-            exit 0
-          fi
+          echo "📢 Sending Discord notification via script..."
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
+          chmod +x ./scripts/notifications/notify-discord.sh
+          ./scripts/notifications/notify-discord.sh
