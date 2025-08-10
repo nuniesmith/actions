@@ -8,6 +8,8 @@ SERVICE_NAME="${1:-unknown}"
 SERVER_TYPE="${2:-g6-standard-2}"
 TARGET_REGION="${3:-ca-central}"
 OVERWRITE_SERVER="${4:-false}"
+# Initialize to avoid unbound variable errors under 'set -u'
+SERVER_IP=""
 
 echo "🚀 Managing Linode server for $SERVICE_NAME..."
 
@@ -49,7 +51,7 @@ if [[ "$OVERWRITE_SERVER" != "true" ]]; then
     echo "🔍 Debug - Found existing server:"
     echo "$EXISTING_SERVER"
     
-    SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
+  SERVER_ID=$(echo "$EXISTING_SERVER" | cut -f1)
     # Try different columns for IP address
     SERVER_IP_COL4=$(echo "$EXISTING_SERVER" | cut -f4)
     SERVER_IP_COL5=$(echo "$EXISTING_SERVER" | cut -f5)
@@ -92,8 +94,8 @@ echo "🆕 Creating new server: $SERVER_LABEL"
 echo "🔑 Generating SSH key for server access..."
 ssh-keygen -t ed25519 -a 64 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-$SERVICE_NAME"
 
-# Get the public key content for server authorization
-SSH_PUBLIC_KEY=$(base64 -w 0 ~/.ssh/linode_deployment_key.pub)
+# Get the public key content for server authorization (raw, not base64)
+SSH_PUBLIC_KEY=$(cat ~/.ssh/linode_deployment_key.pub | tr -d '\n')
 echo "🔑 SSH public key generated (ed25519)"
 
 # Store the private key (base64 encoded for safe storage)
@@ -104,6 +106,7 @@ echo "🚀 Creating server with SSH key authentication..."
 echo "Using server type: $SERVER_TYPE"
 echo "Using region: $TARGET_REGION"
 
+# Pass the raw public key string to --authorized_keys (Linode expects the standard 'ssh-ed25519 AAAA... comment' format)
 RESULT=$(linode-cli linodes create \
   --type "$SERVER_TYPE" \
   --region "$TARGET_REGION" \
