@@ -306,14 +306,17 @@ jobs:
           SSL_STAGING: ${{ secrets.SSL_STAGING }}
         run: |
           echo "🔧 Running Stage 1 setup on server..."
+          # Cache frequently used env vars into local shell vars to avoid GitHub expression interpolation
+          SVC_NAME="$SERVICE_NAME"
+          SVC_SERVER_IP="$SERVER_IP"
           
           # Prepare stage1 script with replaced placeholders
           cp ./scripts/stage1-complete-setup.sh /tmp/stage1-setup.sh
-          sed -i "s/SERVICE_NAME_PLACEHOLDER/${{ env.SERVICE_NAME }}/g" /tmp/stage1-setup.sh
-          sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${{ secrets.ACTIONS_USER_PASSWORD }}/g" /tmp/stage1-setup.sh
-          sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${{ secrets.JORDAN_PASSWORD }}/g" /tmp/stage1-setup.sh
-          sed -i "s/SERVICE_USER_PASSWORD_PLACEHOLDER/${{ secrets.SERVICE_USER_PASSWORD }}/g" /tmp/stage1-setup.sh
-          sed -i "s/SSL_STAGING_PLACEHOLDER/${{ secrets.SSL_STAGING }}/g" /tmp/stage1-setup.sh
+          sed -i "s/SERVICE_NAME_PLACEHOLDER/${SVC_NAME}/g" /tmp/stage1-setup.sh
+          sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${ACTIONS_USER_PASSWORD}/g" /tmp/stage1-setup.sh
+          sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${JORDAN_PASSWORD}/g" /tmp/stage1-setup.sh
+          sed -i "s/SERVICE_USER_PASSWORD_PLACEHOLDER/${SERVICE_USER_PASSWORD}/g" /tmp/stage1-setup.sh
+          sed -i "s/SSL_STAGING_PLACEHOLDER/${SSL_STAGING}/g" /tmp/stage1-setup.sh
           
           # Create SSH keys file for additional authorized keys
           echo "🔑 Skipping injection of additional SSH public keys to reduce expression size"
@@ -328,7 +331,7 @@ jobs:
               chmod 600 ~/.ssh/deployment_key
 
               chmod +x ./scripts/deployment/deploy-service.sh
-              ./scripts/deployment/deploy-service.sh "${{ env.SERVICE_NAME }}" "${{ steps.linode.outputs.server_ip }}"
+              ./scripts/deployment/deploy-service.sh "${SVC_NAME}" "${SVC_SERVER_IP}"
 
               echo "status=success" >> $GITHUB_OUTPUT
           # Build remote deployment script (executed on the server later)
