@@ -21,9 +21,11 @@ log "Running health checks for $SERVICE_NAME..."
 log "Server IP: $SERVER_IP"
 log "Tailscale IP: ${TAILSCALE_IP:-not available}"
 
-# Setup SSH key
+# Setup SSH key: if provided via env, decode it; otherwise assume it was installed by the workflow
 mkdir -p ~/.ssh
-echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/deployment_key 2>/dev/null || true
+if [[ -n "${SSH_PRIVATE_KEY:-}" ]]; then
+    echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/deployment_key 2>/dev/null || true
+fi
 chmod 600 ~/.ssh/deployment_key 2>/dev/null || true
 
 # Basic connectivity test

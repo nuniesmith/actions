@@ -90,11 +90,11 @@ echo "🆕 Creating new server: $SERVER_LABEL"
 
 # Generate SSH key for this deployment
 echo "🔑 Generating SSH key for server access..."
-ssh-keygen -t rsa -b 4096 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-$SERVICE_NAME"
+ssh-keygen -t ed25519 -a 64 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-$SERVICE_NAME"
 
 # Get the public key content for server authorization
-SSH_PUBLIC_KEY=$(cat ~/.ssh/linode_deployment_key.pub)
-echo "🔑 SSH Public Key: $SSH_PUBLIC_KEY"
+SSH_PUBLIC_KEY=$(base64 -w 0 ~/.ssh/linode_deployment_key.pub)
+echo "🔑 SSH public key generated (ed25519)"
 
 # Store the private key (base64 encoded for safe storage)
 SSH_PRIVATE_KEY=$(base64 -w 0 ~/.ssh/linode_deployment_key)

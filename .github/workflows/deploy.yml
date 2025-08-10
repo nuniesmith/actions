@@ -225,7 +225,6 @@ jobs:
       server_id: ${{ steps.linode.outputs.server_id }}
       server_ip: ${{ steps.linode.outputs.server_ip }}
       tailscale_ip: ${{ steps.linode.outputs.tailscale_ip }}
-      ssh_key: ${{ steps.linode.outputs.ssh_private_key }}
       deployment_status: ${{ steps.deploy.outputs.status }}
     
     steps:
@@ -288,6 +287,14 @@ jobs:
           chmod +x ./scripts/linode/wait-for-ssh.sh
           ./scripts/linode/wait-for-ssh.sh "${{ steps.linode.outputs.server_ip }}"
 
+      - name: 📦 Upload SSH deployment key (artifact)
+        if: steps.linode.outputs.server_ip != 'EXTRACTION_FAILED' && steps.linode.outputs.server_ip != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment_key
+          path: $HOME/.ssh/linode_deployment_key
+          if-no-files-found: error
+
       - name: 🔧 Run Stage 1 Setup Script
         id: deploy
         if: steps.linode.outputs.server_ip != 'EXTRACTION_FAILED' && steps.linode.outputs.server_ip != ''
@@ -315,9 +322,9 @@ jobs:
           
               echo "✅ Prerequisites validated - proceeding with service deployment via scripts/deployment/deploy-service.sh"
 
-              # Setup SSH key
+              # Setup SSH key (use generated file)
               mkdir -p ~/.ssh
-              echo "${{ steps.linode.outputs.ssh_private_key }}" | base64 -d > ~/.ssh/deployment_key
+              cp "$HOME/.ssh/linode_deployment_key" ~/.ssh/deployment_key
               chmod 600 ~/.ssh/deployment_key
 
               chmod +x ./scripts/deployment/deploy-service.sh
@@ -739,28 +746,32 @@ jobs:
     if: |
       inputs.action_type == 'restart' &&
       needs.infrastructure.result == 'success'
-    
     outputs:
       status: ${{ steps.restart.outputs.status }}
-    
     steps:
       - name: 📁 Checkout Actions
         uses: actions/checkout@v4
         with:
           repository: nuniesmith/actions
           token: ${{ github.token }}
-      
+
+      - name:  Download SSH key artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment_key
+          path: /tmp/key
+
+      - name: 🔐 Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          cp /tmp/key/linode_deployment_key ~/.ssh/deployment_key
+          chmod 600 ~/.ssh/deployment_key
+
       - name: 🔄 Restart Service
         id: restart
         env:
           SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
-          SSH_PRIVATE_KEY: ${{ needs.infrastructure.outputs.ssh_key }}
         run: |
-          # Setup SSH key
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/deployment_key
-          chmod 600 ~/.ssh/deployment_key
-          
           echo "🔄 Restarting ${{ env.SERVICE_NAME }} service..."
           
           # Restart service on server
@@ -808,6 +819,7 @@ jobs:
           "
           
           echo "status=success" >> $GITHUB_OUTPUT
+          
 
   # ============================================================================
   # Service Destruction
@@ -910,11 +922,22 @@ jobs:
           repository: nuniesmith/actions
           token: ${{ github.token }}
       
+      - name: 📥 Download SSH key artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment_key
+          path: /tmp/key
+
+      - name: 🔐 Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          cp /tmp/key/linode_deployment_key ~/.ssh/deployment_key
+          chmod 600 ~/.ssh/deployment_key
+
       - name: 🏥 Run Health Checks
         env:
           SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
           TAILSCALE_IP: ${{ needs.infrastructure.outputs.tailscale_ip }}
-          SSH_PRIVATE_KEY: ${{ needs.infrastructure.outputs.ssh_key }}
         run: |
           if [[ -n "$SERVER_IP" ]]; then
             chmod +x ./scripts/health/service-health-check.sh
@@ -1103,11 +1126,22 @@ jobs:
           repository: nuniesmith/actions
           token: ${{ github.token }}
       
+      - name: 📥 Download SSH key artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment_key
+          path: /tmp/key
+
+      - name: 🔐 Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          cp /tmp/key/linode_deployment_key ~/.ssh/deployment_key
+          chmod 600 ~/.ssh/deployment_key
+
       - name: 🏥 Run Post-Deploy Health Checks
         env:
           SERVER_IP: ${{ needs.infrastructure.outputs.server_ip }}
           TAILSCALE_IP: ${{ needs.infrastructure.outputs.tailscale_ip }}
-          SSH_PRIVATE_KEY: ${{ needs.infrastructure.outputs.ssh_key }}
         run: |
           if [[ -n "$SERVER_IP" ]]; then
             chmod +x ./scripts/health/service-health-check.sh
