@@ -69,6 +69,11 @@ on:
         description: 'Optional SSH jump host for home deployments (e.g., nginx.7gram.xyz)'
         required: false
         type: string
+      runner_label:
+        description: 'Runner label to execute jobs on (e.g., self-hosted, ubuntu-latest)'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
     
     secrets:
       LINODE_CLI_TOKEN:
@@ -160,7 +165,7 @@ jobs:
   # ============================================================================
   stage0-preflight:
     name: 🚦 Stage 0 - Preflight Checks
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     outputs:
       should_deploy: ${{ steps.stage0.outputs.should_deploy }}
       should_destroy: ${{ steps.stage0.outputs.should_destroy }}
@@ -216,7 +221,7 @@ jobs:
   # ============================================================================
   infrastructure:
     name: 🏗️ Stage 1 - Infrastructure
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     needs: [stage0-preflight]
     if: needs.stage0-preflight.outputs.should_deploy == 'true' && inputs.deployment_mode != 'multi' && inputs.deployment_mode != 'home'
@@ -780,7 +785,7 @@ jobs:
   # ============================================================================  
   service-restart:
     name: 🔄 Service Restart
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 10
     needs: [stage0-preflight, infrastructure]
     if: |
@@ -866,7 +871,7 @@ jobs:
   # ============================================================================  
   service-destroy:
     name: 💥 Service Destroy
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 15
     needs: [stage0-preflight]
     if: |
@@ -947,7 +952,7 @@ jobs:
   # ============================================================================
   health-check:
     name: 🏥 Health Check
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 10
     needs: [infrastructure]
     if: |
@@ -992,7 +997,7 @@ jobs:
   # ============================================================================
   home-deploy:
     name: 🏠 Home Deploy
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     needs: [stage0-preflight]
     if: needs.stage0-preflight.outputs.should_deploy == 'true' && inputs.deployment_mode == 'home' && inputs.action_type == 'deploy'
     steps:
@@ -1151,7 +1156,7 @@ jobs:
   # Post-deployment health check for successful deployments
   post-deploy-health:
     name: 🏥 Post-Deploy Health Check
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 10
     needs: [infrastructure]
     if: |
@@ -1196,7 +1201,7 @@ jobs:
   # ============================================================================
   summary:
     name: 📋 Summary
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     needs: [stage0-preflight, infrastructure, service-restart, service-destroy, health-check, post-deploy-health]
     if: always()
     steps:
