@@ -224,7 +224,7 @@ jobs:
     outputs:
       server_id: ${{ steps.linode.outputs.server_id }}
       server_ip: ${{ steps.linode.outputs.server_ip }}
-      tailscale_ip: ${{ steps.linode.outputs.tailscale_ip }}
+      tailscale_ip: ${{ steps.tailscale.outputs.tailscale_ip }}
       deployment_status: ${{ steps.deploy.outputs.status }}
     
     steps:
@@ -304,38 +304,75 @@ jobs:
           JORDAN_PASSWORD: ${{ secrets.JORDAN_PASSWORD }}
           SERVICE_USER_PASSWORD: ${{ secrets.SERVICE_USER_PASSWORD }}
           SSL_STAGING: ${{ secrets.SSL_STAGING }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          TAILSCALE_TAILNET: ${{ secrets.TAILSCALE_TAILNET }}
         run: |
-          echo "🔧 Running Stage 1 setup on server..."
-          # Cache frequently used env vars into local shell vars to avoid GitHub expression interpolation
+          set -euo pipefail
+          echo "🔧 Preparing Stage 1 and Stage 2 scripts..."
+
           SVC_NAME="$SERVICE_NAME"
           SVC_SERVER_IP="$SERVER_IP"
-          
-          # Prepare stage1 script with replaced placeholders
+
+          # Prepare Stage 1 script with placeholders
           cp ./scripts/stage1-complete-setup.sh /tmp/stage1-setup.sh
           sed -i "s/SERVICE_NAME_PLACEHOLDER/${SVC_NAME}/g" /tmp/stage1-setup.sh
           sed -i "s/ACTIONS_USER_PASSWORD_PLACEHOLDER/${ACTIONS_USER_PASSWORD}/g" /tmp/stage1-setup.sh
           sed -i "s/JORDAN_PASSWORD_PLACEHOLDER/${JORDAN_PASSWORD}/g" /tmp/stage1-setup.sh
           sed -i "s/SERVICE_USER_PASSWORD_PLACEHOLDER/${SERVICE_USER_PASSWORD}/g" /tmp/stage1-setup.sh
           sed -i "s/SSL_STAGING_PLACEHOLDER/${SSL_STAGING}/g" /tmp/stage1-setup.sh
-          
-          # Create SSH keys file for additional authorized keys
-          echo "🔑 Skipping injection of additional SSH public keys to reduce expression size"
-          # Create an empty file to keep downstream scripts simple
-          : > /tmp/ssh_keys_clean.pub
-          
-              echo "✅ Prerequisites validated - proceeding with service deployment via scripts/deployment/deploy-service.sh"
 
-              # Setup SSH key (use generated file)
-              mkdir -p ~/.ssh
-              cp "$HOME/.ssh/linode_deployment_key" ~/.ssh/deployment_key
-              chmod 600 ~/.ssh/deployment_key
+          # Prepare Stage 2 script with Tailscale OAuth placeholders
+          cp ./scripts/stage2-post-reboot.sh /tmp/stage2-post-reboot.sh
+          sed -i "s/TS_OAUTH_CLIENT_ID_PLACEHOLDER/${TS_OAUTH_CLIENT_ID}/g" /tmp/stage2-post-reboot.sh
+          sed -i "s/TS_OAUTH_SECRET_PLACEHOLDER/${TS_OAUTH_SECRET}/g" /tmp/stage2-post-reboot.sh
+          sed -i "s/TAILSCALE_TAILNET_PLACEHOLDER/${TAILSCALE_TAILNET}/g" /tmp/stage2-post-reboot.sh
+          sed -i "s/SERVICE_NAME_PLACEHOLDER/${SVC_NAME}/g" /tmp/stage2-post-reboot.sh || true
 
-              chmod +x ./scripts/deployment/deploy-service.sh
-              ./scripts/deployment/deploy-service.sh "${SVC_NAME}" "${SVC_SERVER_IP}"
+          echo "📤 Transferring Stage 1/2 scripts to server..."
+          # Setup SSH key
+          mkdir -p ~/.ssh
+          cp "$HOME/.ssh/linode_deployment_key" ~/.ssh/deployment_key
+          chmod 600 ~/.ssh/deployment_key
 
-              echo "status=success" >> $GITHUB_OUTPUT
-          # Build remote deployment script (executed on the server later)
-          cat > /tmp/service-deploy.sh << 'DEPLOY_SCRIPT_EOF'
+          # Copy scripts to server (stage1 to /root, stage2 to /tmp then move)
+          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no /tmp/stage1-setup.sh root@"$SVC_SERVER_IP":/root/stage1-setup.sh
+          scp -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no /tmp/stage2-post-reboot.sh root@"$SVC_SERVER_IP":/tmp/stage2-post-reboot.sh
+
+          echo "🚀 Installing Stage 2 script and running Stage 1..."
+          ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@"$SVC_SERVER_IP" "\
+            set -euo pipefail; \
+            install -m 0755 /tmp/stage2-post-reboot.sh /usr/local/bin/stage2-post-reboot.sh; \
+            bash /root/stage1-setup.sh; \
+            echo '✅ Stage 1 complete; rebooting...' && reboot || true \
+          "
+
+          echo "⏳ Waiting for server to reboot and SSH to return..."
+          chmod +x ./scripts/linode/wait-for-ssh.sh
+          ./scripts/linode/wait-for-ssh.sh "$SVC_SERVER_IP"
+
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: 📡 Collect Tailscale IP
+        id: tailscale
+        if: steps.linode.outputs.server_ip != 'EXTRACTION_FAILED' && steps.linode.outputs.server_ip != ''
+        env:
+          SERVER_IP: ${{ steps.linode.outputs.server_ip }}
+        run: |
+          set -euo pipefail
+          echo "🔎 Polling for Tailscale IP from /tmp/tailscale_ip..."
+          for i in {1..18}; do
+            TSIP=$(ssh -i ~/.ssh/deployment_key -o StrictHostKeyChecking=no root@"$SERVER_IP" "cat /tmp/tailscale_ip 2>/dev/null || true")
+            if [[ -n "$TSIP" && "$TSIP" != "pending" && "$TSIP" != "failed" ]]; then
+              echo "✅ Tailscale IP detected: $TSIP"
+              echo "tailscale_ip=$TSIP" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Attempt $i/18: Tailscale IP not ready (value='$TSIP'). Waiting 10s..."
+            sleep 10
+          done
+          echo "⚠️ Tailscale IP not available yet; marking as pending"
+          echo "tailscale_ip=pending" >> $GITHUB_OUTPUT
           #!/usr/bin/env bash
           set -euo pipefail
             sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || true
