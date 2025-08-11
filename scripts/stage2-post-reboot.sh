@@ -206,43 +206,9 @@ iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
 
 echo "✅ Docker iptables chains initialized"
 
-echo "🐳 Starting Docker service..."
-systemctl start docker
+echo "🐳 Skipping Docker start in Stage 2; will be started during deploy"
 
-echo "⏳ Waiting for Docker to be ready..."
-for i in {1..10}; do
-  if docker info >/dev/null 2>&1; then
-    echo "✅ Docker is ready"
-    break
-  fi
-  echo "Attempt $i/10: Waiting for Docker..."
-  sleep 5
-done
-
-# Wait a bit more for Docker to fully initialize its iptables rules
-echo "⏳ Waiting for Docker iptables initialization..."
-sleep 10
-
-# Test Docker network creation to ensure iptables fix worked
-echo "🧪 Testing Docker network creation capability..."
-TEST_NETWORK="test-docker-fix-$(date +%s)"
-if docker network create "$TEST_NETWORK" >/dev/null 2>&1; then
-    echo "✅ Docker network creation test successful"
-    docker network rm "$TEST_NETWORK" >/dev/null 2>&1
-    echo "✅ Docker iptables fix confirmed working"
-else
-    echo "❌ Docker network creation test failed"
-    echo "🔍 Checking Docker daemon logs..."
-    journalctl -u docker --no-pager -l --since="5 minutes ago" | tail -20 || true
-    echo "⚠️ Docker networking may still have issues - check deployment logs"
-fi
-
-# Verify Docker is working properly before proceeding
-echo "🔍 Verifying Docker network status..."
-docker network ls
-docker info | grep -A 5 "Network:" || echo "⚠️ Network section not found in docker info (this is normal on some systems)"
-
-echo "🔗 Starting and authenticating Tailscale..."
+echo " Starting and authenticating Tailscale..."
 systemctl start tailscaled
 
 echo "⏳ Waiting for tailscaled daemon to start..."
@@ -516,49 +482,7 @@ if [[ "$TAILSCALE_CONNECTED" == "true" ]]; then
   tailscale status --peers=false --self | grep -E "(advertised|routes)" || echo "⚠️ No route information available"
 fi
 
-echo "🐳 Setting up Docker iptables chains..."
-
-# Create necessary iptables chains for Docker networking
-echo "🔧 Creating missing Docker iptables chains..."
-iptables -t filter -N DOCKER 2>/dev/null || echo "DOCKER chain already exists"
-iptables -t filter -N DOCKER-ISOLATION-STAGE-1 2>/dev/null || echo "DOCKER-ISOLATION-STAGE-1 chain already exists"
-iptables -t filter -N DOCKER-ISOLATION-STAGE-2 2>/dev/null || echo "DOCKER-ISOLATION-STAGE-2 chain already exists"
-iptables -t filter -N DOCKER-USER 2>/dev/null || echo "DOCKER-USER chain already exists"
-iptables -t filter -N DOCKER-FORWARD 2>/dev/null || echo "DOCKER-FORWARD chain already exists"
-iptables -t filter -N DOCKER-BRIDGE 2>/dev/null || echo "DOCKER-BRIDGE chain already exists"
-
-# Add Docker chains to FORWARD chain if not already present
-echo "🔗 Setting up Docker chain forwarding rules..."
-iptables -t filter -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-USER
-iptables -t filter -C FORWARD -j DOCKER-ISOLATION-STAGE-1 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-ISOLATION-STAGE-1
-iptables -t filter -C FORWARD -j DOCKER 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER
-iptables -t filter -C FORWARD -j DOCKER-FORWARD 2>/dev/null || iptables -t filter -I FORWARD -j DOCKER-FORWARD
-
-# Set up isolation rules
-echo "🚧 Configuring Docker network isolation..."
-iptables -t filter -C DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2 2>/dev/null || \
-  iptables -t filter -A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
-iptables -t filter -C DOCKER-ISOLATION-STAGE-1 -j RETURN 2>/dev/null || \
-  iptables -t filter -A DOCKER-ISOLATION-STAGE-1 -j RETURN
-iptables -t filter -C DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP 2>/dev/null || \
-  iptables -t filter -A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
-iptables -t filter -C DOCKER-ISOLATION-STAGE-2 -j RETURN 2>/dev/null || \
-  iptables -t filter -A DOCKER-ISOLATION-STAGE-2 -j RETURN
-
-# Set up basic Docker rules
-echo "⚙️ Configuring basic Docker forwarding rules..."
-iptables -t filter -C DOCKER-USER -j RETURN 2>/dev/null || \
-  iptables -t filter -A DOCKER-USER -j RETURN
-
-# Create NAT table chain for Docker
-echo "🌐 Setting up Docker NAT rules..."
-iptables -t nat -N DOCKER 2>/dev/null || echo "DOCKER NAT chain already exists"
-iptables -t nat -C PREROUTING -m addrtype --dst-type LOCAL -j DOCKER 2>/dev/null || \
-  iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
-
-# Create POSTROUTING rule for Docker
-iptables -t nat -C POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || \
-  iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+echo "🐳 Skipping Docker iptables chain setup in Stage 2"
 
 echo "⏳ Waiting for Docker to fully initialize..."
 sleep 5
