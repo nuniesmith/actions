@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+trap 'echo "❌ Error on line $LINENO"; exit 1' ERR
 
 # Linode server creation and management script
 # Usage: ./create-server.sh <service_name> <server_type> <region> <overwrite>
@@ -12,11 +13,34 @@ OVERWRITE_SERVER="${4:-false}"
 SERVER_IP=""
 
 echo "🚀 Managing Linode server for $SERVICE_NAME..."
+echo "🔎 Debug: Inputs => TYPE=$SERVER_TYPE REGION=$TARGET_REGION OVERWRITE=$OVERWRITE_SERVER"
+
+# Verify required env
+if [[ -z "${LINODE_CLI_TOKEN:-}" ]]; then
+  echo "❌ LINODE_CLI_TOKEN is not set in environment"
+  exit 1
+fi
+if [[ -z "${SERVICE_ROOT_PASSWORD:-}" ]]; then
+  echo "❌ SERVICE_ROOT_PASSWORD is not set in environment"
+  exit 1
+fi
 
 # Install and configure Linode CLI
-pip install linode-cli
+echo "📦 Installing linode-cli..."
+if command -v python3 >/dev/null 2>&1; then
+  python3 -m pip install --upgrade pip >/dev/null 2>&1 || true
+  python3 -m pip install --upgrade linode-cli >/dev/null 2>&1
+elif command -v pip >/dev/null 2>&1; then
+  pip install --upgrade linode-cli >/dev/null 2>&1
+else
+  echo "📦 Installing Python and pip..."
+  sudo apt-get update -y >/dev/null 2>&1 || true
+  sudo apt-get install -y python3 python3-pip >/dev/null 2>&1 || true
+  python3 -m pip install --upgrade linode-cli >/dev/null 2>&1
+fi
 export LINODE_CLI_TOKEN="${LINODE_CLI_TOKEN}"
-linode-cli --version
+echo -n "🔧 linode-cli version: "
+linode-cli --version || { echo "❌ linode-cli not available"; exit 1; }
 
 # If overwrite is enabled, check for and remove existing servers with the same name
 if [[ "$OVERWRITE_SERVER" == "true" ]]; then
@@ -92,6 +116,7 @@ echo "🆕 Creating new server: $SERVER_LABEL"
 
 # Generate SSH key for this deployment
 echo "🔑 Generating SSH key for server access..."
+mkdir -p ~/.ssh
 ssh-keygen -t ed25519 -a 64 -f ~/.ssh/linode_deployment_key -N "" -C "github-actions-$SERVICE_NAME"
 
 # Get the public key content for server authorization (raw, not base64)
@@ -107,6 +132,7 @@ echo "Using server type: $SERVER_TYPE"
 echo "Using region: $TARGET_REGION"
 
 # Pass the raw public key string to --authorized_keys (Linode expects the standard 'ssh-ed25519 AAAA... comment' format)
+set +e
 RESULT=$(linode-cli linodes create \
   --type "$SERVER_TYPE" \
   --region "$TARGET_REGION" \
@@ -116,11 +142,13 @@ RESULT=$(linode-cli linodes create \
   --authorized_keys "$SSH_PUBLIC_KEY" \
   --backups_enabled=false \
   --text --no-headers)
+CLI_STATUS=$?
+set -e
 
 echo "🔍 Server creation result:"
 echo "$RESULT"
 
-if [[ -z "$RESULT" ]] || [[ "$RESULT" == *"error"* ]] || [[ "$RESULT" == *"Error"* ]]; then
+if [[ $CLI_STATUS -ne 0 ]] || [[ -z "$RESULT" ]] || [[ "$RESULT" == *"error"* ]] || [[ "$RESULT" == *"Error"* ]]; then
   echo "❌ Server creation failed!"
   echo "Result: $RESULT"
   exit 1

@@ -17,14 +17,26 @@ SSH_READY=false
 
 # First, test basic connectivity
 echo "🔍 Testing basic connectivity to port 22..."
-for i in {1..10}; do
-  if timeout 5 nc -zv $SERVER_IP 22 2>/dev/null; then
-    echo "✅ Port 22 is reachable on attempt $i"
-    break
-  fi
-  echo "Port 22 not ready, waiting 10 seconds..."
-  sleep 10
-done
+if command -v nc >/dev/null 2>&1; then
+  for i in {1..10}; do
+    if timeout 5 nc -zv $SERVER_IP 22 2>/dev/null; then
+      echo "✅ Port 22 is reachable on attempt $i"
+      break
+    fi
+    echo "Port 22 not ready, waiting 10 seconds..."
+    sleep 10
+  done
+else
+  echo "ℹ️ nc not available on runner; falling back to ping"
+  for i in {1..10}; do
+    if ping -c 1 -W 2 $SERVER_IP >/dev/null 2>&1; then
+      echo "✅ Host is reachable (ping) on attempt $i"
+      break
+    fi
+    echo "Host not reachable yet, waiting 10 seconds..."
+    sleep 10
+  done
+fi
 
 # Test SSH with detailed error output
 echo "🔑 Testing SSH connection with private key..."
@@ -55,7 +67,12 @@ if [[ "$SSH_READY" != "true" ]]; then
   
   # Try to get more info about why SSH is failing
   echo "Testing basic connectivity..."
-  timeout 5 nc -zv $SERVER_IP 22 || echo "Port 22 not reachable"
+  if command -v nc >/dev/null 2>&1; then
+    timeout 5 nc -zv $SERVER_IP 22 || echo "Port 22 not reachable"
+  else
+    echo "ℹ️ nc not available; attempting TCP with bash (may fail)"
+    (echo > /dev/tcp/$SERVER_IP/22) >/dev/null 2>&1 || echo "Port 22 not reachable via bash tcp"
+  fi
   
   exit 1
 fi
