@@ -1,0 +1,579 @@
+# =============================================================================
+# 🚀 Server Setup & CI/CD Pipeline
+# =============================================================================
+# This workflow provides:
+# 1. Manual server setup for fresh Ubuntu/Fedora/Arch VMs (workflow_dispatch)
+# 2. Uses Tailscale for secure SSH connections
+# 3. Generates secrets and outputs them for easy copying
+# 4. Optional repository cloning after setup
+# =============================================================================
+
+name: 🖥️ Server Setup & CI/CD
+
+on:
+    workflow_dispatch:
+        inputs:
+            tailscale_ip:
+                description: "Tailscale IP of the server (e.g., 100.x.x.x)"
+                required: true
+                type: string
+            ssh_user:
+                description: "SSH username for initial connection (e.g., jordan)"
+                required: true
+                type: string
+                default: "jordan"
+            ssh_password:
+                description: "SSH password for the user"
+                required: true
+                type: string
+            ssh_port:
+                description: "SSH port (default: 22)"
+                required: false
+                type: string
+                default: "22"
+            repo_url:
+                description: "Optional: Repository URL to clone after setup"
+                required: false
+                type: string
+            repo_branch:
+                description: "Optional: Branch to clone (default: main)"
+                required: false
+                type: string
+                default: "main"
+            server_name:
+                description: "Optional: Friendly name for this server"
+                required: false
+                type: string
+                default: "production"
+
+permissions:
+    contents: read
+
+env:
+    SSH_USER: actions
+    DEPLOY_PATH: /home/actions
+
+concurrency:
+    group: server-setup-${{ github.workflow }}-${{ inputs.tailscale_ip }}
+    cancel-in-progress: false
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    # ========================================================================
+    # STAGE 1: Connect to Tailscale Network
+    # ========================================================================
+    tailscale-connect:
+        name: 🔐 Connect to Tailscale
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        outputs:
+            connected: ${{ steps.connect.outputs.connected }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              id: connect
+              uses: tailscale/github-action@v2
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  tags: tag:ci
+
+            - name: 📡 Verify Tailscale Connection
+              run: |
+                  # Wait for Tailscale to fully connect
+                  sleep 5
+
+                  # Get our Tailscale IP
+                  MY_IP=$(tailscale ip -4 2>/dev/null || echo "")
+
+                  if [ -z "$MY_IP" ]; then
+                    echo "❌ Failed to get Tailscale IP"
+                    exit 1
+                  fi
+
+                  echo "✅ Connected to Tailscale"
+                  echo "Our IP: $MY_IP"
+                  echo "Target: ${{ inputs.tailscale_ip }}"
+
+                  # Test if we can reach the target
+                  echo "Testing connectivity to ${{ inputs.tailscale_ip }}..."
+                  if tailscale ping -c 3 ${{ inputs.tailscale_ip }} 2>/dev/null; then
+                    echo "✅ Target server is reachable via Tailscale"
+                  else
+                    echo "⚠️  Could not ping target, but SSH may still work"
+                  fi
+
+                  echo "connected=true" >> $GITHUB_OUTPUT
+
+    # ========================================================================
+    # STAGE 2: Setup Server
+    # ========================================================================
+    setup-server:
+        name: 🖥️ Setup Server
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: tailscale-connect
+        if: needs.tailscale-connect.outputs.connected == 'true'
+        outputs:
+            setup_complete: ${{ steps.setup.outputs.complete }}
+            os_detected: ${{ steps.detect-os.outputs.os_id }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: tailscale/github-action@v2
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  tags: tag:ci
+
+            - name: 📦 Install sshpass
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y sshpass openssh-client
+
+            - name: 🔍 Detect Server OS
+              id: detect-os
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              run: |
+                  echo "🔍 Detecting server operating system..."
+
+                  OS_INFO=$(sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=30 \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
+                    "cat /etc/os-release 2>/dev/null | grep -E '^(ID|PRETTY_NAME)=' || echo 'ID=unknown'")
+
+                  echo "OS Info:"
+                  echo "$OS_INFO"
+
+                  OS_ID=$(echo "$OS_INFO" | grep "^ID=" | cut -d= -f2 | tr -d '"')
+                  PRETTY_NAME=$(echo "$OS_INFO" | grep "^PRETTY_NAME=" | cut -d= -f2 | tr -d '"')
+
+                  echo "os_id=$OS_ID" >> $GITHUB_OUTPUT
+                  echo "os_name=$PRETTY_NAME" >> $GITHUB_OUTPUT
+
+                  echo "## 🖥️ Server Info" >> $GITHUB_STEP_SUMMARY
+                  echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+                  echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| OS | $PRETTY_NAME |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Tailscale IP | \`${{ inputs.tailscale_ip }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| SSH User | \`${{ inputs.ssh_user }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| SSH Port | \`${{ inputs.ssh_port }}\` |" >> $GITHUB_STEP_SUMMARY
+
+            - name: 🔍 Test SSH Connection
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              run: |
+                  echo "🔗 Testing SSH connection to ${{ inputs.tailscale_ip }}..."
+
+                  MAX_RETRIES=3
+                  RETRY_COUNT=0
+
+                  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                    if sshpass -e ssh -o StrictHostKeyChecking=no \
+                      -o UserKnownHostsFile=/dev/null \
+                      -o ConnectTimeout=30 \
+                      -p ${{ inputs.ssh_port }} \
+                      ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
+                      "echo '✅ SSH connection successful!' && uname -a && hostname"; then
+                      echo "✅ SSH connection established"
+                      break
+                    fi
+
+                    RETRY_COUNT=$((RETRY_COUNT + 1))
+                    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                      echo "⚠️  Attempt $RETRY_COUNT failed, retrying in 5 seconds..."
+                      sleep 5
+                    else
+                      echo "❌ Failed to connect after $MAX_RETRIES attempts"
+                      exit 1
+                    fi
+                  done
+
+            - name: 📤 Copy Setup Scripts
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              run: |
+                  echo "📤 Copying setup scripts to server..."
+
+                  # Create scripts directory on remote
+                  sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
+                    "mkdir -p /tmp/setup-scripts"
+
+                  # Copy scripts
+                  sshpass -e scp -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -P ${{ inputs.ssh_port }} \
+                    -r scripts/* \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }}:/tmp/setup-scripts/
+
+                  echo "✅ Scripts copied to /tmp/setup-scripts/"
+
+            - name: 🚀 Run Server Setup
+              id: setup
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              run: |
+                  echo "🚀 Running server setup..."
+                  echo "This may take several minutes..."
+                  echo ""
+
+                  # Make scripts executable and run setup
+                  sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o ServerAliveInterval=60 \
+                    -o ServerAliveCountMax=10 \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} << 'SETUP_SCRIPT'
+                  set -e
+
+                  cd /tmp/setup-scripts
+                  chmod +x *.sh
+
+                  # Run the appropriate setup script
+                  if [ -f "setup-server.sh" ]; then
+                    echo "Running setup-server.sh (multi-distro)..."
+                    echo "$SSHPASS" | sudo -S bash -c 'export DEBIAN_FRONTEND=noninteractive; yes | ./setup-server.sh' || {
+                      echo "⚠️  Setup script encountered issues, continuing..."
+                    }
+                  elif [ -f "setup-production-server.sh" ]; then
+                    echo "Running setup-production-server.sh..."
+                    echo "$SSHPASS" | sudo -S bash -c 'export DEBIAN_FRONTEND=noninteractive; yes | ./setup-production-server.sh' || {
+                      echo "⚠️  Setup script encountered issues, continuing..."
+                    }
+                  else
+                    echo "❌ No setup script found!"
+                    exit 1
+                  fi
+
+                  echo "✅ Server setup complete!"
+                  SETUP_SCRIPT
+
+                  echo "complete=true" >> $GITHUB_OUTPUT
+
+    # ========================================================================
+    # STAGE 3: Generate Secrets
+    # ========================================================================
+    generate-secrets:
+        name: 🔐 Generate Secrets
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        needs: setup-server
+        if: needs.setup-server.outputs.setup_complete == 'true'
+        outputs:
+            secrets_generated: ${{ steps.generate.outputs.generated }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: tailscale/github-action@v2
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  tags: tag:ci
+
+            - name: 📦 Install sshpass
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y sshpass
+
+            - name: 🔐 Generate Secrets
+              id: generate
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              run: |
+                  echo "🔐 Generating secrets..."
+
+                  # Run generate-secrets script
+                  sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} << 'SECRETS_SCRIPT' | tee secrets_output.txt
+                  cd /tmp/setup-scripts
+                  chmod +x *.sh
+
+                  # Determine which secrets script to use
+                  if [ -f "generate-secrets-v2.sh" ]; then
+                    echo "$SSHPASS" | sudo -S bash -c 'echo n | ./generate-secrets-v2.sh --ci-output'
+                  elif [ -f "generate-secrets.sh" ]; then
+                    echo "$SSHPASS" | sudo -S bash -c 'echo n | ./generate-secrets.sh'
+                  else
+                    echo "⚠️  No generate-secrets script found, creating basic SSH key..."
+
+                    # Create actions user SSH key manually
+                    sudo -u actions ssh-keygen -t ed25519 -f /home/actions/.ssh/id_ed25519 -N "" -C "actions@$(hostname)" 2>/dev/null || true
+                    sudo cat /home/actions/.ssh/id_ed25519.pub >> /home/actions/.ssh/authorized_keys 2>/dev/null || true
+
+                    echo "=== PROD_SSH_KEY (copy entire key including BEGIN/END lines) ==="
+                    sudo cat /home/actions/.ssh/id_ed25519
+                    echo "=== PROD_SSH_PORT ==="
+                    grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22"
+                    echo "=== PROD_HOST ==="
+                    tailscale ip -4 2>/dev/null || hostname -I | awk '{print $1}'
+                    echo "=== PROD_USER ==="
+                    echo "actions"
+                  fi
+                  SECRETS_SCRIPT
+
+                  echo "generated=true" >> $GITHUB_OUTPUT
+
+            - name: 📋 Extract and Display Secrets
+              id: extract
+              run: |
+                  echo ""
+                  echo "==========================================="
+                  echo "    📋 SECRETS FOR GITHUB REPOSITORY"
+                  echo "==========================================="
+                  echo ""
+
+                  # Display the full output for manual copying
+                  cat secrets_output.txt
+
+                  echo ""
+                  echo "==========================================="
+                  echo ""
+
+                  # Create summary
+                  cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+                  ## 🔐 Generated Secrets
+
+                  Copy these secrets to your GitHub repository:
+                  **Settings → Secrets and variables → Actions → New repository secret**
+
+                  ### Required Secrets
+
+                  | Secret Name | Description |
+                  |-------------|-------------|
+                  | `PROD_SSH_KEY` | SSH private key for `actions` user |
+                  | `PROD_TAILSCALE_IP` | Tailscale IP of this server |
+                  | `PROD_SSH_PORT` | SSH port (usually `22`) |
+                  | `PROD_SSH_USER` | SSH username (`actions`) |
+
+                  ### For Tailscale CI/CD (if not already configured)
+
+                  | Secret Name | Description |
+                  |-------------|-------------|
+                  | `TAILSCALE_OAUTH_CLIENT_ID` | Tailscale OAuth Client ID |
+                  | `TAILSCALE_OAUTH_SECRET` | Tailscale OAuth Secret |
+
+                  ⚠️ **Important**: Scroll up to see the actual secret values in the logs above.
+                  EOF
+
+            - name: 🔑 Display SSH Key Separately
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              run: |
+                  echo ""
+                  echo "==========================================="
+                  echo "    🔑 PROD_SSH_KEY (Copy this entire block)"
+                  echo "==========================================="
+                  echo ""
+
+                  # Get just the SSH private key
+                  sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
+                    "sudo cat /home/actions/.ssh/id_ed25519 2>/dev/null || echo 'Key not found'"
+
+                  echo ""
+                  echo "==========================================="
+                  echo ""
+
+                  echo "📌 PROD_TAILSCALE_IP: ${{ inputs.tailscale_ip }}"
+                  echo "📌 PROD_SSH_PORT: ${{ inputs.ssh_port }}"
+                  echo "📌 PROD_SSH_USER: actions"
+                  echo ""
+
+    # ========================================================================
+    # STAGE 4: Clone Repository (Optional)
+    # ========================================================================
+    clone-repository:
+        name: 📦 Clone Repository
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: generate-secrets
+        if: inputs.repo_url != ''
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: tailscale/github-action@v2
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  tags: tag:ci
+
+            - name: 📦 Install sshpass
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y sshpass
+
+            - name: 📦 Clone Repository to Server
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              run: |
+                  echo "📦 Cloning repository: ${{ inputs.repo_url }}"
+                  echo "Branch: ${{ inputs.repo_branch }}"
+
+                  REPO_NAME=$(basename "${{ inputs.repo_url }}" .git)
+
+                  sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} << CLONE_SCRIPT
+                  # Switch to actions user and clone to home directory
+                  sudo -u actions bash -c '
+                    cd /home/actions
+
+                    if [ -d "$REPO_NAME" ]; then
+                      echo "Repository already exists, pulling latest..."
+                      cd "$REPO_NAME"
+                      git fetch origin
+                      git checkout ${{ inputs.repo_branch }} 2>/dev/null || git checkout -b ${{ inputs.repo_branch }} origin/${{ inputs.repo_branch }} 2>/dev/null || true
+                      git pull origin ${{ inputs.repo_branch }} || echo "Pull failed, may need manual intervention"
+                    else
+                      echo "Cloning fresh copy..."
+                      git clone -b ${{ inputs.repo_branch }} ${{ inputs.repo_url }} 2>/dev/null || git clone ${{ inputs.repo_url }}
+                    fi
+
+                    echo ""
+                    echo "Repository location: /home/actions/$REPO_NAME"
+                    echo "Contents:"
+                    ls -la /home/actions/$REPO_NAME/
+                  '
+                  CLONE_SCRIPT
+
+                  echo ""
+                  echo "✅ Repository cloned to /home/actions/$REPO_NAME"
+
+                  echo "## 📦 Repository Cloned" >> $GITHUB_STEP_SUMMARY
+                  echo "- Repository: \`${{ inputs.repo_url }}\`" >> $GITHUB_STEP_SUMMARY
+                  echo "- Branch: \`${{ inputs.repo_branch }}\`" >> $GITHUB_STEP_SUMMARY
+                  echo "- Path: \`/home/actions/$REPO_NAME\`" >> $GITHUB_STEP_SUMMARY
+
+    # ========================================================================
+    # STAGE 5: Cleanup & Summary
+    # ========================================================================
+    cleanup-and-summary:
+        name: 📊 Summary
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        needs:
+            - tailscale-connect
+            - setup-server
+            - generate-secrets
+        if: always()
+        steps:
+            - name: 🔌 Connect to Tailscale
+              if: needs.generate-secrets.result == 'success' || needs.setup-server.result == 'success'
+              uses: tailscale/github-action@v2
+              continue-on-error: true
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  tags: tag:ci
+
+            - name: 📦 Install sshpass
+              if: needs.generate-secrets.result == 'success'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y sshpass
+
+            - name: 🧹 Cleanup Temporary Files
+              if: needs.generate-secrets.result == 'success'
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+              continue-on-error: true
+              run: |
+                  echo "🧹 Cleaning up temporary files..."
+
+                  sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=10 \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
+                    "rm -rf /tmp/setup-scripts 2>/dev/null || true" 2>/dev/null || true
+
+                  echo "✅ Cleanup complete"
+
+            - name: 📊 Generate Final Summary
+              run: |
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+
+                  ---
+
+                  ## ✅ Server Setup Complete!
+
+                  ### Connection Details
+
+                  | Property | Value |
+                  |----------|-------|
+                  | Server Name | \`${{ inputs.server_name }}\` |
+                  | Tailscale IP | \`${{ inputs.tailscale_ip }}\` |
+                  | SSH Port | \`${{ inputs.ssh_port }}\` |
+                  | CI/CD User | \`actions\` |
+                  | Initial User | \`${{ inputs.ssh_user }}\` |
+
+                  ### Job Results
+
+                  | Stage | Status |
+                  |-------|--------|
+                  | Tailscale Connect | ${{ needs.tailscale-connect.result == 'success' && '✅ Success' || '❌ Failed' }} |
+                  | Server Setup | ${{ needs.setup-server.result == 'success' && '✅ Success' || '❌ Failed' }} |
+                  | Secrets Generated | ${{ needs.generate-secrets.result == 'success' && '✅ Success' || '❌ Failed' }} |
+
+                  ### Next Steps
+
+                  1. **Copy the secrets** from the job logs above to your GitHub repository
+                  2. **Test SSH connection**: \`ssh -p ${{ inputs.ssh_port }} actions@${{ inputs.tailscale_ip }}\`
+                  3. **Set up deployment workflows** using the \`actions\` user
+
+                  ### Test Connection Command
+
+                  \`\`\`bash
+                  ssh -p ${{ inputs.ssh_port }} actions@${{ inputs.tailscale_ip }}
+                  \`\`\`
+
+                  ### Required GitHub Secrets for Deployments
+
+                  \`\`\`
+                  PROD_TAILSCALE_IP=${{ inputs.tailscale_ip }}
+                  PROD_SSH_PORT=${{ inputs.ssh_port }}
+                  PROD_SSH_USER=actions
+                  PROD_SSH_KEY=(copy from logs above)
+                  \`\`\`
+
+                  ### Security Reminder
+
+                  ⚠️ Delete the credentials file on the server after copying:
+                  \`\`\`bash
+                  sudo rm /tmp/server_credentials_*.txt
+                  \`\`\`
+                  EOF
+
+            - name: ❌ Fail if Critical Steps Failed
+              if: |
+                  needs.tailscale-connect.result == 'failure' ||
+                  needs.setup-server.result == 'failure'
+              run: |
+                  echo "❌ Server setup failed!"
+                  echo ""
+                  echo "Tailscale: ${{ needs.tailscale-connect.result }}"
+                  echo "Setup: ${{ needs.setup-server.result }}"
+                  echo "Secrets: ${{ needs.generate-secrets.result }}"
+                  exit 1

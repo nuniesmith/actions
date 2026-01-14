@@ -1,0 +1,246 @@
+# =============================================================================
+# 🚀 Deploy to Production Template
+# =============================================================================
+# Copy this file to your project's .github/workflows/ directory
+# and customize for your specific deployment needs.
+#
+# Prerequisites:
+# 1. Run the "Server Setup & CI/CD" workflow first to set up your server
+# 2. Add these secrets to your repository:
+#    - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
+#    - TAILSCALE_OAUTH_SECRET: Tailscale OAuth Secret
+#    - PROD_TAILSCALE_IP: Tailscale IP of your server (100.x.x.x)
+#    - PROD_SSH_KEY: SSH private key for 'actions' user
+#    - PROD_SSH_PORT: SSH port (usually 22)
+#    - PROD_SSH_USER: SSH username (usually 'actions')
+# =============================================================================
+
+name: 🚀 Deploy to Production
+
+on:
+    push:
+        branches:
+            - main
+            - master
+    workflow_dispatch:
+        inputs:
+            skip_tests:
+                description: "Skip tests and deploy directly"
+                required: false
+                type: boolean
+                default: false
+
+# Customize these for your project
+env:
+    PROJECT_NAME: my-project # Change this to your repo name
+    DEPLOY_PATH: /home/actions # Repos are cloned to /home/actions/<repo-name>
+
+concurrency:
+    group: deploy-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: false
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    # ========================================================================
+    # STAGE 1: Build & Test (Optional)
+    # ========================================================================
+    # test:
+    #     name: 🧪 Run Tests
+    #     runs-on: ubuntu-latest
+    #     if: ${{ !inputs.skip_tests }}
+    #     steps:
+    #         - uses: actions/checkout@v4
+    #         - name: Run tests
+    #           run: |
+    #               # Add your test commands here
+    #               echo "Running tests..."
+
+    # ========================================================================
+    # STAGE 2: Deploy to Production
+    # ========================================================================
+    deploy:
+        name: 🚀 Deploy to Production
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        # needs: test  # Uncomment if using test job
+        environment:
+            name: production
+            # url: https://your-domain.com  # Uncomment and set your URL
+
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: tailscale/github-action@v2
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  tags: tag:ci
+
+            - name: 📡 Verify Tailscale Connection
+              run: |
+                  sleep 3
+                  echo "Tailscale IP: $(tailscale ip -4)"
+                  echo "Target server: ${{ secrets.PROD_TAILSCALE_IP }}"
+
+            - name: 🔑 Setup SSH via Tailscale
+              run: |
+                  mkdir -p ~/.ssh
+                  chmod 700 ~/.ssh
+
+                  # Write SSH private key
+                  echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/id_rsa
+                  chmod 600 ~/.ssh/id_rsa
+
+                  # Verify key format
+                  if ! head -1 ~/.ssh/id_rsa | grep -q "BEGIN"; then
+                    echo "❌ SSH key is malformed"
+                    exit 1
+                  fi
+
+                  # Add server to known hosts
+                  ssh-keyscan -p ${{ secrets.PROD_SSH_PORT }} ${{ secrets.PROD_TAILSCALE_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+                  echo "✅ SSH configured"
+
+            - name: 🔍 Test SSH Connection
+              run: |
+                  ssh -o BatchMode=yes \
+                      -o ConnectTimeout=10 \
+                      -o StrictHostKeyChecking=no \
+                      -p ${{ secrets.PROD_SSH_PORT }} \
+                      ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_TAILSCALE_IP }} \
+                      "echo '✅ SSH connection successful' && hostname"
+
+            - name: 📤 Sync Code to Server
+              run: |
+                  echo "📤 Syncing code to ${{ secrets.PROD_TAILSCALE_IP }}..."
+
+                  rsync -avz --delete \
+                    --exclude '.git' \
+                    --exclude '.github' \
+                    --exclude 'node_modules' \
+                    --exclude '__pycache__' \
+                    --exclude '.env.local' \
+                    --exclude '.env.development' \
+                    --exclude '*.log' \
+                    -e "ssh -o StrictHostKeyChecking=no -p ${{ secrets.PROD_SSH_PORT }}" \
+                    ./ ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_TAILSCALE_IP }}:${{ env.DEPLOY_PATH }}/${{ env.PROJECT_NAME }}/
+
+                  echo "✅ Code synced"
+
+            - name: 🚀 Run Deployment
+              run: |
+                  ssh -o StrictHostKeyChecking=no \
+                      -p ${{ secrets.PROD_SSH_PORT }} \
+                      ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_TAILSCALE_IP }} << 'DEPLOY_SCRIPT'
+
+                  set -e
+                  cd ${{ env.DEPLOY_PATH }}/${{ env.PROJECT_NAME }}
+
+                  echo "📋 Deploying from: $(pwd)"
+                  echo "📋 Git info: $(git rev-parse HEAD 2>/dev/null || echo 'Not a git repo')"
+
+                  # =============================================================
+                  # CUSTOMIZE YOUR DEPLOYMENT BELOW
+                  # =============================================================
+
+                  # Option 1: Docker Compose deployment
+                  if [ -f "docker-compose.yml" ] || [ -f "compose.yml" ]; then
+                    echo "🐳 Docker Compose detected"
+                    docker compose pull 2>/dev/null || true
+                    docker compose up -d --build --remove-orphans
+                    docker compose ps
+                  fi
+
+                  # Option 2: Node.js deployment (uncomment if needed)
+                  # if [ -f "package.json" ]; then
+                  #   echo "📦 Node.js detected"
+                  #   npm ci --production
+                  #   pm2 restart ecosystem.config.js --env production 2>/dev/null || \
+                  #     pm2 start ecosystem.config.js --env production
+                  # fi
+
+                  # Option 3: Python deployment (uncomment if needed)
+                  # if [ -f "requirements.txt" ]; then
+                  #   echo "🐍 Python detected"
+                  #   source venv/bin/activate 2>/dev/null || python3 -m venv venv && source venv/bin/activate
+                  #   pip install -r requirements.txt
+                  #   sudo systemctl restart myapp
+                  # fi
+
+                  # Option 4: Custom run script (uncomment if needed)
+                  # if [ -f "run.sh" ]; then
+                  #   echo "🔧 Running custom run.sh"
+                  #   chmod +x run.sh
+                  #   ./run.sh deploy
+                  # fi
+
+                  echo "✅ Deployment complete!"
+
+                  DEPLOY_SCRIPT
+
+            - name: 🏥 Health Check
+              run: |
+                  echo "🏥 Running health check..."
+
+                  ssh -o StrictHostKeyChecking=no \
+                      -p ${{ secrets.PROD_SSH_PORT }} \
+                      ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_TAILSCALE_IP }} << 'HEALTH_CHECK'
+
+                  cd ${{ env.DEPLOY_PATH }}/${{ env.PROJECT_NAME }}
+
+                  # Check Docker containers if using Docker
+                  if command -v docker &> /dev/null; then
+                    echo "🐳 Docker containers:"
+                    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
+                  fi
+
+                  # System resources
+                  echo ""
+                  echo "📊 System resources:"
+                  echo "  Memory: $(free -h | awk '/^Mem:/ {print $3 "/" $2}')"
+                  echo "  Disk: $(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 " used)"}')"
+                  echo "  Load: $(uptime | awk -F'load average:' '{print $2}')"
+
+                  HEALTH_CHECK
+
+            - name: 📊 Deployment Summary
+              if: always()
+              run: |
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  ## 🚀 Deployment Summary
+
+                  | Property | Value |
+                  |----------|-------|
+                  | Server | \`${{ secrets.PROD_TAILSCALE_IP }}\` |
+                  | Project | \`${{ env.PROJECT_NAME }}\` |
+                  | Path | \`${{ env.DEPLOY_PATH }}/${{ env.PROJECT_NAME }}\` |
+                  | Branch | \`${{ github.ref_name }}\` |
+                  | Commit | \`${{ github.sha }}\` |
+                  | Triggered by | \`${{ github.actor }}\` |
+                  | Status | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |
+
+                  ### Quick Commands
+
+                  \`\`\`bash
+                  # SSH into server
+                  ssh -p ${{ secrets.PROD_SSH_PORT }} ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_TAILSCALE_IP }}
+
+                  # Go to project
+                  cd ${{ env.DEPLOY_PATH }}/${{ env.PROJECT_NAME }}
+
+                  # View logs (if using Docker)
+                  docker compose logs -f
+                  \`\`\`
+                  EOF
+
+            - name: 🧹 Cleanup
+              if: always()
+              run: |
+                  rm -f ~/.ssh/id_rsa
+                  echo "✅ Cleanup complete"
