@@ -1,0 +1,350 @@
+# =============================================================================
+# Kraken Trading Bot - CI/CD Pipeline
+# =============================================================================
+# This workflow uses reusable actions from nuniesmith/actions repository
+#
+# Required Secrets:
+#   - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
+#   - TAILSCALE_OAUTH_SECRET: Tailscale OAuth Secret
+#   - PROD_TAILSCALE_IP: Production server Tailscale IP
+#   - PROD_SSH_KEY: SSH private key for deployment
+#   - PROD_SSH_USER: SSH username (default: actions)
+#   - PROD_SSH_PORT: SSH port (default: 22)
+#   - DOCKER_USERNAME: Docker Hub username
+#   - DOCKER_TOKEN: Docker Hub access token
+#   - CODECOV_TOKEN: Codecov upload token (optional)
+#   - DISCORD_WEBHOOK_GITHUB: Discord webhook for notifications (optional)
+#   - KRAKEN_API_KEY_PERSONAL: Kraken API key for personal account
+#   - KRAKEN_API_SECRET_PERSONAL: Kraken API secret for personal account
+#   - KRAKEN_API_KEY_PROP: Kraken API key for prop firm account (optional)
+#   - KRAKEN_API_SECRET_PROP: Kraken API secret for prop firm account (optional)
+#   - DISCORD_WEBHOOK_PERSONAL: Discord webhook for personal bot (optional)
+#   - DISCORD_WEBHOOK_PROP: Discord webhook for prop firm bot (optional)
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+env:
+    CARGO_TERM_COLOR: always
+    REGISTRY: docker.io
+    IMAGE_NAME: nuniesmith/kraken
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    # =========================================================================
+    # Stage 1: Test and Lint
+    # =========================================================================
+    test-and-lint:
+        name: 🧪 Test and Lint
+        runs-on: ubuntu-latest
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 📣 Notify build started
+              if: vars.DISCORD_WEBHOOK_GITHUB != '' || secrets.DISCORD_WEBHOOK_GITHUB != ''
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  title: "🔨 CI/CD Pipeline Started"
+                  description: "Building Kraken Trading Bot"
+                  status: started
+                  include-repo-info: "true"
+
+            - name: 🦀 Rust CI
+              uses: nuniesmith/actions/.github/actions/rust-ci@main
+              with:
+                  toolchain: stable
+                  run-fmt: "true"
+                  run-clippy: "true"
+                  run-tests: "true"
+                  run-build: "true"
+                  build-release: "true"
+                  coverage: "true"
+
+            - name: 📊 Upload coverage to Codecov
+              if: hashFiles('./coverage/cobertura.xml') != ''
+              uses: codecov/codecov-action@v4
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  files: ./coverage/cobertura.xml
+                  flags: unittests
+                  name: codecov-umbrella
+                  fail_ci_if_error: false
+
+            - name: ✅ Notify tests passed
+              if: success() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  title: "✅ Tests & Lint Passed"
+                  description: "All tests passed successfully"
+                  status: success
+
+            - name: ❌ Notify tests failed
+              if: failure() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  title: "❌ Tests Failed"
+                  description: "CI tests failed. Check the logs for details."
+                  status: failure
+                  fields: '[{"name": "Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+    # =========================================================================
+    # Stage 2: Build and Push Docker Image
+    # =========================================================================
+    build-and-push:
+        name: 🐳 Build and Push Docker Image
+        needs: test-and-lint
+        runs-on: ubuntu-latest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🐳 Build and Push
+              uses: nuniesmith/actions/.github/actions/docker-build-push@main
+              with:
+                  image-name: ${{ env.IMAGE_NAME }}
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
+                  dockerfile: docker/Dockerfile
+                  platforms: linux/amd64,linux/arm64
+
+            - name: ✅ Notify Docker build complete
+              if: success() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  title: "🐳 Docker Image Built"
+                  description: "Multi-arch Docker images pushed to Docker Hub"
+                  status: success
+                  fields: '[{"name": "Image", "value": "${{ env.IMAGE_NAME }}:latest", "inline": true}, {"name": "Platforms", "value": "amd64, arm64", "inline": true}]'
+
+            - name: ❌ Notify Docker build failed
+              if: failure() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  title: "❌ Docker Build Failed"
+                  description: "Failed to build or push Docker images"
+                  status: failure
+
+    # =========================================================================
+    # Stage 3: Deploy to Production (Raspberry Pi)
+    # =========================================================================
+    deploy:
+        name: 🚀 Deploy to Raspberry Pi
+        needs: build-and-push
+        runs-on: ubuntu-latest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 📝 Generate env files content
+              id: env-files
+              env:
+                  KRAKEN_API_KEY_PERSONAL: ${{ secrets.KRAKEN_API_KEY_PERSONAL }}
+                  KRAKEN_API_SECRET_PERSONAL: ${{ secrets.KRAKEN_API_SECRET_PERSONAL }}
+                  KRAKEN_API_KEY_PROP: ${{ secrets.KRAKEN_API_KEY_PROP }}
+                  KRAKEN_API_SECRET_PROP: ${{ secrets.KRAKEN_API_SECRET_PROP }}
+                  DISCORD_WEBHOOK_PERSONAL: ${{ secrets.DISCORD_WEBHOOK_PERSONAL }}
+                  DISCORD_WEBHOOK_PROP: ${{ secrets.DISCORD_WEBHOOK_PROP }}
+              run: |
+                  # Determine which services to start
+                  SERVICES=""
+
+                  if [ -n "$KRAKEN_API_KEY_PERSONAL" ] && [ -n "$KRAKEN_API_SECRET_PERSONAL" ]; then
+                    SERVICES="personal-bot"
+                    echo "✅ Personal bot credentials found"
+                  fi
+
+                  if [ -n "$KRAKEN_API_KEY_PROP" ] && [ -n "$KRAKEN_API_SECRET_PROP" ]; then
+                    SERVICES="$SERVICES propfirm-bot"
+                    echo "✅ Prop firm bot credentials found"
+                  fi
+
+                  if [ -z "$SERVICES" ]; then
+                    echo "❌ No API credentials found!"
+                    exit 1
+                  fi
+
+                  echo "services=$SERVICES" >> $GITHUB_OUTPUT
+
+            - name: 🚀 Deploy via SSH
+              uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+              with:
+                  host: ${{ secrets.PROD_TAILSCALE_IP }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  project-path: ~/kraken
+                  docker-compose-file: docker-compose.prod.yml
+                  docker-services: ${{ steps.env-files.outputs.services }}
+                  git-pull: "true"
+                  git-branch: main
+                  docker-pull: "true"
+                  docker-prune: "true"
+                  pre-deploy-command: |
+                      # Create .env.personal if credentials exist
+                      if [ -n "${{ secrets.KRAKEN_API_KEY_PERSONAL }}" ]; then
+                        cat > .env.personal << 'ENVEOF'
+                      # Kraken Trading Bot - Personal Account Configuration
+                      # Auto-generated from GitHub Secrets during deployment
+
+                      # API Credentials
+                      KRAKEN_API_KEY=${{ secrets.KRAKEN_API_KEY_PERSONAL }}
+                      KRAKEN_API_SECRET=${{ secrets.KRAKEN_API_SECRET_PERSONAL }}
+
+                      # Trading Configuration
+                      TRADING_PAIRS=BTC/USD,ETH/USD
+                      EMA_SHORT_PERIOD=50
+                      EMA_LONG_PERIOD=200
+
+                      # Risk Management
+                      RISK_PER_TRADE_PERCENTAGE=33.0
+                      MAX_POSITION_SIZE_USD=12.0
+                      MIN_POSITION_SIZE_USD=10.0
+                      MIN_ACCOUNT_BALANCE_USD=10.0
+                      STOP_LOSS_PERCENTAGE=2.0
+                      TAKE_PROFIT_PERCENTAGE=5.0
+                      MAX_DAILY_TRADES=6
+                      TRADE_COOLDOWN_SECONDS=300
+
+                      # Portfolio Management
+                      TARGET_BTC_ALLOCATION_PCT=40.0
+                      TARGET_ETH_ALLOCATION_PCT=40.0
+                      TARGET_SOL_ALLOCATION_PCT=0.0
+                      TARGET_USD_ALLOCATION_PCT=20.0
+                      PROFIT_HOLD_PERCENTAGE=10.0
+                      REBALANCE_THRESHOLD_PCT=10.0
+                      ENABLE_REBALANCING=true
+
+                      # System Configuration
+                      ENABLE_DRY_RUN=false
+                      SIGNAL_ONLY_MODE=false
+                      LOG_LEVEL=info
+                      HEALTH_CHECK_PORT=8080
+
+                      # WebSocket Configuration
+                      WS_RECONNECT_DELAY_SECS=5
+                      WS_PING_INTERVAL_SECS=30
+
+                      # Discord Notifications
+                      DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_PERSONAL }}
+                      ENVEOF
+                        chmod 600 .env.personal
+                        echo "✅ Created .env.personal"
+                      fi
+
+                      # Create .env.propfirm if credentials exist
+                      if [ -n "${{ secrets.KRAKEN_API_KEY_PROP }}" ]; then
+                        cat > .env.propfirm << 'ENVEOF'
+                      # Kraken Trading Bot - Prop Firm Account Configuration
+                      # Auto-generated from GitHub Secrets during deployment
+
+                      # API Credentials
+                      KRAKEN_API_KEY=${{ secrets.KRAKEN_API_KEY_PROP }}
+                      KRAKEN_API_SECRET=${{ secrets.KRAKEN_API_SECRET_PROP }}
+
+                      # Trading Configuration
+                      TRADING_PAIRS=BTC/USD,ETH/USD,SOL/USD,FARTCOIN/USD,HYPE/USD
+                      EMA_SHORT_PERIOD=50
+                      EMA_LONG_PERIOD=200
+
+                      # Risk Management (5K Account)
+                      RISK_PER_TRADE_PERCENTAGE=1.0
+                      MAX_POSITION_SIZE_USD=250.0
+                      MIN_ACCOUNT_BALANCE_USD=4500.0
+                      STOP_LOSS_PERCENTAGE=2.0
+                      TAKE_PROFIT_PERCENTAGE=5.0
+                      MAX_DAILY_TRADES=5
+                      TRADE_COOLDOWN_SECONDS=180
+
+                      # Portfolio Management
+                      TARGET_BTC_ALLOCATION_PCT=20.0
+                      TARGET_ETH_ALLOCATION_PCT=20.0
+                      TARGET_SOL_ALLOCATION_PCT=20.0
+                      TARGET_FARTCOIN_ALLOCATION_PCT=20.0
+                      TARGET_HYPE_ALLOCATION_PCT=20.0
+                      TARGET_USD_ALLOCATION_PCT=0.0
+                      PROFIT_HOLD_PERCENTAGE=10.0
+                      REBALANCE_THRESHOLD_PCT=10.0
+                      ENABLE_REBALANCING=true
+
+                      # System Configuration
+                      ENABLE_DRY_RUN=true
+                      SIGNAL_ONLY_MODE=true
+                      SIMULATED_BALANCE_USD=5000.0
+                      LOG_LEVEL=info
+                      HEALTH_CHECK_PORT=8080
+
+                      # WebSocket Configuration
+                      WS_RECONNECT_DELAY_SECS=5
+                      WS_PING_INTERVAL_SECS=30
+
+                      # Discord Notifications
+                      DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_PROP }}
+                      ENVEOF
+                        chmod 600 .env.propfirm
+                        echo "✅ Created .env.propfirm"
+                      fi
+                  post-deploy-command: |
+                      echo "📊 Checking container health..."
+                      docker compose -f docker-compose.prod.yml ps
+                      echo ""
+                      echo "📊 Storage usage:"
+                      df -h / | grep -v Filesystem
+                      docker system df
+
+            - name: 🔍 Verify deployment
+              env:
+                  PROD_SSH_USER: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  PROD_SSH_PORT: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  PI_HOST: ${{ secrets.PROD_TAILSCALE_IP }}
+              run: |
+                  echo "📋 Checking container logs..."
+
+                  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                      -p ${PROD_SSH_PORT} -i ~/.ssh/deploy_key \
+                      ${PROD_SSH_USER}@${PI_HOST} \
+                      "cd ~/kraken && docker compose -f docker-compose.prod.yml logs --tail=20" || true
+
+            - name: ✅ Notify deployment success
+              if: success() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  title: "🚀 Deployment Successful"
+                  description: "Kraken Trading Bot deployed to Raspberry Pi"
+                  status: success
+                  fields: '[{"name": "Version", "value": "${{ github.sha }}", "inline": true}, {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true}, {"name": "Status", "value": "✅ Running", "inline": true}]'
+
+            - name: ❌ Notify deployment failed
+              if: failure() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  title: "❌ Deployment Failed"
+                  description: "Failed to deploy to Raspberry Pi"
+                  status: failure
+                  fields: '[{"name": "Error", "value": "Check SSH connection and Tailscale setup", "inline": false}, {"name": "Logs", "value": "[View Workflow](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'

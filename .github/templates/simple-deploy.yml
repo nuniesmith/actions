@@ -1,0 +1,184 @@
+# =============================================================================
+# 🚀 Simple Deployment Workflow Template
+# =============================================================================
+# A minimal deployment workflow for deploying to a server via Tailscale SSH.
+# Use this template when you just need to deploy without CI/CD complexity.
+#
+# SETUP:
+# 1. Copy this file to your repository: .github/workflows/deploy.yml
+# 2. Customize the env variables below for your project
+# 3. Add required secrets to your repository
+#
+# REQUIRED SECRETS:
+#   - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
+#   - TAILSCALE_OAUTH_SECRET: Tailscale OAuth Secret
+#   - PROD_TAILSCALE_IP: Production server Tailscale IP (100.x.x.x)
+#   - PROD_SSH_KEY: SSH private key for deployment user
+#
+# OPTIONAL SECRETS:
+#   - PROD_SSH_USER: SSH username (default: actions)
+#   - PROD_SSH_PORT: SSH port (default: 22)
+#   - DISCORD_WEBHOOK: Discord webhook URL for notifications
+# =============================================================================
+
+name: 🚀 Deploy
+
+on:
+  # Deploy on push to main
+  push:
+    branches: [main]
+
+  # Manual deployment trigger
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+        default: production
+      skip_pull:
+        description: "Skip git pull (deploy current state)"
+        required: false
+        type: boolean
+        default: false
+
+# =============================================================================
+# CUSTOMIZE THESE FOR YOUR PROJECT
+# =============================================================================
+env:
+  # Project settings
+  PROJECT_NAME: my-project                 # Your project name
+
+  # Deployment settings
+  DEPLOY_PATH: ~/my-project                # Path on server
+  COMPOSE_FILE: docker-compose.yml         # Docker compose file (or docker-compose.prod.yml)
+  GIT_BRANCH: main                         # Branch to deploy
+
+  # Docker services to deploy (space-separated, empty = all)
+  DOCKER_SERVICES: ""                      # e.g., "web api worker"
+
+# =============================================================================
+# WORKFLOW CONFIGURATION
+# =============================================================================
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ inputs.environment || 'production' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  deploy:
+    name: 🚀 Deploy to ${{ inputs.environment || 'production' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.environment || 'production' }}
+      # url: https://your-domain.com  # Uncomment and set your URL
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📣 Notify deployment started
+        if: ${{ secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🚀 Deployment Started"
+          description: "Deploying `${{ env.PROJECT_NAME }}` to ${{ inputs.environment || 'production' }}"
+          status: started
+          include-repo-info: "true"
+
+      - name: 🔌 Connect to Tailscale
+        uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+          target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+      - name: 🚀 Deploy via SSH
+        uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+        with:
+          host: ${{ secrets.PROD_TAILSCALE_IP }}
+          port: ${{ secrets.PROD_SSH_PORT || '22' }}
+          username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+          ssh-key: ${{ secrets.PROD_SSH_KEY }}
+          project-path: ${{ env.DEPLOY_PATH }}
+          docker-compose-file: ${{ env.COMPOSE_FILE }}
+          docker-services: ${{ env.DOCKER_SERVICES }}
+          git-pull: ${{ inputs.skip_pull != true && 'true' || 'false' }}
+          git-branch: ${{ env.GIT_BRANCH }}
+          docker-pull: "true"
+          docker-prune: "true"
+
+      - name: ✅ Notify deployment success
+        if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "✅ Deployment Successful"
+          description: "`${{ env.PROJECT_NAME }}` deployed to ${{ inputs.environment || 'production' }}"
+          status: success
+          fields: |
+            [
+              {"name": "Environment", "value": "`${{ inputs.environment || 'production' }}`", "inline": true},
+              {"name": "Branch", "value": "`${{ env.GIT_BRANCH }}`", "inline": true},
+              {"name": "Triggered by", "value": "`${{ github.actor }}`", "inline": true}
+            ]
+
+      - name: ❌ Notify deployment failed
+        if: ${{ failure() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "❌ Deployment Failed"
+          description: "Failed to deploy `${{ env.PROJECT_NAME }}` to ${{ inputs.environment || 'production' }}"
+          status: failure
+          fields: '[{"name": "Logs", "value": "[View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+      - name: 📊 Deployment Summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🚀 Deployment Summary
+
+          | Property | Value |
+          |----------|-------|
+          | Project | \`${{ env.PROJECT_NAME }}\` |
+          | Environment | \`${{ inputs.environment || 'production' }}\` |
+          | Server | \`${{ secrets.PROD_TAILSCALE_IP }}\` |
+          | Deploy Path | \`${{ env.DEPLOY_PATH }}\` |
+          | Git Branch | \`${{ env.GIT_BRANCH }}\` |
+          | Git Pull | \`${{ inputs.skip_pull != true && 'yes' || 'no' }}\` |
+          | Commit | \`${{ github.sha }}\` |
+          | Triggered by | \`${{ github.actor }}\` |
+          | Status | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |
+
+          ### Quick Commands
+
+          \`\`\`bash
+          # SSH into server
+          ssh -p ${{ secrets.PROD_SSH_PORT || '22' }} ${{ secrets.PROD_SSH_USER || 'actions' }}@${{ secrets.PROD_TAILSCALE_IP }}
+
+          # Go to project
+          cd ${{ env.DEPLOY_PATH }}
+
+          # View logs
+          docker compose -f ${{ env.COMPOSE_FILE }} logs -f
+
+          # Restart services
+          docker compose -f ${{ env.COMPOSE_FILE }} restart
+          \`\`\`
+          EOF

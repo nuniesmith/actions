@@ -1,0 +1,305 @@
+name: 'Rust CI'
+description: 'Complete Rust CI pipeline with caching, linting, testing, and building'
+author: 'nuniesmith'
+
+branding:
+  icon: 'check-circle'
+  color: 'orange'
+
+inputs:
+  toolchain:
+    description: 'Rust toolchain (stable, beta, nightly)'
+    required: false
+    default: 'stable'
+  components:
+    description: 'Additional components (comma-separated: rustfmt, clippy, llvm-tools-preview)'
+    required: false
+    default: 'rustfmt, clippy'
+  targets:
+    description: 'Additional targets to install (comma-separated)'
+    required: false
+    default: ''
+  run-fmt:
+    description: 'Run cargo fmt check'
+    required: false
+    default: 'true'
+  run-clippy:
+    description: 'Run cargo clippy'
+    required: false
+    default: 'true'
+  run-tests:
+    description: 'Run cargo test'
+    required: false
+    default: 'true'
+  run-build:
+    description: 'Run cargo build'
+    required: false
+    default: 'true'
+  build-release:
+    description: 'Build in release mode'
+    required: false
+    default: 'true'
+  clippy-args:
+    description: 'Additional arguments for clippy'
+    required: false
+    default: '--all-targets --all-features -- -D warnings'
+  test-args:
+    description: 'Additional arguments for test'
+    required: false
+    default: '--verbose'
+  build-args:
+    description: 'Additional arguments for build'
+    required: false
+    default: '--verbose'
+  features:
+    description: 'Features to enable (comma-separated)'
+    required: false
+    default: ''
+  all-features:
+    description: 'Enable all features'
+    required: false
+    default: 'false'
+  no-default-features:
+    description: 'Disable default features'
+    required: false
+    default: 'false'
+  working-directory:
+    description: 'Working directory for cargo commands'
+    required: false
+    default: '.'
+  coverage:
+    description: 'Generate code coverage with cargo-tarpaulin'
+    required: false
+    default: 'false'
+  coverage-output-dir:
+    description: 'Coverage output directory'
+    required: false
+    default: './coverage'
+
+outputs:
+  fmt-result:
+    description: 'Result of fmt check (success/failure/skipped)'
+    value: ${{ steps.fmt.outputs.result }}
+  clippy-result:
+    description: 'Result of clippy (success/failure/skipped)'
+    value: ${{ steps.clippy.outputs.result }}
+  test-result:
+    description: 'Result of tests (success/failure/skipped)'
+    value: ${{ steps.test.outputs.result }}
+  build-result:
+    description: 'Result of build (success/failure/skipped)'
+    value: ${{ steps.build.outputs.result }}
+  coverage-file:
+    description: 'Path to coverage file (if generated)'
+    value: ${{ steps.coverage.outputs.coverage_file }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 🦀 Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: 📦 Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-
+
+    - name: 📦 Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-git-
+
+    - name: 📦 Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-${{ inputs.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-build-${{ inputs.toolchain }}-
+
+    - name: 🔧 Prepare feature flags
+      id: features
+      shell: bash
+      run: |
+        FEATURE_FLAGS=""
+
+        if [ "${{ inputs.all-features }}" = "true" ]; then
+          FEATURE_FLAGS="--all-features"
+        elif [ -n "${{ inputs.features }}" ]; then
+          FEATURE_FLAGS="--features ${{ inputs.features }}"
+        fi
+
+        if [ "${{ inputs.no-default-features }}" = "true" ]; then
+          FEATURE_FLAGS="$FEATURE_FLAGS --no-default-features"
+        fi
+
+        echo "flags=$FEATURE_FLAGS" >> $GITHUB_OUTPUT
+
+    - name: 📝 Run cargo fmt
+      id: fmt
+      if: inputs.run-fmt == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔍 Checking code formatting..."
+        if cargo fmt --all -- --check; then
+          echo "✅ Code formatting check passed"
+          echo "result=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Code formatting check failed"
+          echo "result=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: 📝 Skip fmt (not requested)
+      if: inputs.run-fmt != 'true'
+      id: fmt-skip
+      shell: bash
+      run: echo "result=skipped" >> $GITHUB_OUTPUT
+
+    - name: 📎 Run cargo clippy
+      id: clippy
+      if: inputs.run-clippy == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔍 Running clippy lints..."
+        if cargo clippy ${{ steps.features.outputs.flags }} ${{ inputs.clippy-args }}; then
+          echo "✅ Clippy checks passed"
+          echo "result=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Clippy checks failed"
+          echo "result=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: 📎 Skip clippy (not requested)
+      if: inputs.run-clippy != 'true'
+      id: clippy-skip
+      shell: bash
+      run: echo "result=skipped" >> $GITHUB_OUTPUT
+
+    - name: 🧪 Run cargo test
+      id: test
+      if: inputs.run-tests == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🧪 Running tests..."
+        if cargo test ${{ steps.features.outputs.flags }} ${{ inputs.test-args }}; then
+          echo "✅ All tests passed"
+          echo "result=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Tests failed"
+          echo "result=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: 🧪 Skip tests (not requested)
+      if: inputs.run-tests != 'true'
+      id: test-skip
+      shell: bash
+      run: echo "result=skipped" >> $GITHUB_OUTPUT
+
+    - name: 🏗️ Run cargo build
+      id: build
+      if: inputs.run-build == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🏗️ Building project..."
+        RELEASE_FLAG=""
+        if [ "${{ inputs.build-release }}" = "true" ]; then
+          RELEASE_FLAG="--release"
+        fi
+
+        if cargo build $RELEASE_FLAG ${{ steps.features.outputs.flags }} ${{ inputs.build-args }}; then
+          echo "✅ Build successful"
+          echo "result=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Build failed"
+          echo "result=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: 🏗️ Skip build (not requested)
+      if: inputs.run-build != 'true'
+      id: build-skip
+      shell: bash
+      run: echo "result=skipped" >> $GITHUB_OUTPUT
+
+    - name: 📊 Generate code coverage
+      id: coverage
+      if: inputs.coverage == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "📊 Installing cargo-tarpaulin..."
+        cargo install cargo-tarpaulin || true
+
+        echo "📊 Generating coverage report..."
+        mkdir -p ${{ inputs.coverage-output-dir }}
+        cargo tarpaulin --out Xml --output-dir ${{ inputs.coverage-output-dir }} ${{ steps.features.outputs.flags }}
+
+        COVERAGE_FILE="${{ inputs.coverage-output-dir }}/cobertura.xml"
+        if [ -f "$COVERAGE_FILE" ]; then
+          echo "✅ Coverage report generated: $COVERAGE_FILE"
+          echo "coverage_file=$COVERAGE_FILE" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️ Coverage file not found"
+          echo "coverage_file=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: 📊 Skip coverage (not requested)
+      if: inputs.coverage != 'true'
+      id: coverage-skip
+      shell: bash
+      run: echo "coverage_file=" >> $GITHUB_OUTPUT
+
+    - name: 📋 Summary
+      shell: bash
+      run: |
+        echo "## 🦀 Rust CI Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Toolchain | \`${{ inputs.toolchain }}\` |" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.run-fmt }}" = "true" ]; then
+          echo "| Format (rustfmt) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Format (rustfmt) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ "${{ inputs.run-clippy }}" = "true" ]; then
+          echo "| Lints (clippy) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Lints (clippy) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ "${{ inputs.run-tests }}" = "true" ]; then
+          echo "| Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ "${{ inputs.run-build }}" = "true" ]; then
+          MODE="${{ inputs.build-release == 'true' && 'release' || 'debug' }}"
+          echo "| Build ($MODE) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Build | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ "${{ inputs.coverage }}" = "true" ]; then
+          echo "| Coverage | ✅ Generated |" >> $GITHUB_STEP_SUMMARY
+        fi

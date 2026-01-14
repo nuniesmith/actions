@@ -1,0 +1,175 @@
+name: 'Discord Notification'
+description: 'Send rich embed notifications to Discord webhook'
+author: 'nuniesmith'
+
+branding:
+  icon: 'message-circle'
+  color: 'purple'
+
+inputs:
+  webhook-url:
+    description: 'Discord webhook URL'
+    required: true
+  title:
+    description: 'Embed title'
+    required: true
+  description:
+    description: 'Embed description'
+    required: false
+    default: ''
+  color:
+    description: 'Embed color (success=3066993, failure=15158332, info=3447003, warning=16776960)'
+    required: false
+    default: '3447003'
+  status:
+    description: 'Status type: success, failure, info, warning, started'
+    required: false
+    default: 'info'
+  fields:
+    description: 'JSON array of field objects [{name, value, inline}]'
+    required: false
+    default: '[]'
+  footer:
+    description: 'Footer text'
+    required: false
+    default: ''
+  include-timestamp:
+    description: 'Include timestamp in embed'
+    required: false
+    default: 'true'
+  include-repo-info:
+    description: 'Include repository, branch, and commit info'
+    required: false
+    default: 'false'
+
+outputs:
+  sent:
+    description: 'Whether the notification was sent successfully'
+    value: ${{ steps.send.outputs.sent }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Determine color from status
+      id: color
+      shell: bash
+      run: |
+        STATUS="${{ inputs.status }}"
+        COLOR="${{ inputs.color }}"
+
+        # If color is default and status is set, use status color
+        if [ "$COLOR" = "3447003" ]; then
+          case "$STATUS" in
+            success)
+              COLOR="3066993"  # Green
+              ;;
+            failure)
+              COLOR="15158332"  # Red
+              ;;
+            warning)
+              COLOR="16776960"  # Yellow
+              ;;
+            started)
+              COLOR="3447003"  # Blue
+              ;;
+            info)
+              COLOR="3447003"  # Blue
+              ;;
+          esac
+        fi
+
+        echo "color=$COLOR" >> $GITHUB_OUTPUT
+
+    - name: Build and send notification
+      id: send
+      shell: bash
+      env:
+        WEBHOOK_URL: ${{ inputs.webhook-url }}
+        TITLE: ${{ inputs.title }}
+        DESCRIPTION: ${{ inputs.description }}
+        COLOR: ${{ steps.color.outputs.color }}
+        FIELDS: ${{ inputs.fields }}
+        FOOTER: ${{ inputs.footer }}
+        INCLUDE_TIMESTAMP: ${{ inputs.include-timestamp }}
+        INCLUDE_REPO_INFO: ${{ inputs.include-repo-info }}
+      run: |
+        if [ -z "$WEBHOOK_URL" ]; then
+          echo "No webhook URL provided, skipping notification"
+          echo "sent=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Start building the embed
+        TIMESTAMP=""
+        if [ "$INCLUDE_TIMESTAMP" = "true" ]; then
+          TIMESTAMP=", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\""
+        fi
+
+        # Build footer
+        FOOTER_JSON=""
+        if [ -n "$FOOTER" ]; then
+          FOOTER_JSON=", \"footer\": {\"text\": \"$FOOTER\"}"
+        fi
+
+        # Build repo info fields
+        REPO_FIELDS=""
+        if [ "$INCLUDE_REPO_INFO" = "true" ]; then
+          REPO_FIELDS="[
+            {\"name\": \"Repository\", \"value\": \"${{ github.repository }}\", \"inline\": true},
+            {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"inline\": true},
+            {\"name\": \"Commit\", \"value\": \"[\`${GITHUB_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})\", \"inline\": true}
+          ]"
+        fi
+
+        # Merge custom fields with repo fields
+        if [ -n "$REPO_FIELDS" ] && [ "$FIELDS" != "[]" ]; then
+          # Remove brackets and merge
+          REPO_FIELDS_INNER=$(echo "$REPO_FIELDS" | sed 's/^\[//' | sed 's/\]$//')
+          FIELDS_INNER=$(echo "$FIELDS" | sed 's/^\[//' | sed 's/\]$//')
+          FINAL_FIELDS="[$REPO_FIELDS_INNER, $FIELDS_INNER]"
+        elif [ -n "$REPO_FIELDS" ]; then
+          FINAL_FIELDS="$REPO_FIELDS"
+        else
+          FINAL_FIELDS="$FIELDS"
+        fi
+
+        # Build fields JSON
+        FIELDS_JSON=""
+        if [ "$FINAL_FIELDS" != "[]" ]; then
+          FIELDS_JSON=", \"fields\": $FINAL_FIELDS"
+        fi
+
+        # Build description JSON
+        DESC_JSON=""
+        if [ -n "$DESCRIPTION" ]; then
+          DESC_JSON=", \"description\": \"$DESCRIPTION\""
+        fi
+
+        # Build the payload
+        PAYLOAD=$(cat <<EOF
+        {
+          "embeds": [{
+            "title": "$TITLE"
+            $DESC_JSON
+            , "color": $COLOR
+            $FIELDS_JSON
+            $FOOTER_JSON
+            $TIMESTAMP
+          }]
+        }
+        EOF
+        )
+
+        # Send the notification
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" \
+          "$WEBHOOK_URL")
+
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "✅ Discord notification sent successfully"
+          echo "sent=true" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️ Discord notification failed with HTTP $HTTP_CODE"
+          echo "sent=false" >> $GITHUB_OUTPUT
+        fi

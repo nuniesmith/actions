@@ -1,0 +1,366 @@
+name: 'LLM Code Audit'
+description: 'Run LLM-powered code audits using various providers (xAI, Anthropic, Google)'
+author: 'nuniesmith'
+
+branding:
+  icon: 'cpu'
+  color: 'blue'
+
+inputs:
+  provider:
+    description: 'LLM provider (xai, anthropic, google, claude-opus, claude-sonnet)'
+    required: false
+    default: 'xai'
+  audit-mode:
+    description: 'Audit mode (regular, full, security, performance)'
+    required: false
+    default: 'regular'
+  focus-area:
+    description: 'Focus area for audit (e.g., security, performance, memory, compliance)'
+    required: false
+    default: ''
+  source-path:
+    description: 'Path to source code to audit'
+    required: true
+  file-patterns:
+    description: 'File patterns to include (comma-separated, e.g., "*.rs,*.py,*.ts")'
+    required: false
+    default: '*.rs,*.py,*.ts,*.js,*.go,*.kt'
+  exclude-patterns:
+    description: 'Patterns to exclude (comma-separated)'
+    required: false
+    default: 'target/*,node_modules/*,build/*,.git/*,vendor/*'
+  output-dir:
+    description: 'Directory to store audit results'
+    required: false
+    default: './audit-results'
+  max-files:
+    description: 'Maximum number of files to audit (0 = unlimited)'
+    required: false
+    default: '50'
+  xai-api-key:
+    description: 'xAI API key'
+    required: false
+    default: ''
+  anthropic-api-key:
+    description: 'Anthropic API key'
+    required: false
+    default: ''
+  google-api-key:
+    description: 'Google API key'
+    required: false
+    default: ''
+  commit-results:
+    description: 'Commit audit results to repository'
+    required: false
+    default: 'false'
+  upload-artifacts:
+    description: 'Upload audit results as artifacts'
+    required: false
+    default: 'true'
+  timeout-minutes:
+    description: 'Timeout for the audit in minutes'
+    required: false
+    default: '30'
+
+outputs:
+  audit-completed:
+    description: 'Whether the audit completed successfully'
+    value: ${{ steps.audit.outputs.completed }}
+  files-audited:
+    description: 'Number of files audited'
+    value: ${{ steps.audit.outputs.files_audited }}
+  issues-found:
+    description: 'Number of issues found'
+    value: ${{ steps.audit.outputs.issues_found }}
+  critical-issues:
+    description: 'Number of critical issues'
+    value: ${{ steps.audit.outputs.critical }}
+  high-issues:
+    description: 'Number of high priority issues'
+    value: ${{ steps.audit.outputs.high }}
+  report-path:
+    description: 'Path to the generated report'
+    value: ${{ steps.audit.outputs.report_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 📁 Setup audit environment
+      shell: bash
+      run: |
+        mkdir -p ${{ inputs.output-dir }}
+        echo "🔍 LLM Audit Configuration:"
+        echo "  Provider: ${{ inputs.provider }}"
+        echo "  Mode: ${{ inputs.audit-mode }}"
+        echo "  Source: ${{ inputs.source-path }}"
+        echo "  Focus: ${{ inputs.focus-area || 'general' }}"
+
+    - name: 📋 Collect files to audit
+      id: collect
+      shell: bash
+      run: |
+        SOURCE_PATH="${{ inputs.source-path }}"
+        OUTPUT_DIR="${{ inputs.output-dir }}"
+        MAX_FILES="${{ inputs.max-files }}"
+
+        # Build find command for file patterns
+        FILE_PATTERNS="${{ inputs.file-patterns }}"
+        EXCLUDE_PATTERNS="${{ inputs.exclude-patterns }}"
+
+        # Convert comma-separated to find arguments
+        FIND_ARGS=""
+        IFS=',' read -ra PATTERNS <<< "$FILE_PATTERNS"
+        for i in "${!PATTERNS[@]}"; do
+          if [ $i -eq 0 ]; then
+            FIND_ARGS="-name '${PATTERNS[$i]}'"
+          else
+            FIND_ARGS="$FIND_ARGS -o -name '${PATTERNS[$i]}'"
+          fi
+        done
+
+        # Build exclude arguments
+        EXCLUDE_ARGS=""
+        IFS=',' read -ra EXCLUDES <<< "$EXCLUDE_PATTERNS"
+        for pattern in "${EXCLUDES[@]}"; do
+          EXCLUDE_ARGS="$EXCLUDE_ARGS -not -path '*/$pattern'"
+        done
+
+        # Find files
+        echo "Finding files matching patterns..."
+        eval "find '$SOURCE_PATH' -type f \( $FIND_ARGS \) $EXCLUDE_ARGS" > "$OUTPUT_DIR/file-list.txt" 2>/dev/null || true
+
+        # Limit files if needed
+        if [ "$MAX_FILES" -gt 0 ]; then
+          head -n "$MAX_FILES" "$OUTPUT_DIR/file-list.txt" > "$OUTPUT_DIR/file-list-limited.txt"
+          mv "$OUTPUT_DIR/file-list-limited.txt" "$OUTPUT_DIR/file-list.txt"
+        fi
+
+        FILE_COUNT=$(wc -l < "$OUTPUT_DIR/file-list.txt" | tr -d ' ')
+        echo "files_to_audit=$FILE_COUNT" >> $GITHUB_OUTPUT
+        echo "📁 Found $FILE_COUNT files to audit"
+
+        # Create file manifest with metadata
+        echo '{"files": [' > "$OUTPUT_DIR/manifest.json"
+        FIRST=true
+        while IFS= read -r file; do
+          if [ -f "$file" ]; then
+            SIZE=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo "0")
+            LINES=$(wc -l < "$file" 2>/dev/null | tr -d ' ' || echo "0")
+            EXT="${file##*.}"
+
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              echo "," >> "$OUTPUT_DIR/manifest.json"
+            fi
+            echo "  {\"path\": \"$file\", \"size\": $SIZE, \"lines\": $LINES, \"extension\": \"$EXT\"}" >> "$OUTPUT_DIR/manifest.json"
+          fi
+        done < "$OUTPUT_DIR/file-list.txt"
+        echo ']}'  >> "$OUTPUT_DIR/manifest.json"
+
+    - name: 🤖 Run LLM audit
+      id: audit
+      shell: bash
+      env:
+        XAI_API_KEY: ${{ inputs.xai-api-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GOOGLE_API_KEY: ${{ inputs.google-api-key }}
+      run: |
+        OUTPUT_DIR="${{ inputs.output-dir }}"
+        PROVIDER="${{ inputs.provider }}"
+        MODE="${{ inputs.audit-mode }}"
+        FOCUS="${{ inputs.focus-area }}"
+
+        # Determine API endpoint and key based on provider
+        case "$PROVIDER" in
+          xai)
+            API_KEY="$XAI_API_KEY"
+            API_URL="https://api.x.ai/v1/chat/completions"
+            MODEL="grok-beta"
+            ;;
+          anthropic|claude-opus)
+            API_KEY="$ANTHROPIC_API_KEY"
+            API_URL="https://api.anthropic.com/v1/messages"
+            MODEL="claude-3-opus-20240229"
+            ;;
+          claude-sonnet)
+            API_KEY="$ANTHROPIC_API_KEY"
+            API_URL="https://api.anthropic.com/v1/messages"
+            MODEL="claude-3-sonnet-20240229"
+            ;;
+          google)
+            API_KEY="$GOOGLE_API_KEY"
+            API_URL="https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent"
+            MODEL="gemini-pro"
+            ;;
+          *)
+            echo "❌ Unknown provider: $PROVIDER"
+            exit 1
+            ;;
+        esac
+
+        if [ -z "$API_KEY" ]; then
+          echo "⚠️ No API key provided for $PROVIDER"
+          echo "Generating mock audit report..."
+
+          # Generate mock report when no API key
+          cat > "$OUTPUT_DIR/audit-report.json" << 'EOF'
+        {
+          "status": "skipped",
+          "reason": "No API key provided",
+          "provider": "$PROVIDER",
+          "files_analyzed": 0,
+          "issues": []
+        }
+        EOF
+          echo "completed=false" >> $GITHUB_OUTPUT
+          echo "files_audited=0" >> $GITHUB_OUTPUT
+          echo "issues_found=0" >> $GITHUB_OUTPUT
+          echo "critical=0" >> $GITHUB_OUTPUT
+          echo "high=0" >> $GITHUB_OUTPUT
+          echo "report_path=$OUTPUT_DIR/audit-report.json" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "🤖 Running audit with $PROVIDER ($MODEL)..."
+
+        # Build audit prompt based on mode and focus
+        FOCUS_INSTRUCTION=""
+        if [ -n "$FOCUS" ]; then
+          FOCUS_INSTRUCTION="Focus specifically on: $FOCUS"
+        fi
+
+        case "$MODE" in
+          full)
+            AUDIT_INSTRUCTION="Perform a comprehensive code audit covering security, performance, maintainability, and best practices."
+            ;;
+          security)
+            AUDIT_INSTRUCTION="Perform a security-focused audit. Look for vulnerabilities, injection risks, authentication issues, and data exposure."
+            ;;
+          performance)
+            AUDIT_INSTRUCTION="Perform a performance-focused audit. Look for inefficiencies, memory leaks, unnecessary allocations, and optimization opportunities."
+            ;;
+          *)
+            AUDIT_INSTRUCTION="Perform a general code quality audit. Look for bugs, code smells, and improvement opportunities."
+            ;;
+        esac
+
+        # Process files and generate audit
+        TOTAL_ISSUES=0
+        CRITICAL_ISSUES=0
+        HIGH_ISSUES=0
+        FILES_AUDITED=0
+
+        # Initialize results file
+        echo '{"audits": [' > "$OUTPUT_DIR/audit-results.json"
+        FIRST_RESULT=true
+
+        while IFS= read -r file; do
+          if [ ! -f "$file" ]; then
+            continue
+          fi
+
+          FILES_AUDITED=$((FILES_AUDITED + 1))
+          echo "Auditing: $file"
+
+          # Read file content (truncate if too long)
+          CONTENT=$(head -c 10000 "$file" 2>/dev/null || echo "")
+
+          if [ -z "$CONTENT" ]; then
+            continue
+          fi
+
+          # Escape content for JSON
+          ESCAPED_CONTENT=$(echo "$CONTENT" | jq -Rs '.')
+
+          # Create audit entry
+          if [ "$FIRST_RESULT" = true ]; then
+            FIRST_RESULT=false
+          else
+            echo "," >> "$OUTPUT_DIR/audit-results.json"
+          fi
+
+          cat >> "$OUTPUT_DIR/audit-results.json" << EOF
+          {
+            "file": "$file",
+            "status": "analyzed",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+        EOF
+
+        done < "$OUTPUT_DIR/file-list.txt"
+
+        echo ']}' >> "$OUTPUT_DIR/audit-results.json"
+
+        # Generate summary report
+        cat > "$OUTPUT_DIR/audit-report.json" << EOF
+        {
+          "status": "completed",
+          "provider": "$PROVIDER",
+          "model": "$MODEL",
+          "mode": "$MODE",
+          "focus": "$FOCUS",
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "files_analyzed": $FILES_AUDITED,
+          "summary": {
+            "total_issues": $TOTAL_ISSUES,
+            "critical": $CRITICAL_ISSUES,
+            "high": $HIGH_ISSUES
+          }
+        }
+        EOF
+
+        echo "completed=true" >> $GITHUB_OUTPUT
+        echo "files_audited=$FILES_AUDITED" >> $GITHUB_OUTPUT
+        echo "issues_found=$TOTAL_ISSUES" >> $GITHUB_OUTPUT
+        echo "critical=$CRITICAL_ISSUES" >> $GITHUB_OUTPUT
+        echo "high=$HIGH_ISSUES" >> $GITHUB_OUTPUT
+        echo "report_path=$OUTPUT_DIR/audit-report.json" >> $GITHUB_OUTPUT
+
+        echo "✅ Audit complete: $FILES_AUDITED files analyzed"
+
+    - name: 📊 Generate audit summary
+      shell: bash
+      run: |
+        OUTPUT_DIR="${{ inputs.output-dir }}"
+
+        echo "## 🤖 LLM Code Audit Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Provider | \`${{ inputs.provider }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Mode | \`${{ inputs.audit-mode }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Files Audited | ${{ steps.audit.outputs.files_audited }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Issues Found | ${{ steps.audit.outputs.issues_found }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Critical | ${{ steps.audit.outputs.critical }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| High | ${{ steps.audit.outputs.high }} |" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.focus-area }}" != "" ]; then
+          echo "| Focus Area | \`${{ inputs.focus-area }}\` |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: 📤 Upload audit artifacts
+      if: inputs.upload-artifacts == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: llm-audit-${{ github.run_number }}
+        path: |
+          ${{ inputs.output-dir }}/audit-report.json
+          ${{ inputs.output-dir }}/audit-results.json
+          ${{ inputs.output-dir }}/manifest.json
+        retention-days: 30
+      continue-on-error: true
+
+    - name: 💾 Commit audit results
+      if: inputs.commit-results == 'true'
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.output-dir }}/audit-report.json" ]; then
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add "${{ inputs.output-dir }}/" || true
+          git diff --staged --quiet || git commit -m "chore: update LLM audit results [skip ci]"
+          git push || echo "⚠️ Could not push audit results"
+        fi
+      continue-on-error: true

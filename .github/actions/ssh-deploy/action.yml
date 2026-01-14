@@ -1,0 +1,319 @@
+name: 'SSH Deploy'
+description: 'Deploy to a remote server via SSH over Tailscale'
+author: 'nuniesmith'
+
+branding:
+  icon: 'upload-cloud'
+  color: 'green'
+
+inputs:
+  host:
+    description: 'Target host (Tailscale IP or hostname)'
+    required: true
+  port:
+    description: 'SSH port'
+    required: false
+    default: '22'
+  username:
+    description: 'SSH username'
+    required: true
+  ssh-key:
+    description: 'SSH private key'
+    required: false
+    default: ''
+  password:
+    description: 'SSH password (fallback if no key)'
+    required: false
+    default: ''
+  project-path:
+    description: 'Path to project on remote server'
+    required: true
+  deploy-command:
+    description: 'Custom deploy command to run on remote'
+    required: false
+    default: ''
+  pre-deploy-command:
+    description: 'Command to run before deployment'
+    required: false
+    default: ''
+  post-deploy-command:
+    description: 'Command to run after deployment'
+    required: false
+    default: ''
+  docker-compose-file:
+    description: 'Docker compose file to use'
+    required: false
+    default: 'docker-compose.yml'
+  docker-services:
+    description: 'Space-separated list of services to deploy (empty = all)'
+    required: false
+    default: ''
+  git-pull:
+    description: 'Pull latest changes from git'
+    required: false
+    default: 'true'
+  git-branch:
+    description: 'Git branch to checkout/pull'
+    required: false
+    default: 'main'
+  docker-pull:
+    description: 'Pull latest Docker images'
+    required: false
+    default: 'true'
+  docker-prune:
+    description: 'Prune unused Docker resources after deploy'
+    required: false
+    default: 'true'
+  env-files:
+    description: 'JSON object of env files to create {filename: content}'
+    required: false
+    default: ''
+  timeout:
+    description: 'SSH connection timeout in seconds'
+    required: false
+    default: '30'
+  use-tailscale-ssh:
+    description: 'Try Tailscale SSH first before regular SSH'
+    required: false
+    default: 'true'
+
+outputs:
+  deployed:
+    description: 'Whether deployment was successful'
+    value: ${{ steps.deploy.outputs.deployed }}
+  ssh-method:
+    description: 'SSH method used (tailscale/key/password)'
+    value: ${{ steps.ssh-setup.outputs.method }}
+  services-started:
+    description: 'Services that were started'
+    value: ${{ steps.deploy.outputs.services }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 📦 Install SSH tools
+      shell: bash
+      run: |
+        if ! command -v sshpass &> /dev/null; then
+          sudo apt-get update && sudo apt-get install -y sshpass
+        fi
+        if ! command -v nc &> /dev/null; then
+          sudo apt-get install -y netcat-openbsd || sudo apt-get install -y netcat
+        fi
+
+    - name: 🔐 Configure SSH
+      id: ssh-setup
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.ssh-key }}
+        SSH_HOST: ${{ inputs.host }}
+        SSH_PORT: ${{ inputs.port }}
+        SSH_USER: ${{ inputs.username }}
+        SSH_PASSWORD: ${{ inputs.password }}
+        USE_TAILSCALE_SSH: ${{ inputs.use-tailscale-ssh }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        # Configure SSH options
+        cat >> ~/.ssh/config << EOF
+        Host $SSH_HOST
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            ConnectTimeout $TIMEOUT
+            ServerAliveInterval 10
+            ServerAliveCountMax 3
+            Port $SSH_PORT
+        EOF
+
+        # Setup SSH key if provided
+        if [ -n "$SSH_KEY" ]; then
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "✅ SSH private key configured"
+        fi
+
+        # Determine best SSH method
+        SSH_METHOD=""
+
+        # Try Tailscale SSH first
+        if [ "$USE_TAILSCALE_SSH" = "true" ] && command -v tailscale &> /dev/null; then
+          echo "🔍 Testing Tailscale SSH..."
+          if timeout 15 tailscale ssh ${SSH_USER}@${SSH_HOST} "echo 'Connected'" 2>&1 | grep -q "Connected"; then
+            SSH_METHOD="tailscale"
+            echo "✅ Tailscale SSH works"
+          else
+            echo "⚠️ Tailscale SSH not available"
+          fi
+        fi
+
+        # Try SSH with key
+        if [ -z "$SSH_METHOD" ] && [ -f ~/.ssh/deploy_key ]; then
+          echo "🔍 Testing SSH with key..."
+          if timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -p ${SSH_PORT} -i ~/.ssh/deploy_key \
+              ${SSH_USER}@${SSH_HOST} "echo 'Connected'" 2>&1 | grep -q "Connected"; then
+            SSH_METHOD="key"
+            echo "✅ SSH key authentication works"
+          else
+            echo "⚠️ SSH key authentication failed"
+          fi
+        fi
+
+        # Try SSH with password
+        if [ -z "$SSH_METHOD" ] && [ -n "$SSH_PASSWORD" ]; then
+          echo "🔍 Testing SSH with password..."
+          if sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -p ${SSH_PORT} \
+              ${SSH_USER}@${SSH_HOST} "echo 'Connected'" 2>&1 | grep -q "Connected"; then
+            SSH_METHOD="password"
+            echo "✅ SSH password authentication works"
+          else
+            echo "⚠️ SSH password authentication failed"
+          fi
+        fi
+
+        if [ -z "$SSH_METHOD" ]; then
+          echo "❌ No working SSH method found"
+          exit 1
+        fi
+
+        echo "method=$SSH_METHOD" >> $GITHUB_OUTPUT
+        echo "📡 Using SSH method: $SSH_METHOD"
+
+    - name: 🚀 Deploy to server
+      id: deploy
+      shell: bash
+      env:
+        SSH_HOST: ${{ inputs.host }}
+        SSH_PORT: ${{ inputs.port }}
+        SSH_USER: ${{ inputs.username }}
+        SSH_PASSWORD: ${{ inputs.password }}
+        SSH_METHOD: ${{ steps.ssh-setup.outputs.method }}
+        PROJECT_PATH: ${{ inputs.project-path }}
+        DEPLOY_COMMAND: ${{ inputs.deploy-command }}
+        PRE_DEPLOY_COMMAND: ${{ inputs.pre-deploy-command }}
+        POST_DEPLOY_COMMAND: ${{ inputs.post-deploy-command }}
+        COMPOSE_FILE: ${{ inputs.docker-compose-file }}
+        DOCKER_SERVICES: ${{ inputs.docker-services }}
+        GIT_PULL: ${{ inputs.git-pull }}
+        GIT_BRANCH: ${{ inputs.git-branch }}
+        DOCKER_PULL: ${{ inputs.docker-pull }}
+        DOCKER_PRUNE: ${{ inputs.docker-prune }}
+        ENV_FILES: ${{ inputs.env-files }}
+      run: |
+        # SSH execution function
+        ssh_exec() {
+          case "$SSH_METHOD" in
+            tailscale)
+              tailscale ssh ${SSH_USER}@${SSH_HOST} "$1"
+              ;;
+            key)
+              ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                  -p ${SSH_PORT} -i ~/.ssh/deploy_key ${SSH_USER}@${SSH_HOST} "$1"
+              ;;
+            password)
+              sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null -p ${SSH_PORT} \
+                  ${SSH_USER}@${SSH_HOST} "$1"
+              ;;
+          esac
+        }
+
+        echo "🚀 Starting deployment to ${SSH_HOST}..."
+        echo "📁 Project path: ${PROJECT_PATH}"
+
+        # Run pre-deploy command
+        if [ -n "$PRE_DEPLOY_COMMAND" ]; then
+          echo "⚙️ Running pre-deploy command..."
+          ssh_exec "cd ${PROJECT_PATH} && ${PRE_DEPLOY_COMMAND}"
+        fi
+
+        # Create env files if provided
+        if [ -n "$ENV_FILES" ] && [ "$ENV_FILES" != "{}" ]; then
+          echo "📝 Creating environment files..."
+          # Parse JSON and create files (simplified - expects flat JSON)
+          echo "$ENV_FILES" | jq -r 'to_entries[] | "\(.key):\(.value)"' 2>/dev/null | while IFS=: read -r filename content; do
+            if [ -n "$filename" ] && [ -n "$content" ]; then
+              echo "  Creating ${filename}..."
+              ssh_exec "echo '${content}' > ${PROJECT_PATH}/${filename} && chmod 600 ${PROJECT_PATH}/${filename}"
+            fi
+          done || echo "  (No env files to create or JSON parsing skipped)"
+        fi
+
+        # Custom deploy command takes precedence
+        if [ -n "$DEPLOY_COMMAND" ]; then
+          echo "⚙️ Running custom deploy command..."
+          ssh_exec "cd ${PROJECT_PATH} && ${DEPLOY_COMMAND}"
+        else
+          # Standard Docker Compose deployment
+
+          # Git pull
+          if [ "$GIT_PULL" = "true" ]; then
+            echo "📥 Pulling latest changes from git (${GIT_BRANCH})..."
+            ssh_exec "cd ${PROJECT_PATH} && git fetch origin && git checkout ${GIT_BRANCH} 2>/dev/null || true && git pull origin ${GIT_BRANCH}"
+          fi
+
+          # Stop containers
+          echo "🛑 Stopping current containers..."
+          ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} down || docker-compose -f ${COMPOSE_FILE} down || true"
+
+          # Docker pull
+          if [ "$DOCKER_PULL" = "true" ]; then
+            echo "📥 Pulling latest Docker images..."
+            ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} pull || docker-compose -f ${COMPOSE_FILE} pull || true"
+          fi
+
+          # Start containers
+          echo "🚀 Starting containers..."
+          if [ -n "$DOCKER_SERVICES" ]; then
+            echo "  Services: ${DOCKER_SERVICES}"
+            ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} up -d ${DOCKER_SERVICES} || docker-compose -f ${COMPOSE_FILE} up -d ${DOCKER_SERVICES}"
+            echo "services=${DOCKER_SERVICES}" >> $GITHUB_OUTPUT
+          else
+            ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} up -d || docker-compose -f ${COMPOSE_FILE} up -d"
+            echo "services=all" >> $GITHUB_OUTPUT
+          fi
+
+          # Docker prune
+          if [ "$DOCKER_PRUNE" = "true" ]; then
+            echo "🧹 Pruning unused Docker resources..."
+            ssh_exec "docker image prune -af && docker container prune -f && docker builder prune -af" || true
+          fi
+
+          # Show status
+          echo ""
+          echo "📊 Container status:"
+          ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} ps || docker-compose -f ${COMPOSE_FILE} ps" || true
+        fi
+
+        # Run post-deploy command
+        if [ -n "$POST_DEPLOY_COMMAND" ]; then
+          echo "⚙️ Running post-deploy command..."
+          ssh_exec "cd ${PROJECT_PATH} && ${POST_DEPLOY_COMMAND}"
+        fi
+
+        echo ""
+        echo "✅ Deployment complete!"
+        echo "deployed=true" >> $GITHUB_OUTPUT
+
+    - name: 📊 Deployment Summary
+      shell: bash
+      env:
+        SSH_METHOD: ${{ steps.ssh-setup.outputs.method }}
+        SERVICES: ${{ steps.deploy.outputs.services }}
+      run: |
+        echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Host | \`${{ inputs.host }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| User | \`${{ inputs.username }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| SSH Method | \`${SSH_METHOD}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Project Path | \`${{ inputs.project-path }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Services | \`${SERVICES:-all}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Git Pull | \`${{ inputs.git-pull }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Docker Pull | \`${{ inputs.docker-pull }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ **Deployment successful!**" >> $GITHUB_STEP_SUMMARY

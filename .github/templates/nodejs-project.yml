@@ -1,0 +1,579 @@
+# =============================================================================
+# 📦 Node.js/TypeScript Project CI/CD Pipeline Template
+# =============================================================================
+# A complete CI/CD workflow for Node.js and TypeScript projects using reusable actions.
+#
+# SETUP:
+# 1. Copy this file to your repository: .github/workflows/ci-cd.yml
+# 2. Customize the env variables below for your project
+# 3. Add required secrets to your repository (see secrets section below)
+#
+# REQUIRED SECRETS:
+#   - DOCKER_USERNAME: Docker Hub username (if using Docker)
+#   - DOCKER_TOKEN: Docker Hub access token (if using Docker)
+#
+# OPTIONAL SECRETS (for deployment):
+#   - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
+#   - TAILSCALE_OAUTH_SECRET: Tailscale OAuth Secret
+#   - PROD_TAILSCALE_IP: Production server Tailscale IP (100.x.x.x)
+#   - PROD_SSH_KEY: SSH private key for deployment user
+#   - PROD_SSH_USER: SSH username (default: actions)
+#   - PROD_SSH_PORT: SSH port (default: 22)
+#
+# OPTIONAL SECRETS (for notifications & publishing):
+#   - DISCORD_WEBHOOK: Discord webhook URL for notifications
+#   - CODECOV_TOKEN: Codecov upload token for coverage reports
+#   - NPM_TOKEN: NPM registry token (for publishing packages)
+# =============================================================================
+
+name: 📦 CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+      - "LICENSE"
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip tests (deploy only)"
+        required: false
+        type: boolean
+        default: false
+      publish:
+        description: "Publish to NPM"
+        required: false
+        type: boolean
+        default: false
+
+# =============================================================================
+# CUSTOMIZE THESE FOR YOUR PROJECT
+# =============================================================================
+env:
+  # Project settings
+  PROJECT_NAME: my-nodejs-project          # Your project name
+  NODE_VERSION: "20"                        # Node.js version
+  PACKAGE_MANAGER: "npm"                    # npm, yarn, or pnpm
+
+  # Testing settings
+  RUN_LINT: "true"                          # Run ESLint/TSLint
+  RUN_TYPECHECK: "true"                     # Run TypeScript type check
+  RUN_TESTS: "true"                         # Run unit tests
+  RUN_E2E: "false"                          # Run E2E tests (Playwright/Cypress)
+  COVERAGE: "true"                          # Generate code coverage
+
+  # Docker settings (leave empty to skip Docker)
+  DOCKER_IMAGE: ""                          # Docker image name (user/repo)
+  DOCKERFILE_PATH: "Dockerfile"             # Path to Dockerfile
+  DOCKER_PLATFORMS: "linux/amd64,linux/arm64"
+
+  # Deployment settings
+  DEPLOY_PATH: ~/my-nodejs-project          # Path on server
+  COMPOSE_FILE: docker-compose.yml          # Docker compose file
+
+# =============================================================================
+# WORKFLOW CONFIGURATION
+# =============================================================================
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+defaults:
+  run:
+    shell: bash
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  # ===========================================================================
+  # Stage 1: Code Quality & Tests
+  # ===========================================================================
+  test:
+    name: 🧪 Test & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ !inputs.skip_tests }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📣 Notify build started
+        if: ${{ secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🔨 CI Pipeline Started"
+          description: "Running tests for `${{ env.PROJECT_NAME }}`"
+          status: started
+          include-repo-info: "true"
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: ${{ env.PACKAGE_MANAGER }}
+
+      - name: 📦 Setup pnpm
+        if: ${{ env.PACKAGE_MANAGER == 'pnpm' }}
+        uses: pnpm/action-setup@v2
+        with:
+          version: latest
+
+      - name: 📥 Install dependencies
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm ci
+              ;;
+            yarn)
+              yarn install --frozen-lockfile
+              ;;
+            pnpm)
+              pnpm install --frozen-lockfile
+              ;;
+          esac
+
+      - name: ✨ Run linting
+        if: ${{ env.RUN_LINT == 'true' }}
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm run lint --if-present
+              ;;
+            yarn)
+              yarn lint --if-present || true
+              ;;
+            pnpm)
+              pnpm run lint --if-present
+              ;;
+          esac
+
+      - name: 🔍 Type check
+        if: ${{ env.RUN_TYPECHECK == 'true' }}
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm run typecheck --if-present || npm run type-check --if-present || npm run tsc --if-present
+              ;;
+            yarn)
+              yarn typecheck || yarn type-check || yarn tsc || true
+              ;;
+            pnpm)
+              pnpm run typecheck --if-present || pnpm run type-check --if-present
+              ;;
+          esac
+
+      - name: 🧪 Run tests
+        if: ${{ env.RUN_TESTS == 'true' }}
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              if [ "${{ env.COVERAGE }}" = "true" ]; then
+                npm run test:coverage --if-present || npm run test -- --coverage || npm test
+              else
+                npm test
+              fi
+              ;;
+            yarn)
+              if [ "${{ env.COVERAGE }}" = "true" ]; then
+                yarn test:coverage || yarn test --coverage || yarn test
+              else
+                yarn test
+              fi
+              ;;
+            pnpm)
+              if [ "${{ env.COVERAGE }}" = "true" ]; then
+                pnpm run test:coverage --if-present || pnpm test -- --coverage || pnpm test
+              else
+                pnpm test
+              fi
+              ;;
+          esac
+
+      - name: 📊 Upload coverage to Codecov
+        if: ${{ env.COVERAGE == 'true' && secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unittests
+          name: ${{ env.PROJECT_NAME }}
+          fail_ci_if_error: false
+
+      - name: 🔨 Build
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm run build --if-present
+              ;;
+            yarn)
+              yarn build || true
+              ;;
+            pnpm)
+              pnpm run build --if-present
+              ;;
+          esac
+
+      - name: ✅ Notify tests passed
+        if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "✅ Tests Passed"
+          description: "All tests passed for `${{ env.PROJECT_NAME }}`"
+          status: success
+          include-repo-info: "true"
+
+      - name: ❌ Notify tests failed
+        if: ${{ failure() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "❌ Tests Failed"
+          description: "CI tests failed. Check the logs for details."
+          status: failure
+          fields: '[{"name": "Workflow", "value": "[View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+  # ===========================================================================
+  # Stage 2: E2E Tests (Optional)
+  # ===========================================================================
+  e2e:
+    name: 🎭 E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+    if: ${{ !inputs.skip_tests && env.RUN_E2E == 'true' }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: ${{ env.PACKAGE_MANAGER }}
+
+      - name: 📦 Setup pnpm
+        if: ${{ env.PACKAGE_MANAGER == 'pnpm' }}
+        uses: pnpm/action-setup@v2
+        with:
+          version: latest
+
+      - name: 📥 Install dependencies
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm ci
+              ;;
+            yarn)
+              yarn install --frozen-lockfile
+              ;;
+            pnpm)
+              pnpm install --frozen-lockfile
+              ;;
+          esac
+
+      - name: 🎭 Install Playwright browsers
+        run: npx playwright install --with-deps
+        continue-on-error: true
+
+      - name: 🎭 Run E2E tests
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm run test:e2e --if-present || npm run e2e --if-present
+              ;;
+            yarn)
+              yarn test:e2e || yarn e2e || true
+              ;;
+            pnpm)
+              pnpm run test:e2e --if-present || pnpm run e2e --if-present
+              ;;
+          esac
+
+      - name: 📦 Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results-${{ github.run_number }}
+          path: |
+            playwright-report/
+            test-results/
+            cypress/screenshots/
+            cypress/videos/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ===========================================================================
+  # Stage 3: Security Audit
+  # ===========================================================================
+  security:
+    name: 🔒 Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ !inputs.skip_tests }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: ${{ env.PACKAGE_MANAGER }}
+
+      - name: 🔒 Run npm audit
+        if: ${{ env.PACKAGE_MANAGER == 'npm' }}
+        run: npm audit --audit-level=high || true
+
+      - name: 🔒 Run yarn audit
+        if: ${{ env.PACKAGE_MANAGER == 'yarn' }}
+        run: yarn audit --level high || true
+
+      - name: 🔒 Run pnpm audit
+        if: ${{ env.PACKAGE_MANAGER == 'pnpm' }}
+        run: pnpm audit --audit-level high || true
+
+  # ===========================================================================
+  # Stage 4: Build Docker Image
+  # ===========================================================================
+  docker:
+    name: 🐳 Build Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [test, security]
+    if: |
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.security.result == 'success' || needs.security.result == 'skipped') &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    outputs:
+      image-digest: ${{ steps.docker.outputs.digest }}
+      image-tags: ${{ steps.docker.outputs.tags }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐳 Build and Push Docker Image
+        id: docker
+        if: ${{ env.DOCKER_IMAGE != '' }}
+        uses: nuniesmith/actions/.github/actions/docker-build-push@main
+        with:
+          image-name: ${{ env.DOCKER_IMAGE }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          dockerfile: ${{ env.DOCKERFILE_PATH }}
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          push: "true"
+
+      - name: 📝 Skip Docker (not configured)
+        if: ${{ env.DOCKER_IMAGE == '' }}
+        run: echo "Docker build skipped - DOCKER_IMAGE not configured"
+
+      - name: ✅ Notify Docker build complete
+        if: ${{ success() && env.DOCKER_IMAGE != '' && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🐳 Docker Image Built"
+          description: "Multi-arch images pushed to Docker Hub"
+          status: success
+          fields: '[{"name": "Image", "value": "`${{ env.DOCKER_IMAGE }}`", "inline": true}, {"name": "Platforms", "value": "`${{ env.DOCKER_PLATFORMS }}`", "inline": true}]'
+
+  # ===========================================================================
+  # Stage 5: Publish to NPM (Optional)
+  # ===========================================================================
+  publish:
+    name: 📦 Publish to NPM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test, security]
+    if: |
+      always() &&
+      needs.test.result == 'success' &&
+      needs.security.result == 'success' &&
+      (inputs.publish == true || startsWith(github.ref, 'refs/tags/v'))
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+
+      - name: 📥 Install dependencies
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm ci
+              ;;
+            yarn)
+              yarn install --frozen-lockfile
+              ;;
+            pnpm)
+              pnpm install --frozen-lockfile
+              ;;
+          esac
+
+      - name: 🔨 Build
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm run build --if-present
+              ;;
+            yarn)
+              yarn build || true
+              ;;
+            pnpm)
+              pnpm run build --if-present
+              ;;
+          esac
+
+      - name: 📦 Publish to NPM
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          case "${{ env.PACKAGE_MANAGER }}" in
+            npm)
+              npm publish --access public
+              ;;
+            yarn)
+              yarn publish --access public
+              ;;
+            pnpm)
+              pnpm publish --access public
+              ;;
+          esac
+
+  # ===========================================================================
+  # Stage 6: Deploy to Production
+  # ===========================================================================
+  deploy:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: docker
+    if: |
+      always() &&
+      (needs.docker.result == 'success' || needs.docker.result == 'skipped') &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_DEPLOY == 'true'
+    environment:
+      name: production
+      # url: https://your-domain.com  # Uncomment and set your URL
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔌 Connect to Tailscale
+        uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+          target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+      - name: 🚀 Deploy via SSH
+        uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+        with:
+          host: ${{ secrets.PROD_TAILSCALE_IP }}
+          port: ${{ secrets.PROD_SSH_PORT || '22' }}
+          username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+          ssh-key: ${{ secrets.PROD_SSH_KEY }}
+          project-path: ${{ env.DEPLOY_PATH }}
+          docker-compose-file: ${{ env.COMPOSE_FILE }}
+          git-pull: "true"
+          git-branch: main
+          docker-pull: "true"
+          docker-prune: "true"
+
+      - name: ✅ Notify deployment success
+        if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🚀 Deployment Successful"
+          description: "`${{ env.PROJECT_NAME }}` deployed to production"
+          status: success
+          fields: |
+            [
+              {"name": "Version", "value": "`${{ github.sha }}`", "inline": true},
+              {"name": "Branch", "value": "`${{ github.ref_name }}`", "inline": true},
+              {"name": "Triggered by", "value": "`${{ github.actor }}`", "inline": true}
+            ]
+
+      - name: ❌ Notify deployment failed
+        if: ${{ failure() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "❌ Deployment Failed"
+          description: "Failed to deploy `${{ env.PROJECT_NAME }}`"
+          status: failure
+          fields: '[{"name": "Logs", "value": "[View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+  # ===========================================================================
+  # Stage 7: Pipeline Summary
+  # ===========================================================================
+  summary:
+    name: 📊 Pipeline Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [test, e2e, security, docker, publish, deploy]
+    if: always()
+
+    steps:
+      - name: 📊 Generate summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## 📦 Node.js CI/CD Pipeline Summary
+
+          | Stage | Status |
+          |-------|--------|
+          | 🧪 Tests | ${{ needs.test.result == 'success' && '✅ Passed' || needs.test.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🎭 E2E Tests | ${{ needs.e2e.result == 'success' && '✅ Passed' || needs.e2e.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🔒 Security | ${{ needs.security.result == 'success' && '✅ Passed' || needs.security.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🐳 Docker | ${{ needs.docker.result == 'success' && '✅ Built' || needs.docker.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 📦 Publish | ${{ needs.publish.result == 'success' && '✅ Published' || needs.publish.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🚀 Deploy | ${{ needs.deploy.result == 'success' && '✅ Deployed' || needs.deploy.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+
+          ### Build Info
+
+          | Property | Value |
+          |----------|-------|
+          | Project | `${{ env.PROJECT_NAME }}` |
+          | Node.js | `${{ env.NODE_VERSION }}` |
+          | Package Manager | `${{ env.PACKAGE_MANAGER }}` |
+          | Branch | `${{ github.ref_name }}` |
+          | Commit | `${{ github.sha }}` |
+          | Triggered by | `${{ github.actor }}` |
+          EOF
+
+      - name: ❌ Fail if critical stages failed
+        if: |
+          needs.test.result == 'failure' ||
+          needs.docker.result == 'failure'
+        run: |
+          echo "❌ Pipeline failed due to critical stage failure"
+          exit 1

@@ -1,0 +1,532 @@
+# =============================================================================
+# 🐍 Python Project CI/CD Pipeline Template
+# =============================================================================
+# A complete CI/CD workflow for Python projects using reusable actions.
+#
+# SETUP:
+# 1. Copy this file to your repository: .github/workflows/ci-cd.yml
+# 2. Customize the env variables below for your project
+# 3. Add required secrets to your repository (see secrets section below)
+#
+# REQUIRED SECRETS:
+#   - DOCKER_USERNAME: Docker Hub username (if using Docker)
+#   - DOCKER_TOKEN: Docker Hub access token (if using Docker)
+#
+# OPTIONAL SECRETS (for deployment):
+#   - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
+#   - TAILSCALE_OAUTH_SECRET: Tailscale OAuth Secret
+#   - PROD_TAILSCALE_IP: Production server Tailscale IP (100.x.x.x)
+#   - PROD_SSH_KEY: SSH private key for deployment user
+#   - PROD_SSH_USER: SSH username (default: actions)
+#   - PROD_SSH_PORT: SSH port (default: 22)
+#
+# OPTIONAL SECRETS (for notifications & publishing):
+#   - DISCORD_WEBHOOK: Discord webhook URL for notifications
+#   - CODECOV_TOKEN: Codecov upload token for coverage reports
+#   - PYPI_API_TOKEN: PyPI API token (for publishing packages)
+#   - TEST_PYPI_API_TOKEN: TestPyPI API token (for test publishing)
+# =============================================================================
+
+name: 🐍 CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+      - "LICENSE"
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip tests (deploy only)"
+        required: false
+        type: boolean
+        default: false
+      publish:
+        description: "Publish to PyPI"
+        required: false
+        type: boolean
+        default: false
+      publish_test:
+        description: "Publish to TestPyPI"
+        required: false
+        type: boolean
+        default: false
+
+# =============================================================================
+# CUSTOMIZE THESE FOR YOUR PROJECT
+# =============================================================================
+env:
+  # Project settings
+  PROJECT_NAME: my-python-project          # Your project name
+  PYTHON_VERSION: "3.12"                    # Python version
+  PYTHON_VERSIONS: '["3.10", "3.11", "3.12"]'  # Versions to test against
+
+  # Package manager: pip, poetry, or pipenv
+  PACKAGE_MANAGER: "pip"
+
+  # Testing settings
+  RUN_LINT: "true"                          # Run ruff/flake8/pylint
+  RUN_TYPECHECK: "true"                     # Run mypy type check
+  RUN_TESTS: "true"                         # Run pytest
+  COVERAGE: "true"                          # Generate code coverage
+
+  # Linting tool: ruff, flake8, or pylint
+  LINT_TOOL: "ruff"
+
+  # Docker settings (leave empty to skip Docker)
+  DOCKER_IMAGE: ""                          # Docker image name (user/repo)
+  DOCKERFILE_PATH: "Dockerfile"             # Path to Dockerfile
+  DOCKER_PLATFORMS: "linux/amd64,linux/arm64"
+
+  # Deployment settings
+  DEPLOY_PATH: ~/my-python-project          # Path on server
+  COMPOSE_FILE: docker-compose.yml          # Docker compose file
+
+# =============================================================================
+# WORKFLOW CONFIGURATION
+# =============================================================================
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+defaults:
+  run:
+    shell: bash
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  # ===========================================================================
+  # Stage 1: Code Quality & Linting
+  # ===========================================================================
+  lint:
+    name: ✨ Lint & Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ !inputs.skip_tests }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📣 Notify build started
+        if: ${{ secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🔨 CI Pipeline Started"
+          description: "Running checks for `${{ env.PROJECT_NAME }}`"
+          status: started
+          include-repo-info: "true"
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy black isort
+
+      - name: ✨ Run Ruff linting
+        if: ${{ env.RUN_LINT == 'true' && env.LINT_TOOL == 'ruff' }}
+        run: |
+          echo "🔍 Running Ruff linter..."
+          ruff check . --output-format=github || true
+          ruff format --check . || true
+
+      - name: ✨ Run Flake8 linting
+        if: ${{ env.RUN_LINT == 'true' && env.LINT_TOOL == 'flake8' }}
+        run: |
+          pip install flake8
+          echo "🔍 Running Flake8 linter..."
+          flake8 . --count --show-source --statistics || true
+
+      - name: ✨ Run Pylint linting
+        if: ${{ env.RUN_LINT == 'true' && env.LINT_TOOL == 'pylint' }}
+        run: |
+          pip install pylint
+          echo "🔍 Running Pylint linter..."
+          pylint **/*.py --output-format=colorized || true
+
+      - name: 🔍 Run mypy type check
+        if: ${{ env.RUN_TYPECHECK == 'true' }}
+        run: |
+          echo "🔍 Running mypy type checker..."
+          mypy . --ignore-missing-imports || true
+
+  # ===========================================================================
+  # Stage 2: Tests
+  # ===========================================================================
+  test:
+    name: 🧪 Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ !inputs.skip_tests }}
+    needs: lint
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(env.PYTHON_VERSIONS || '["3.12"]') }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: 📦 Install dependencies (pip)
+        if: ${{ env.PACKAGE_MANAGER == 'pip' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pytest-asyncio
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install -e .; fi
+
+      - name: 📦 Install dependencies (poetry)
+        if: ${{ env.PACKAGE_MANAGER == 'poetry' }}
+        run: |
+          pip install poetry
+          poetry install --with dev
+
+      - name: 📦 Install dependencies (pipenv)
+        if: ${{ env.PACKAGE_MANAGER == 'pipenv' }}
+        run: |
+          pip install pipenv
+          pipenv install --dev
+
+      - name: 🧪 Run tests with coverage (pip)
+        if: ${{ env.RUN_TESTS == 'true' && env.PACKAGE_MANAGER == 'pip' }}
+        run: |
+          if [ "${{ env.COVERAGE }}" = "true" ]; then
+            pytest --cov=. --cov-report=xml --cov-report=term-missing -v
+          else
+            pytest -v
+          fi
+
+      - name: 🧪 Run tests with coverage (poetry)
+        if: ${{ env.RUN_TESTS == 'true' && env.PACKAGE_MANAGER == 'poetry' }}
+        run: |
+          if [ "${{ env.COVERAGE }}" = "true" ]; then
+            poetry run pytest --cov=. --cov-report=xml --cov-report=term-missing -v
+          else
+            poetry run pytest -v
+          fi
+
+      - name: 🧪 Run tests with coverage (pipenv)
+        if: ${{ env.RUN_TESTS == 'true' && env.PACKAGE_MANAGER == 'pipenv' }}
+        run: |
+          if [ "${{ env.COVERAGE }}" = "true" ]; then
+            pipenv run pytest --cov=. --cov-report=xml --cov-report=term-missing -v
+          else
+            pipenv run pytest -v
+          fi
+
+      - name: 📊 Upload coverage to Codecov
+        if: ${{ env.COVERAGE == 'true' && matrix.python-version == env.PYTHON_VERSION && secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          flags: unittests
+          name: ${{ env.PROJECT_NAME }}-py${{ matrix.python-version }}
+          fail_ci_if_error: false
+
+      - name: ✅ Notify tests passed
+        if: ${{ success() && matrix.python-version == env.PYTHON_VERSION && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "✅ Tests Passed"
+          description: "All tests passed for `${{ env.PROJECT_NAME }}`"
+          status: success
+          include-repo-info: "true"
+
+      - name: ❌ Notify tests failed
+        if: ${{ failure() && matrix.python-version == env.PYTHON_VERSION && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "❌ Tests Failed"
+          description: "CI tests failed on Python ${{ matrix.python-version }}"
+          status: failure
+          fields: '[{"name": "Workflow", "value": "[View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+  # ===========================================================================
+  # Stage 3: Security Audit
+  # ===========================================================================
+  security:
+    name: 🔒 Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ !inputs.skip_tests }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install security tools
+        run: |
+          pip install safety bandit pip-audit
+
+      - name: 🔒 Run pip-audit
+        run: |
+          echo "🔍 Running pip-audit..."
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt || true
+          fi
+
+      - name: 🔒 Run safety check
+        run: |
+          echo "🔍 Running safety check..."
+          if [ -f requirements.txt ]; then
+            safety check -r requirements.txt || true
+          fi
+
+      - name: 🔒 Run bandit security scan
+        run: |
+          echo "🔍 Running bandit security scan..."
+          bandit -r . -x ./tests,./test,./.venv,./venv -ll || true
+
+  # ===========================================================================
+  # Stage 4: Build Docker Image
+  # ===========================================================================
+  docker:
+    name: 🐳 Build Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [test, security]
+    if: |
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.security.result == 'success' || needs.security.result == 'skipped') &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    outputs:
+      image-digest: ${{ steps.docker.outputs.digest }}
+      image-tags: ${{ steps.docker.outputs.tags }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐳 Build and Push Docker Image
+        id: docker
+        if: ${{ env.DOCKER_IMAGE != '' }}
+        uses: nuniesmith/actions/.github/actions/docker-build-push@main
+        with:
+          image-name: ${{ env.DOCKER_IMAGE }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          dockerfile: ${{ env.DOCKERFILE_PATH }}
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          push: "true"
+
+      - name: 📝 Skip Docker (not configured)
+        if: ${{ env.DOCKER_IMAGE == '' }}
+        run: echo "Docker build skipped - DOCKER_IMAGE not configured"
+
+      - name: ✅ Notify Docker build complete
+        if: ${{ success() && env.DOCKER_IMAGE != '' && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🐳 Docker Image Built"
+          description: "Multi-arch images pushed to Docker Hub"
+          status: success
+          fields: '[{"name": "Image", "value": "`${{ env.DOCKER_IMAGE }}`", "inline": true}, {"name": "Platforms", "value": "`${{ env.DOCKER_PLATFORMS }}`", "inline": true}]'
+
+  # ===========================================================================
+  # Stage 5: Publish to PyPI (Optional)
+  # ===========================================================================
+  publish:
+    name: 📦 Publish to PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test, security]
+    if: |
+      always() &&
+      needs.test.result == 'success' &&
+      needs.security.result == 'success' &&
+      (inputs.publish == true || inputs.publish_test == true || startsWith(github.ref, 'refs/tags/v'))
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: 🔨 Build package
+        run: python -m build
+
+      - name: 📦 Publish to TestPyPI
+        if: ${{ inputs.publish_test == true }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          twine upload --repository testpypi dist/*
+
+      - name: 📦 Publish to PyPI
+        if: ${{ inputs.publish == true || startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          twine upload dist/*
+
+      - name: ✅ Notify publish success
+        if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "📦 Package Published"
+          description: "`${{ env.PROJECT_NAME }}` published to PyPI"
+          status: success
+
+  # ===========================================================================
+  # Stage 6: Deploy to Production
+  # ===========================================================================
+  deploy:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: docker
+    if: |
+      always() &&
+      (needs.docker.result == 'success' || needs.docker.result == 'skipped') &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_DEPLOY == 'true'
+    environment:
+      name: production
+      # url: https://your-domain.com  # Uncomment and set your URL
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔌 Connect to Tailscale
+        uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+          target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+      - name: 🚀 Deploy via SSH
+        uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+        with:
+          host: ${{ secrets.PROD_TAILSCALE_IP }}
+          port: ${{ secrets.PROD_SSH_PORT || '22' }}
+          username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+          ssh-key: ${{ secrets.PROD_SSH_KEY }}
+          project-path: ${{ env.DEPLOY_PATH }}
+          docker-compose-file: ${{ env.COMPOSE_FILE }}
+          git-pull: "true"
+          git-branch: main
+          docker-pull: "true"
+          docker-prune: "true"
+
+      - name: ✅ Notify deployment success
+        if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🚀 Deployment Successful"
+          description: "`${{ env.PROJECT_NAME }}` deployed to production"
+          status: success
+          fields: |
+            [
+              {"name": "Version", "value": "`${{ github.sha }}`", "inline": true},
+              {"name": "Branch", "value": "`${{ github.ref_name }}`", "inline": true},
+              {"name": "Triggered by", "value": "`${{ github.actor }}`", "inline": true}
+            ]
+
+      - name: ❌ Notify deployment failed
+        if: ${{ failure() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "❌ Deployment Failed"
+          description: "Failed to deploy `${{ env.PROJECT_NAME }}`"
+          status: failure
+          fields: '[{"name": "Logs", "value": "[View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+  # ===========================================================================
+  # Stage 7: Pipeline Summary
+  # ===========================================================================
+  summary:
+    name: 📊 Pipeline Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [lint, test, security, docker, publish, deploy]
+    if: always()
+
+    steps:
+      - name: 📊 Generate summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## 🐍 Python CI/CD Pipeline Summary
+
+          | Stage | Status |
+          |-------|--------|
+          | ✨ Lint | ${{ needs.lint.result == 'success' && '✅ Passed' || needs.lint.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🧪 Tests | ${{ needs.test.result == 'success' && '✅ Passed' || needs.test.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🔒 Security | ${{ needs.security.result == 'success' && '✅ Passed' || needs.security.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🐳 Docker | ${{ needs.docker.result == 'success' && '✅ Built' || needs.docker.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 📦 Publish | ${{ needs.publish.result == 'success' && '✅ Published' || needs.publish.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🚀 Deploy | ${{ needs.deploy.result == 'success' && '✅ Deployed' || needs.deploy.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+
+          ### Build Info
+
+          | Property | Value |
+          |----------|-------|
+          | Project | `${{ env.PROJECT_NAME }}` |
+          | Python | `${{ env.PYTHON_VERSION }}` |
+          | Package Manager | `${{ env.PACKAGE_MANAGER }}` |
+          | Branch | `${{ github.ref_name }}` |
+          | Commit | `${{ github.sha }}` |
+          | Triggered by | `${{ github.actor }}` |
+          EOF
+
+      - name: ❌ Fail if critical stages failed
+        if: |
+          needs.lint.result == 'failure' ||
+          needs.test.result == 'failure' ||
+          needs.docker.result == 'failure'
+        run: |
+          echo "❌ Pipeline failed due to critical stage failure"
+          exit 1

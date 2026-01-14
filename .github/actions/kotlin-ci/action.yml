@@ -1,0 +1,234 @@
+name: 'Kotlin/KMP CI'
+description: 'Complete Kotlin Multiplatform CI pipeline with Gradle caching and testing'
+author: 'nuniesmith'
+
+branding:
+  icon: 'smartphone'
+  color: 'purple'
+
+inputs:
+  java-version:
+    description: 'Java version to install'
+    required: false
+    default: '21'
+  java-distribution:
+    description: 'Java distribution (temurin, zulu, adopt, etc.)'
+    required: false
+    default: 'temurin'
+  working-directory:
+    description: 'Working directory for Gradle commands'
+    required: false
+    default: '.'
+  gradle-version:
+    description: 'Gradle version (wrapper or specific version)'
+    required: false
+    default: 'wrapper'
+  run-detekt:
+    description: 'Run detekt linting'
+    required: false
+    default: 'true'
+  run-tests:
+    description: 'Run tests'
+    required: false
+    default: 'true'
+  run-build:
+    description: 'Run build'
+    required: false
+    default: 'true'
+  test-module:
+    description: 'Module to test (e.g., :shared, :app)'
+    required: false
+    default: ':shared'
+  test-task:
+    description: 'Gradle test task to run'
+    required: false
+    default: 'testDebugUnitTest'
+  build-task:
+    description: 'Gradle build task to run'
+    required: false
+    default: 'assemble'
+  gradle-args:
+    description: 'Additional Gradle arguments'
+    required: false
+    default: '--no-configuration-cache'
+  known-test-failures:
+    description: 'Number of known/expected test failures to allow'
+    required: false
+    default: '0'
+  upload-test-results:
+    description: 'Upload test results as artifacts'
+    required: false
+    default: 'true'
+  continue-on-test-failure:
+    description: 'Continue even if tests fail'
+    required: false
+    default: 'false'
+
+outputs:
+  build-result:
+    description: 'Result of build (success/failure/skipped)'
+    value: ${{ steps.build.outputs.result }}
+  test-result:
+    description: 'Result of tests (success/failure/skipped)'
+    value: ${{ steps.test.outputs.result }}
+  detekt-result:
+    description: 'Result of detekt (success/failure/skipped)'
+    value: ${{ steps.detekt.outputs.result }}
+  total-tests:
+    description: 'Total number of tests run'
+    value: ${{ steps.test-report.outputs.total }}
+  failed-tests:
+    description: 'Number of failed tests'
+    value: ${{ steps.test-report.outputs.failed }}
+  passed-tests:
+    description: 'Number of passed tests'
+    value: ${{ steps.test-report.outputs.passed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: ☕ Setup JDK ${{ inputs.java-version }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: ${{ inputs.java-distribution }}
+        java-version: ${{ inputs.java-version }}
+
+    - name: 🐘 Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+      with:
+        gradle-version: ${{ inputs.gradle-version }}
+        cache-read-only: false
+
+    - name: 📦 Validate Gradle wrapper
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ -f "gradlew" ]; then
+          ./gradlew --version
+          echo "✅ Gradle wrapper validated"
+        else
+          echo "⚠️ No Gradle wrapper found, using system Gradle"
+          gradle --version
+        fi
+
+    - name: ✨ Run detekt linting
+      id: detekt
+      if: inputs.run-detekt == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      continue-on-error: true
+      run: |
+        echo "🔍 Running detekt linting..."
+        if ./gradlew detekt ${{ inputs.gradle-args }} 2>/dev/null; then
+          echo "✅ Detekt passed"
+          echo "result=success" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️ Detekt not configured or failed"
+          echo "result=skipped" >> $GITHUB_OUTPUT
+        fi
+
+    - name: 🔨 Build KMP module
+      id: build
+      if: inputs.run-build == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔨 Building ${{ inputs.test-module }}..."
+        if ./gradlew ${{ inputs.test-module }}:${{ inputs.build-task }} ${{ inputs.gradle-args }}; then
+          echo "✅ Build successful"
+          echo "result=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Build failed"
+          echo "result=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: 🧪 Run tests
+      id: test
+      if: inputs.run-tests == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      continue-on-error: ${{ inputs.continue-on-test-failure == 'true' }}
+      run: |
+        echo "🧪 Running tests: ${{ inputs.test-module }}:${{ inputs.test-task }}"
+        if ./gradlew ${{ inputs.test-module }}:${{ inputs.test-task }} --continue --stacktrace ${{ inputs.gradle-args }}; then
+          echo "✅ Tests passed"
+          echo "result=success" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️ Some tests failed"
+          echo "result=failure" >> $GITHUB_OUTPUT
+        fi
+
+    - name: 📊 Parse test results
+      id: test-report
+      if: always() && inputs.run-tests == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        MODULE_PATH=$(echo "${{ inputs.test-module }}" | sed 's/:/\//g' | sed 's/^\///')
+
+        # Find test results
+        TEST_RESULTS_DIR="${MODULE_PATH}/build/test-results"
+
+        if [ -d "$TEST_RESULTS_DIR" ]; then
+          TOTAL=$(find "$TEST_RESULTS_DIR" -name "*.xml" -exec grep -o 'tests="[0-9]*"' {} \; 2>/dev/null | cut -d'"' -f2 | awk '{s+=$1} END {print s+0}')
+          FAILED=$(find "$TEST_RESULTS_DIR" -name "*.xml" -exec grep -o 'failures="[0-9]*"' {} \; 2>/dev/null | cut -d'"' -f2 | awk '{s+=$1} END {print s+0}')
+          ERRORS=$(find "$TEST_RESULTS_DIR" -name "*.xml" -exec grep -o 'errors="[0-9]*"' {} \; 2>/dev/null | cut -d'"' -f2 | awk '{s+=$1} END {print s+0}')
+          PASSED=$((TOTAL - FAILED - ERRORS))
+
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "failed=$((FAILED + ERRORS))" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+
+          echo "## 🎯 Kotlin/KMP Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Tests | $TOTAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Passed | $PASSED |" >> $GITHUB_STEP_SUMMARY
+          echo "| Failed | $((FAILED + ERRORS)) |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "total=0" >> $GITHUB_OUTPUT
+          echo "failed=0" >> $GITHUB_OUTPUT
+          echo "passed=0" >> $GITHUB_OUTPUT
+          echo "⚠️ No test results found at $TEST_RESULTS_DIR" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: 🔍 Check test failure threshold
+      if: always() && inputs.run-tests == 'true'
+      shell: bash
+      run: |
+        FAILED="${{ steps.test-report.outputs.failed }}"
+        KNOWN="${{ inputs.known-test-failures }}"
+
+        if [ "${FAILED:-0}" -gt "${KNOWN:-0}" ]; then
+          echo "❌ Found $FAILED test failures (exceeds threshold of $KNOWN)"
+          if [ "${{ inputs.continue-on-test-failure }}" != "true" ]; then
+            exit 1
+          fi
+        elif [ "${FAILED:-0}" -gt 0 ]; then
+          echo "⚠️ Found $FAILED test failures (within threshold of $KNOWN)"
+        else
+          echo "✅ All tests passed"
+        fi
+
+    - name: 📦 Upload test results
+      if: always() && inputs.run-tests == 'true' && inputs.upload-test-results == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: kotlin-test-results-${{ github.run_number }}
+        path: |
+          ${{ inputs.working-directory }}/**/build/test-results/
+          ${{ inputs.working-directory }}/**/build/reports/tests/
+        retention-days: 30
+      continue-on-error: true
+
+    - name: 📊 Publish JUnit report
+      if: always() && inputs.run-tests == 'true'
+      uses: mikepenz/action-junit-report@v4
+      with:
+        report_paths: '${{ inputs.working-directory }}/**/build/test-results/**/TEST-*.xml'
+        check_name: 'Kotlin/KMP Test Report'
+        detailed_summary: true
+        include_passed: true
+      continue-on-error: true

@@ -1,0 +1,433 @@
+# =============================================================================
+# 🎯 Kotlin/KMP Project CI/CD Pipeline Template
+# =============================================================================
+# A complete CI/CD workflow for Kotlin Multiplatform projects using reusable actions.
+#
+# SETUP:
+# 1. Copy this file to your repository: .github/workflows/ci-cd.yml
+# 2. Customize the env variables below for your project
+# 3. Add required secrets to your repository (see secrets section below)
+#
+# REQUIRED SECRETS:
+#   - DOCKER_USERNAME: Docker Hub username (if using Docker)
+#   - DOCKER_TOKEN: Docker Hub access token (if using Docker)
+#
+# OPTIONAL SECRETS (for deployment):
+#   - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
+#   - TAILSCALE_OAUTH_SECRET: Tailscale OAuth Secret
+#   - PROD_TAILSCALE_IP: Production server Tailscale IP (100.x.x.x)
+#   - PROD_SSH_KEY: SSH private key for deployment user
+#   - PROD_SSH_USER: SSH username (default: actions)
+#   - PROD_SSH_PORT: SSH port (default: 22)
+#
+# OPTIONAL SECRETS (for notifications & publishing):
+#   - DISCORD_WEBHOOK: Discord webhook URL for notifications
+#   - SIGNING_KEY: Base64-encoded signing key for releases
+#   - SIGNING_PASSWORD: Signing key password
+#   - MAVEN_USERNAME: Maven Central username (for publishing)
+#   - MAVEN_PASSWORD: Maven Central password (for publishing)
+# =============================================================================
+
+name: 🎯 Kotlin CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+      - "LICENSE"
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip tests"
+        required: false
+        type: boolean
+        default: false
+      publish:
+        description: "Publish artifacts"
+        required: false
+        type: boolean
+        default: false
+
+# =============================================================================
+# CUSTOMIZE THESE FOR YOUR PROJECT
+# =============================================================================
+env:
+  # Project settings
+  PROJECT_NAME: my-kotlin-project         # Your project name
+  JAVA_VERSION: "21"                       # Java version
+  JAVA_DISTRIBUTION: "temurin"             # Java distribution
+
+  # Gradle settings
+  GRADLE_VERSION: "wrapper"                # Use wrapper or specific version
+  WORKING_DIRECTORY: "."                   # Root directory of Gradle project
+
+  # KMP module settings
+  SHARED_MODULE: ":shared"                 # Main shared module path
+  TEST_TASK: "testDebugUnitTest"           # Test task to run
+  BUILD_TASK: "assemble"                   # Build task to run
+
+  # Docker settings (leave empty to skip Docker)
+  DOCKER_IMAGE: ""                         # Docker image name (user/repo)
+  DOCKERFILE_PATH: "Dockerfile"            # Path to Dockerfile
+  DOCKER_PLATFORMS: "linux/amd64,linux/arm64"
+
+  # Deployment settings
+  DEPLOY_PATH: "~/my-kotlin-project"       # Path on server
+  COMPOSE_FILE: "docker-compose.yml"       # Docker compose file
+
+  # Known test failures (set > 0 if you have flaky tests to allow)
+  KNOWN_TEST_FAILURES: "0"
+
+# =============================================================================
+# WORKFLOW CONFIGURATION
+# =============================================================================
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+defaults:
+  run:
+    shell: bash
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  # ===========================================================================
+  # Stage 1: Code Quality & Tests
+  # ===========================================================================
+  test:
+    name: 🧪 Test & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ !inputs.skip_tests }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📣 Notify build started
+        if: ${{ secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🔨 CI Pipeline Started"
+          description: "Running tests for `${{ env.PROJECT_NAME }}`"
+          status: started
+          include-repo-info: "true"
+
+      - name: 🎯 Run Kotlin CI
+        id: kotlin-ci
+        uses: nuniesmith/actions/.github/actions/kotlin-ci@main
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          java-distribution: ${{ env.JAVA_DISTRIBUTION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          run-detekt: "true"
+          run-tests: "true"
+          run-build: "true"
+          test-module: ${{ env.SHARED_MODULE }}
+          test-task: ${{ env.TEST_TASK }}
+          build-task: ${{ env.BUILD_TASK }}
+          known-test-failures: ${{ env.KNOWN_TEST_FAILURES }}
+          upload-test-results: "true"
+          continue-on-test-failure: "false"
+
+      - name: ✅ Notify tests passed
+        if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "✅ Tests Passed"
+          description: "All tests passed for `${{ env.PROJECT_NAME }}`"
+          status: success
+          fields: |
+            [
+              {"name": "Total Tests", "value": "${{ steps.kotlin-ci.outputs.total-tests }}", "inline": true},
+              {"name": "Passed", "value": "${{ steps.kotlin-ci.outputs.passed-tests }}", "inline": true},
+              {"name": "Failed", "value": "${{ steps.kotlin-ci.outputs.failed-tests }}", "inline": true}
+            ]
+
+      - name: ❌ Notify tests failed
+        if: ${{ failure() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "❌ Tests Failed"
+          description: "CI tests failed. Check the logs for details."
+          status: failure
+          fields: '[{"name": "Workflow", "value": "[View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+  # ===========================================================================
+  # Stage 2: Build All Platforms
+  # ===========================================================================
+  build-platforms:
+    name: 🔨 Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    needs: test
+    if: |
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      github.event_name == 'push'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Android
+            os: ubuntu-latest
+            task: ":shared:assembleRelease"
+          - platform: JVM
+            os: ubuntu-latest
+            task: ":shared:jvmJar"
+          # Uncomment for iOS builds (requires macOS runner)
+          # - platform: iOS
+          #   os: macos-latest
+          #   task: ":shared:linkReleaseFrameworkIosArm64"
+          # Uncomment for JS/WASM builds
+          # - platform: JS
+          #   os: ubuntu-latest
+          #   task: ":shared:jsBrowserProductionWebpack"
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 🐘 Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: false
+
+      - name: 🔨 Build ${{ matrix.platform }}
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          echo "🔨 Building ${{ matrix.platform }}..."
+          ./gradlew ${{ matrix.task }} --no-configuration-cache --stacktrace
+
+      - name: 📦 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.platform }}-${{ github.run_number }}
+          path: |
+            ${{ env.WORKING_DIRECTORY }}/**/build/outputs/
+            ${{ env.WORKING_DIRECTORY }}/**/build/libs/
+            ${{ env.WORKING_DIRECTORY }}/**/build/bin/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ===========================================================================
+  # Stage 3: Build Docker Image (Optional)
+  # ===========================================================================
+  docker:
+    name: 🐳 Build Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [test, build-platforms]
+    if: |
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.build-platforms.result == 'success' || needs.build-platforms.result == 'skipped') &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    outputs:
+      image-digest: ${{ steps.docker.outputs.digest }}
+      image-tags: ${{ steps.docker.outputs.tags }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐳 Build and Push Docker Image
+        id: docker
+        if: ${{ env.DOCKER_IMAGE != '' }}
+        uses: nuniesmith/actions/.github/actions/docker-build-push@main
+        with:
+          image-name: ${{ env.DOCKER_IMAGE }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          dockerfile: ${{ env.DOCKERFILE_PATH }}
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          push: "true"
+
+      - name: 📝 Skip Docker (not configured)
+        if: ${{ env.DOCKER_IMAGE == '' }}
+        run: echo "Docker build skipped - DOCKER_IMAGE not configured"
+
+  # ===========================================================================
+  # Stage 4: Publish to Maven (Optional)
+  # ===========================================================================
+  publish:
+    name: 📦 Publish Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [test, build-platforms]
+    if: |
+      always() &&
+      needs.test.result == 'success' &&
+      needs.build-platforms.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      (inputs.publish == true || startsWith(github.ref, 'refs/tags/v'))
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 🐘 Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: 📦 Publish to Maven Local
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          echo "📦 Publishing to Maven Local..."
+          ./gradlew publishToMavenLocal --no-configuration-cache
+
+      # Uncomment to publish to Maven Central
+      # - name: 📦 Publish to Maven Central
+      #   working-directory: ${{ env.WORKING_DIRECTORY }}
+      #   env:
+      #     MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+      #     MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+      #     SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+      #     SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+      #   run: |
+      #     echo "📦 Publishing to Maven Central..."
+      #     ./gradlew publish --no-configuration-cache
+
+  # ===========================================================================
+  # Stage 5: Deploy to Production (Optional)
+  # ===========================================================================
+  deploy:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [docker]
+    if: |
+      always() &&
+      (needs.docker.result == 'success' || needs.docker.result == 'skipped') &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_DEPLOY == 'true'
+    environment:
+      name: production
+      # url: https://your-domain.com  # Uncomment and set your URL
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔌 Connect to Tailscale
+        uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+          target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+      - name: 🚀 Deploy via SSH
+        uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+        with:
+          host: ${{ secrets.PROD_TAILSCALE_IP }}
+          port: ${{ secrets.PROD_SSH_PORT || '22' }}
+          username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+          ssh-key: ${{ secrets.PROD_SSH_KEY }}
+          project-path: ${{ env.DEPLOY_PATH }}
+          docker-compose-file: ${{ env.COMPOSE_FILE }}
+          git-pull: "true"
+          git-branch: main
+          docker-pull: "true"
+          docker-prune: "true"
+
+      - name: ✅ Notify deployment success
+        if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🚀 Deployment Successful"
+          description: "`${{ env.PROJECT_NAME }}` deployed to production"
+          status: success
+          fields: |
+            [
+              {"name": "Version", "value": "`${{ github.sha }}`", "inline": true},
+              {"name": "Branch", "value": "`${{ github.ref_name }}`", "inline": true}
+            ]
+
+      - name: ❌ Notify deployment failed
+        if: ${{ failure() && secrets.DISCORD_WEBHOOK != '' }}
+        uses: nuniesmith/actions/.github/actions/discord-notify@main
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "❌ Deployment Failed"
+          description: "Failed to deploy `${{ env.PROJECT_NAME }}`"
+          status: failure
+
+  # ===========================================================================
+  # Stage 6: Pipeline Summary
+  # ===========================================================================
+  summary:
+    name: 📊 Pipeline Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [test, build-platforms, docker, publish, deploy]
+    if: always()
+
+    steps:
+      - name: 📊 Generate summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## 🎯 Kotlin/KMP CI/CD Pipeline Summary
+
+          | Stage | Status |
+          |-------|--------|
+          | 🧪 Tests | ${{ needs.test.result == 'success' && '✅ Passed' || needs.test.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🔨 Build Platforms | ${{ needs.build-platforms.result == 'success' && '✅ Built' || needs.build-platforms.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🐳 Docker | ${{ needs.docker.result == 'success' && '✅ Built' || needs.docker.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 📦 Publish | ${{ needs.publish.result == 'success' && '✅ Published' || needs.publish.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | 🚀 Deploy | ${{ needs.deploy.result == 'success' && '✅ Deployed' || needs.deploy.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+
+          ### Build Info
+
+          | Property | Value |
+          |----------|-------|
+          | Project | `${{ env.PROJECT_NAME }}` |
+          | Java | `${{ env.JAVA_VERSION }}` |
+          | Branch | `${{ github.ref_name }}` |
+          | Commit | `${{ github.sha }}` |
+          | Triggered by | `${{ github.actor }}` |
+          EOF
+
+      - name: ❌ Fail if critical stages failed
+        if: |
+          needs.test.result == 'failure' ||
+          needs.build-platforms.result == 'failure'
+        run: |
+          echo "❌ Pipeline failed due to critical stage failure"
+          exit 1
