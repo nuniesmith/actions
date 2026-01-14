@@ -232,12 +232,13 @@ jobs:
                   echo ""
 
                   # Make scripts executable and run setup
+                  # Pass the password as an argument to the remote script
                   sshpass -e ssh -o StrictHostKeyChecking=no \
                     -o UserKnownHostsFile=/dev/null \
                     -o ServerAliveInterval=60 \
                     -o ServerAliveCountMax=10 \
                     -p ${{ inputs.ssh_port }} \
-                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} << 'SETUP_SCRIPT'
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} "SUDO_PASS='$SSHPASS' bash -s" << 'SETUP_SCRIPT'
                   set -e
 
                   cd /tmp/setup-scripts
@@ -246,12 +247,12 @@ jobs:
                   # Run the appropriate setup script
                   if [ -f "setup-server.sh" ]; then
                     echo "Running setup-server.sh (multi-distro)..."
-                    echo "$SSHPASS" | sudo -S bash -c 'export DEBIAN_FRONTEND=noninteractive; yes | ./setup-server.sh' || {
+                    echo "$SUDO_PASS" | sudo -S bash -c 'export DEBIAN_FRONTEND=noninteractive; yes | ./setup-server.sh' || {
                       echo "⚠️  Setup script encountered issues, continuing..."
                     }
                   elif [ -f "setup-production-server.sh" ]; then
                     echo "Running setup-production-server.sh..."
-                    echo "$SSHPASS" | sudo -S bash -c 'export DEBIAN_FRONTEND=noninteractive; yes | ./setup-production-server.sh' || {
+                    echo "$SUDO_PASS" | sudo -S bash -c 'export DEBIAN_FRONTEND=noninteractive; yes | ./setup-production-server.sh' || {
                       echo "⚠️  Setup script encountered issues, continuing..."
                     }
                   else
@@ -298,28 +299,28 @@ jobs:
               run: |
                   echo "🔐 Generating secrets..."
 
-                  # Run generate-secrets script
+                  # Run generate-secrets script with sudo password passed to remote
                   sshpass -e ssh -o StrictHostKeyChecking=no \
                     -o UserKnownHostsFile=/dev/null \
                     -p ${{ inputs.ssh_port }} \
-                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} << 'SECRETS_SCRIPT' | tee secrets_output.txt
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} "SUDO_PASS='$SSHPASS' bash -s" << 'SECRETS_SCRIPT' | tee secrets_output.txt
                   cd /tmp/setup-scripts
                   chmod +x *.sh
 
                   # Determine which secrets script to use
                   if [ -f "generate-secrets-v2.sh" ]; then
-                    echo "$SSHPASS" | sudo -S bash -c 'echo n | ./generate-secrets-v2.sh --ci-output'
+                    echo "$SUDO_PASS" | sudo -S bash -c 'echo n | ./generate-secrets-v2.sh --ci-output'
                   elif [ -f "generate-secrets.sh" ]; then
-                    echo "$SSHPASS" | sudo -S bash -c 'echo n | ./generate-secrets.sh'
+                    echo "$SUDO_PASS" | sudo -S bash -c 'echo n | ./generate-secrets.sh'
                   else
                     echo "⚠️  No generate-secrets script found, creating basic SSH key..."
 
                     # Create actions user SSH key manually
-                    sudo -u actions ssh-keygen -t ed25519 -f /home/actions/.ssh/id_ed25519 -N "" -C "actions@$(hostname)" 2>/dev/null || true
-                    sudo cat /home/actions/.ssh/id_ed25519.pub >> /home/actions/.ssh/authorized_keys 2>/dev/null || true
+                    echo "$SUDO_PASS" | sudo -S -u actions ssh-keygen -t ed25519 -f /home/actions/.ssh/id_ed25519 -N "" -C "actions@$(hostname)" 2>/dev/null || true
+                    echo "$SUDO_PASS" | sudo -S bash -c 'cat /home/actions/.ssh/id_ed25519.pub >> /home/actions/.ssh/authorized_keys' 2>/dev/null || true
 
                     echo "=== PROD_SSH_KEY (copy entire key including BEGIN/END lines) ==="
-                    sudo cat /home/actions/.ssh/id_ed25519
+                    echo "$SUDO_PASS" | sudo -S cat /home/actions/.ssh/id_ed25519
                     echo "=== PROD_SSH_PORT ==="
                     grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22"
                     echo "=== PROD_HOST ==="
@@ -383,12 +384,12 @@ jobs:
                   echo "==========================================="
                   echo ""
 
-                  # Get just the SSH private key
+                  # Get just the SSH private key with sudo password
                   sshpass -e ssh -o StrictHostKeyChecking=no \
                     -o UserKnownHostsFile=/dev/null \
                     -p ${{ inputs.ssh_port }} \
                     ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
-                    "sudo cat /home/actions/.ssh/id_ed25519 2>/dev/null || echo 'Key not found'"
+                    "echo '$SSHPASS' | sudo -S cat /home/actions/.ssh/id_ed25519 2>/dev/null || echo 'Key not found'"
 
                   echo ""
                   echo "==========================================="
@@ -427,44 +428,48 @@ jobs:
             - name: 📦 Clone Repository to Server
               env:
                   SSHPASS: ${{ inputs.ssh_password }}
+                  REPO_URL: ${{ inputs.repo_url }}
+                  REPO_BRANCH: ${{ inputs.repo_branch }}
               run: |
-                  echo "📦 Cloning repository: ${{ inputs.repo_url }}"
-                  echo "Branch: ${{ inputs.repo_branch }}"
+                  echo "📦 Cloning repository: $REPO_URL"
+                  echo "Branch: $REPO_BRANCH"
 
-                  REPO_NAME=$(basename "${{ inputs.repo_url }}" .git)
+                  REPO_NAME=$(basename "$REPO_URL" .git)
 
+                  # Pass all variables to the remote script
                   sshpass -e ssh -o StrictHostKeyChecking=no \
                     -o UserKnownHostsFile=/dev/null \
                     -p ${{ inputs.ssh_port }} \
-                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} << CLONE_SCRIPT
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
+                    "SUDO_PASS='$SSHPASS' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REPO_NAME='$REPO_NAME' bash -s" << 'CLONE_SCRIPT'
                   # Switch to actions user and clone to home directory
-                  sudo -u actions bash -c '
+                  echo "$SUDO_PASS" | sudo -S -u actions bash -c "
                     cd /home/actions
 
-                    if [ -d "$REPO_NAME" ]; then
-                      echo "Repository already exists, pulling latest..."
-                      cd "$REPO_NAME"
+                    if [ -d '$REPO_NAME' ]; then
+                      echo 'Repository already exists, pulling latest...'
+                      cd '$REPO_NAME'
                       git fetch origin
-                      git checkout ${{ inputs.repo_branch }} 2>/dev/null || git checkout -b ${{ inputs.repo_branch }} origin/${{ inputs.repo_branch }} 2>/dev/null || true
-                      git pull origin ${{ inputs.repo_branch }} || echo "Pull failed, may need manual intervention"
+                      git checkout '$REPO_BRANCH' 2>/dev/null || git checkout -b '$REPO_BRANCH' origin/'$REPO_BRANCH' 2>/dev/null || true
+                      git pull origin '$REPO_BRANCH' || echo 'Pull failed, may need manual intervention'
                     else
-                      echo "Cloning fresh copy..."
-                      git clone -b ${{ inputs.repo_branch }} ${{ inputs.repo_url }} 2>/dev/null || git clone ${{ inputs.repo_url }}
+                      echo 'Cloning fresh copy...'
+                      git clone -b '$REPO_BRANCH' '$REPO_URL' 2>/dev/null || git clone '$REPO_URL'
                     fi
 
-                    echo ""
-                    echo "Repository location: /home/actions/$REPO_NAME"
-                    echo "Contents:"
-                    ls -la /home/actions/$REPO_NAME/
-                  '
+                    echo ''
+                    echo 'Repository location: /home/actions/$REPO_NAME'
+                    echo 'Contents:'
+                    ls -la /home/actions/'$REPO_NAME'/
+                  "
                   CLONE_SCRIPT
 
                   echo ""
                   echo "✅ Repository cloned to /home/actions/$REPO_NAME"
 
                   echo "## 📦 Repository Cloned" >> $GITHUB_STEP_SUMMARY
-                  echo "- Repository: \`${{ inputs.repo_url }}\`" >> $GITHUB_STEP_SUMMARY
-                  echo "- Branch: \`${{ inputs.repo_branch }}\`" >> $GITHUB_STEP_SUMMARY
+                  echo "- Repository: \`$REPO_URL\`" >> $GITHUB_STEP_SUMMARY
+                  echo "- Branch: \`$REPO_BRANCH\`" >> $GITHUB_STEP_SUMMARY
                   echo "- Path: \`/home/actions/$REPO_NAME\`" >> $GITHUB_STEP_SUMMARY
 
     # ========================================================================
