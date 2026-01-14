@@ -70,7 +70,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 10
         outputs:
-            connected: ${{ steps.connect.outputs.connected }}
+            connected: ${{ steps.verify.outputs.connected }}
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -84,6 +84,7 @@ jobs:
                   tags: tag:ci
 
             - name: 📡 Verify Tailscale Connection
+              id: verify
               run: |
                   # Wait for Tailscale to fully connect
                   sleep 5
