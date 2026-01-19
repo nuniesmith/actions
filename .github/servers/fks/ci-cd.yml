@@ -365,13 +365,22 @@ jobs:
                   project-path: ~/fks
                   git-pull: "true"
                   docker-pull: "true"
-                  docker-prune: "true"
+                  docker-prune: "false"
                   pre-deploy-command: |
                       if [ ! -d ~/fks/.git ]; then
                         echo "📦 Cloning repository for first-time setup..."
                         rm -rf ~/fks
                         git clone https://github.com/nuniesmith/fks.git ~/fks
                       fi
+
+                      echo "📦 Ensuring required Docker volumes exist..."
+                      docker volume create fks_certbot_www 2>/dev/null || true
+                      docker volume create fks_certbot_conf 2>/dev/null || true
+                      docker volume create fks_postgres_data 2>/dev/null || true
+                      docker volume create fks_questdb_data 2>/dev/null || true
+                      docker volume create fks_redis_data 2>/dev/null || true
+                      docker volume create fks_grafana_data 2>/dev/null || true
+                      echo "✅ Docker volumes ready"
                   deploy-command: |
                       echo "📝 Validating .env file..."
                       [ ! -f .env ] && touch .env
@@ -397,16 +406,46 @@ jobs:
 
                       set -a && source .env && set +a
 
+                      echo "🛑 Stopping existing containers..."
                       docker compose -f infrastructure/compose/docker-compose.yml \
-                        -f infrastructure/compose/docker-compose.prod.yml pull
+                        -f infrastructure/compose/docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
 
-                      ./run.sh prod up 2>/dev/null || \
+                      echo "📥 Pulling production images..."
+                      docker compose -f infrastructure/compose/docker-compose.yml \
+                        -f infrastructure/compose/docker-compose.prod.yml pull 2>/dev/null || true
+
+                      echo "🚀 Starting containers..."
+                      if [ -f ./run.sh ]; then
+                        chmod +x ./run.sh
+                        ./run.sh prod up
+                      else
                         docker compose -f infrastructure/compose/docker-compose.yml \
                           -f infrastructure/compose/docker-compose.prod.yml up -d
+                      fi
 
+                      echo "⏳ Waiting for containers to stabilize..."
+                      sleep 10
+
+                      echo "📊 Container status:"
                       docker compose -f infrastructure/compose/docker-compose.yml \
                         -f infrastructure/compose/docker-compose.prod.yml ps
+
+                      echo "🔍 Verifying containers are running..."
+                      RUNNING=$(docker compose -f infrastructure/compose/docker-compose.yml \
+                        -f infrastructure/compose/docker-compose.prod.yml ps --status running -q | wc -l)
+
+                      if [ "$RUNNING" -eq 0 ]; then
+                        echo "❌ ERROR: No containers are running!"
+                        echo "📋 Recent container logs:"
+                        docker compose -f infrastructure/compose/docker-compose.yml \
+                          -f infrastructure/compose/docker-compose.prod.yml logs --tail=50
+                        exit 1
+                      else
+                        echo "✅ $RUNNING container(s) running"
+                      fi
                   post-deploy-command: |
+                      echo "🧹 Cleaning up old images (keeping recent)..."
+                      docker image prune -f --filter "until=24h" 2>/dev/null || true
                       echo "✅ FKS services deployed"
 
             - name: 🏥 Health check
