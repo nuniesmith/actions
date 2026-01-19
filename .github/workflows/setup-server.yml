@@ -472,6 +472,57 @@ jobs:
                   echo "- Branch: \`$REPO_BRANCH\`" >> $GITHUB_STEP_SUMMARY
                   echo "- Path: \`/home/actions/$REPO_NAME\`" >> $GITHUB_STEP_SUMMARY
 
+            - name: 🚀 Start Services via run.sh
+              env:
+                  SSHPASS: ${{ inputs.ssh_password }}
+                  REPO_URL: ${{ inputs.repo_url }}
+              run: |
+                  REPO_NAME=$(basename "$REPO_URL" .git)
+                  echo "🚀 Starting services for $REPO_NAME..."
+
+                  sshpass -e ssh -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -p ${{ inputs.ssh_port }} \
+                    ${{ inputs.ssh_user }}@${{ inputs.tailscale_ip }} \
+                    "SUDO_PASS='$SSHPASS' REPO_NAME='$REPO_NAME' bash -s" << 'START_SCRIPT'
+
+                  REPO_PATH="/home/actions/$REPO_NAME"
+
+                  if [ -f "$REPO_PATH/run.sh" ]; then
+                    echo "📋 Found run.sh, starting services..."
+                    cd "$REPO_PATH"
+
+                    # Make sure run.sh is executable
+                    echo "$SUDO_PASS" | sudo -S chmod +x run.sh
+
+                    # Run as actions user
+                    echo "$SUDO_PASS" | sudo -S -u actions bash -c "
+                      cd '$REPO_PATH'
+                      ./run.sh start
+                    "
+
+                    echo ""
+                    echo "✅ Services started via run.sh"
+
+                    # Show running containers if docker is available
+                    if command -v docker &> /dev/null; then
+                      echo ""
+                      echo "🐳 Running containers:"
+                      docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true
+                    fi
+                  else
+                    echo "⚠️ No run.sh found in $REPO_PATH"
+                    echo "   Skipping automatic service start"
+                    echo "   You can manually start services by SSHing to the server and running:"
+                    echo "   cd $REPO_PATH && ./run.sh start"
+                  fi
+                  START_SCRIPT
+
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "## 🚀 Services Started" >> $GITHUB_STEP_SUMMARY
+                  echo "- Command: \`./run.sh start\`" >> $GITHUB_STEP_SUMMARY
+                  echo "- Path: \`/home/actions/$REPO_NAME\`" >> $GITHUB_STEP_SUMMARY
+
     # ========================================================================
     # STAGE 5: Cleanup & Summary
     # ========================================================================

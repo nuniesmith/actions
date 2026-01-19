@@ -124,7 +124,13 @@ install_packages_debian() {
         net-tools \
         openssh-server \
         openssl \
-        sudo
+        sudo \
+        openjdk-21-jdk
+
+    # Set JAVA_HOME for all users
+    echo 'export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64' > /etc/profile.d/java.sh
+    echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
+    chmod +x /etc/profile.d/java.sh
 }
 
 install_packages_fedora() {
@@ -142,7 +148,13 @@ install_packages_fedora() {
         openssh-server \
         openssl \
         sudo \
-        dnf-plugins-core
+        dnf-plugins-core \
+        java-21-openjdk-devel
+
+    # Set JAVA_HOME for all users
+    echo 'export JAVA_HOME=/usr/lib/jvm/java-21-openjdk' > /etc/profile.d/java.sh
+    echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
+    chmod +x /etc/profile.d/java.sh
 }
 
 install_packages_arch() {
@@ -161,7 +173,13 @@ install_packages_arch() {
         openssh \
         openssl \
         sudo \
-        base-devel
+        base-devel \
+        jdk21-openjdk
+
+    # Set JAVA_HOME for all users
+    echo 'export JAVA_HOME=/usr/lib/jvm/java-21-openjdk' > /etc/profile.d/java.sh
+    echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
+    chmod +x /etc/profile.d/java.sh
 }
 
 install_packages() {
@@ -439,6 +457,13 @@ main() {
     log_info "Step 1/7: Installing system packages..."
     install_packages
     log_success "System packages installed"
+
+    # Verify Java installation
+    if command -v java >/dev/null 2>&1; then
+        log_success "Java installed: $(java -version 2>&1 | head -1)"
+    else
+        log_warn "Java installation may require a shell restart"
+    fi
     printf "\n"
 
     # Step 2: Install Docker

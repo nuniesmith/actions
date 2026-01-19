@@ -1,5 +1,5 @@
 # ============================================================================
-# FKS CI/CD Pipeline (Refactored)
+# FKS CI/CD Pipeline
 # ============================================================================
 # Complete pipeline using reusable composite actions for maintainability.
 #
@@ -614,8 +614,11 @@ jobs:
               continue-on-error: true
 
             - name: 📣 Notify deployment success
-              if: success() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              if: success()
               uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              env:
+                  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
                   title: "🚀 FKS Deployed to Production"
@@ -629,8 +632,11 @@ jobs:
                       ]
 
             - name: 📣 Notify deployment failure
-              if: failure() && secrets.DISCORD_WEBHOOK_GITHUB != ''
+              if: failure()
               uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              env:
+                  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
                   title: "❌ FKS Deployment Failed"
