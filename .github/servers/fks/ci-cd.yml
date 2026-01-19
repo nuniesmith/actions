@@ -6,10 +6,9 @@
 # Pipeline Flow:
 # 1. Docker Build & Push - Multi-service matrix build
 # 2. Infrastructure Setup - Tailscale, DNS
-# 3. SSL Certificates - Let's Encrypt with self-signed fallback
-# 4. Deployment - Staging (develop) or Production (main)
-# 5. Health Checks - Verify deployment success
-# 6. Post-CI - LLM audit, notifications
+# 3. Deployment - SSL Certificates + Staging (develop) or Production (main)
+# 4. Health Checks - Verify deployment success
+# 5. Post-CI - LLM audit, notifications
 #
 # NOTE: Tests are currently disabled to focus on deployment process
 # =============================================================================
@@ -36,7 +35,7 @@ on:
                 description: "Skip SSL certificate generation"
                 required: false
                 type: boolean
-                default: true
+                default: false
             environment:
                 description: "Target environment"
                 required: false
@@ -293,92 +292,18 @@ jobs:
                   additional-records: '[{"name": "www.${{ steps.config.outputs.domain }}"}]'
 
     # =========================================================================
-    # STAGE 3.5: SSL CERTIFICATES
-    # =========================================================================
-
-    ssl-certificates:
-        name: 🔐 SSL Certificates
-        runs-on: ubuntu-latest
-        timeout-minutes: 15
-        needs: [setup, infrastructure-setup]
-        if: |
-            needs.infrastructure-setup.result == 'success' &&
-            github.event_name == 'push' &&
-            github.ref == 'refs/heads/main' &&
-            !inputs.skip_deploy &&
-            !inputs.skip_ssl
-        outputs:
-            cert_ready: ${{ steps.ssl.outputs.cert-ready }}
-            cert_type: ${{ steps.ssl.outputs.cert-type }}
-            deployed: ${{ steps.ssl.outputs.deployed }}
-        steps:
-            - name: 📥 Checkout code
-              uses: actions/checkout@v4
-
-            - name: ⚙️ Configure SSL target
-              id: ssl-config
-              run: |
-                  # Use secrets directly for reliability
-                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
-                  TARGET_DOMAIN="${{ env.DOMAIN }}"
-                  TARGET_HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
-
-                  # Final validation
-                  if [ -z "$TARGET_HOST" ]; then
-                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
-                    echo "## ❌ Missing: PROD_TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
-                    exit 1
-                  fi
-
-                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
-                  echo "domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
-                  echo "hostname=$TARGET_HOSTNAME" >> $GITHUB_OUTPUT
-
-                  echo "✅ SSL target configured:"
-                  echo "   Host: $TARGET_HOST"
-                  echo "   Hostname: ${TARGET_HOSTNAME:-not set}"
-                  echo "   Domain: $TARGET_DOMAIN"
-
-            - name: 🔌 Connect to Tailscale
-              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
-              with:
-                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ steps.ssl-config.outputs.host }}
-
-            - name: 🔐 Generate & Deploy SSL Certificates
-              id: ssl
-              uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
-              with:
-                  domain: ${{ steps.ssl-config.outputs.domain }}
-                  additional-domains: "www.${{ steps.ssl-config.outputs.domain }}"
-                  cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
-                  email: ${{ secrets.SSL_EMAIL }}
-                  fallback-to-self-signed: "true"
-                  self-signed-days: "365"
-                  deploy-to-server: "true"
-                  ssh-host: ${{ steps.ssl-config.outputs.host }}
-                  ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
-                  ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
-                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
-                  docker-volume-name: "fks_certbot_certs"
-                  docker-username: ${{ secrets.DOCKER_USERNAME }}
-                  docker-token: ${{ secrets.DOCKER_TOKEN }}
-
-    # =========================================================================
-    # STAGE 4: DEPLOYMENT
+    # STAGE 4: DEPLOYMENT (includes SSL certificates)
     # =========================================================================
 
     deploy:
         name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
         timeout-minutes: 30
-        needs: [setup, docker-build, infrastructure-setup, ssl-certificates]
+        needs: [setup, docker-build, infrastructure-setup]
         if: |
             always() &&
             needs.docker-build.result == 'success' &&
             needs.infrastructure-setup.result == 'success' &&
-            (needs.ssl-certificates.result == 'success' || needs.ssl-certificates.result == 'skipped') &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
@@ -387,6 +312,9 @@ jobs:
             url: https://${{ needs.infrastructure-setup.outputs.target_domain }}
         outputs:
             deployed: ${{ steps.deploy.outputs.deployed }}
+            ssl_cert_type: ${{ steps.ssl.outputs.cert-type }}
+            ssl_cert_ready: ${{ steps.ssl.outputs.cert-ready }}
+            ssl_deployed: ${{ steps.ssl.outputs.deployed }}
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -423,6 +351,47 @@ jobs:
                   target-ip: ${{ steps.deploy-config.outputs.host }}
                   target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
 
+            # -----------------------------------------------------------------
+            # SSL CERTIFICATES (run before deployment if not skipped)
+            # -----------------------------------------------------------------
+            - name: 🔐 Generate & Deploy SSL Certificates
+              id: ssl
+              if: |
+                  github.ref == 'refs/heads/main' &&
+                  !inputs.skip_ssl
+              uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+              with:
+                  domain: ${{ steps.deploy-config.outputs.domain }}
+                  additional-domains: "www.${{ steps.deploy-config.outputs.domain }}"
+                  cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+                  email: ${{ secrets.SSL_EMAIL }}
+                  fallback-to-self-signed: "true"
+                  self-signed-days: "365"
+                  deploy-to-server: "true"
+                  ssh-host: ${{ steps.deploy-config.outputs.host }}
+                  ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  docker-volume-name: "fks_certbot_certs"
+                  docker-username: ${{ secrets.DOCKER_USERNAME }}
+                  docker-token: ${{ secrets.DOCKER_TOKEN }}
+
+            - name: 📋 SSL Certificate Summary
+              if: steps.ssl.outcome == 'success' || steps.ssl.outcome == 'skipped'
+              run: |
+                  if [ "${{ steps.ssl.outcome }}" = "skipped" ]; then
+                    echo "⏭️ SSL certificate generation was skipped"
+                    echo "ssl_status=skipped" >> $GITHUB_OUTPUT
+                  else
+                    echo "✅ SSL certificates processed"
+                    echo "   Type: ${{ steps.ssl.outputs.cert-type || 'unknown' }}"
+                    echo "   Ready: ${{ steps.ssl.outputs.cert-ready || 'unknown' }}"
+                    echo "   Deployed: ${{ steps.ssl.outputs.deployed || 'unknown' }}"
+                  fi
+
+            # -----------------------------------------------------------------
+            # DEPLOYMENT
+            # -----------------------------------------------------------------
             - name: 🚀 Deploy via SSH
               id: deploy
               uses: nuniesmith/actions/.github/actions/ssh-deploy@main
@@ -654,7 +623,7 @@ jobs:
                       [
                         {"name": "Environment", "value": "${{ needs.setup.outputs.deploy_env }}", "inline": true},
                         {"name": "Domain", "value": "${{ steps.health-config.outputs.domain || env.DOMAIN }}", "inline": true},
-                        {"name": "SSL", "value": "${{ needs.ssl-certificates.outputs.cert_type || 'skipped' }}", "inline": true}
+                        {"name": "SSL", "value": "${{ needs.deploy.outputs.ssl_cert_type || 'skipped' }}", "inline": true}
                       ]
 
     # =========================================================================
@@ -738,7 +707,6 @@ jobs:
             - setup
             - docker-build
             - infrastructure-setup
-            - ssl-certificates
             - deploy
             - health-check
             - llm-audit
@@ -765,16 +733,15 @@ jobs:
                   |-----|--------|
                   | 🐳 Docker Build | ${{ needs.docker-build.result || 'skipped' }} |
                   | 🔐 Infrastructure | ${{ needs.infrastructure-setup.result || 'skipped' }} |
-                  | 🔒 SSL Certificates | ${{ needs.ssl-certificates.result || 'skipped' }} |
                   | 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |
                   | 🏥 Health Check | ${{ needs.health-check.result || 'skipped' }} |
 
                   ## SSL Details
                   | Property | Value |
                   |----------|-------|
-                  | Certificate Type | ${{ needs.ssl-certificates.outputs.cert_type || 'N/A' }} |
-                  | Certificate Ready | ${{ needs.ssl-certificates.outputs.cert_ready || 'N/A' }} |
-                  | Deployed | ${{ needs.ssl-certificates.outputs.deployed || 'N/A' }} |
+                  | Certificate Type | ${{ needs.deploy.outputs.ssl_cert_type || 'N/A' }} |
+                  | Certificate Ready | ${{ needs.deploy.outputs.ssl_cert_ready || 'N/A' }} |
+                  | Deployed | ${{ needs.deploy.outputs.ssl_deployed || 'N/A' }} |
 
                   ## Post-CI
                   | Job | Status |
