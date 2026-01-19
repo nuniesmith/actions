@@ -578,11 +578,15 @@ jobs:
                   username: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   project-path: ~/fks
-                  git-pull: "false"
+                  git-pull: "true"
                   docker-pull: "true"
                   docker-prune: "true"
                   pre-deploy-command: |
-                      mkdir -p ~/fks
+                      if [ ! -d ~/fks/.git ]; then
+                        echo "📦 Cloning repository for first-time setup..."
+                        rm -rf ~/fks
+                        git clone https://github.com/nuniesmith/fks.git ~/fks
+                      fi
                   deploy-command: |
                       # Generate .env if not exists
                       if [ ! -f .env ]; then
