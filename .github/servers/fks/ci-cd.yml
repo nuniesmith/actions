@@ -596,10 +596,11 @@ jobs:
                   endpoints: |
                       [
                         {"url": "https://${{ steps.health-config.outputs.domain }}/health", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}:3000/api/health", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}:9090/-/healthy", "expected_status": 200}
+                        {"url": "https://${{ steps.health-config.outputs.domain }}/health/grafana", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}:9090/-/healthy", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}:9000/ping", "expected_status": 200}
                       ]
-                  containers: "fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana"
+                  containers: "fks_janus fks_execution fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana fks_nginx"
                   ssh-host: ${{ steps.health-config.outputs.host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
