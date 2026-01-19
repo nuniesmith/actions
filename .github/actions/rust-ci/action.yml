@@ -1,305 +1,529 @@
-name: 'Rust CI'
-description: 'Complete Rust CI pipeline with caching, linting, testing, and building'
-author: 'nuniesmith'
+name: "Rust CI"
+description: "Complete Rust CI pipeline with caching, linting, testing, building, and optional protobuf support"
+author: "nuniesmith"
 
 branding:
-  icon: 'check-circle'
-  color: 'orange'
+    icon: "check-circle"
+    color: "orange"
 
 inputs:
-  toolchain:
-    description: 'Rust toolchain (stable, beta, nightly)'
-    required: false
-    default: 'stable'
-  components:
-    description: 'Additional components (comma-separated: rustfmt, clippy, llvm-tools-preview)'
-    required: false
-    default: 'rustfmt, clippy'
-  targets:
-    description: 'Additional targets to install (comma-separated)'
-    required: false
-    default: ''
-  run-fmt:
-    description: 'Run cargo fmt check'
-    required: false
-    default: 'true'
-  run-clippy:
-    description: 'Run cargo clippy'
-    required: false
-    default: 'true'
-  run-tests:
-    description: 'Run cargo test'
-    required: false
-    default: 'true'
-  run-build:
-    description: 'Run cargo build'
-    required: false
-    default: 'true'
-  build-release:
-    description: 'Build in release mode'
-    required: false
-    default: 'true'
-  clippy-args:
-    description: 'Additional arguments for clippy'
-    required: false
-    default: '--all-targets --all-features -- -D warnings'
-  test-args:
-    description: 'Additional arguments for test'
-    required: false
-    default: '--verbose'
-  build-args:
-    description: 'Additional arguments for build'
-    required: false
-    default: '--verbose'
-  features:
-    description: 'Features to enable (comma-separated)'
-    required: false
-    default: ''
-  all-features:
-    description: 'Enable all features'
-    required: false
-    default: 'false'
-  no-default-features:
-    description: 'Disable default features'
-    required: false
-    default: 'false'
-  working-directory:
-    description: 'Working directory for cargo commands'
-    required: false
-    default: '.'
-  coverage:
-    description: 'Generate code coverage with cargo-tarpaulin'
-    required: false
-    default: 'false'
-  coverage-output-dir:
-    description: 'Coverage output directory'
-    required: false
-    default: './coverage'
+    toolchain:
+        description: "Rust toolchain (stable, beta, nightly, or specific version like 1.92.0)"
+        required: false
+        default: "stable"
+    components:
+        description: "Additional components (comma-separated: rustfmt, clippy, llvm-tools-preview)"
+        required: false
+        default: "rustfmt, clippy"
+    targets:
+        description: "Additional targets to install (comma-separated)"
+        required: false
+        default: ""
+    run-fmt:
+        description: "Run cargo fmt check"
+        required: false
+        default: "true"
+    run-clippy:
+        description: "Run cargo clippy"
+        required: false
+        default: "true"
+    run-tests:
+        description: "Run cargo test"
+        required: false
+        default: "true"
+    run-build:
+        description: "Run cargo build"
+        required: false
+        default: "true"
+    build-release:
+        description: "Build in release mode"
+        required: false
+        default: "true"
+    clippy-args:
+        description: "Additional arguments for clippy"
+        required: false
+        default: "--all-targets --all-features -- -D warnings"
+    test-args:
+        description: "Additional arguments for test"
+        required: false
+        default: "--verbose"
+    build-args:
+        description: "Additional arguments for build"
+        required: false
+        default: "--verbose"
+    features:
+        description: "Features to enable (comma-separated)"
+        required: false
+        default: ""
+    all-features:
+        description: "Enable all features"
+        required: false
+        default: "false"
+    no-default-features:
+        description: "Disable default features"
+        required: false
+        default: "false"
+    working-directory:
+        description: "Working directory for cargo commands"
+        required: false
+        default: "."
+    coverage:
+        description: "Generate code coverage with cargo-tarpaulin"
+        required: false
+        default: "false"
+    coverage-output-dir:
+        description: "Coverage output directory"
+        required: false
+        default: "./coverage"
+    # Workspace-specific options
+    workspace:
+        description: "Build/test entire workspace (--workspace flag)"
+        required: false
+        default: "false"
+    packages:
+        description: "Specific packages to build/test (comma-separated, uses -p flag)"
+        required: false
+        default: ""
+    exclude-packages:
+        description: "Packages to exclude from workspace (comma-separated, uses --exclude flag)"
+        required: false
+        default: ""
+    # Protobuf/buf options
+    install-protobuf:
+        description: "Install protobuf compiler"
+        required: false
+        default: "false"
+    install-buf:
+        description: "Install buf CLI for protobuf linting"
+        required: false
+        default: "false"
+    run-buf-lint:
+        description: "Run buf lint on proto files"
+        required: false
+        default: "false"
+    run-buf-breaking:
+        description: "Run buf breaking change detection (requires git history)"
+        required: false
+        default: "false"
+    proto-directory:
+        description: "Directory containing proto files"
+        required: false
+        default: "proto"
+    buf-breaking-against:
+        description: "Git reference to check breaking changes against"
+        required: false
+        default: ".git#branch=main"
+    # Build ordering
+    pre-build-packages:
+        description: "Packages to build first before main build (comma-separated)"
+        required: false
+        default: ""
+    # Test configuration
+    test-lib-only:
+        description: "Run only library tests (--lib flag)"
+        required: false
+        default: "false"
+    test-bins:
+        description: "Run binary tests (--bins flag)"
+        required: false
+        default: "false"
+    test-integration:
+        description: "Run integration tests separately (--test flag)"
+        required: false
+        default: "false"
+    # System dependencies
+    install-system-deps:
+        description: "Install common system dependencies (libssl-dev, pkg-config, etc.)"
+        required: false
+        default: "false"
+    additional-apt-packages:
+        description: "Additional apt packages to install (space-separated)"
+        required: false
+        default: ""
+    # Caching
+    cache-key-suffix:
+        description: "Suffix for cache key to differentiate between jobs"
+        required: false
+        default: "rust-ci"
 
 outputs:
-  fmt-result:
-    description: 'Result of fmt check (success/failure/skipped)'
-    value: ${{ steps.fmt.outputs.result }}
-  clippy-result:
-    description: 'Result of clippy (success/failure/skipped)'
-    value: ${{ steps.clippy.outputs.result }}
-  test-result:
-    description: 'Result of tests (success/failure/skipped)'
-    value: ${{ steps.test.outputs.result }}
-  build-result:
-    description: 'Result of build (success/failure/skipped)'
-    value: ${{ steps.build.outputs.result }}
-  coverage-file:
-    description: 'Path to coverage file (if generated)'
-    value: ${{ steps.coverage.outputs.coverage_file }}
+    fmt-result:
+        description: "Result of fmt check (success/failure/skipped)"
+        value: ${{ steps.fmt.outputs.result || steps.fmt-skip.outputs.result }}
+    clippy-result:
+        description: "Result of clippy (success/failure/skipped)"
+        value: ${{ steps.clippy.outputs.result || steps.clippy-skip.outputs.result }}
+    test-result:
+        description: "Result of tests (success/failure/skipped)"
+        value: ${{ steps.test.outputs.result || steps.test-skip.outputs.result }}
+    build-result:
+        description: "Result of build (success/failure/skipped)"
+        value: ${{ steps.build.outputs.result || steps.build-skip.outputs.result }}
+    coverage-file:
+        description: "Path to coverage file (if generated)"
+        value: ${{ steps.coverage.outputs.coverage_file || '' }}
+    buf-lint-result:
+        description: "Result of buf lint (success/failure/skipped)"
+        value: ${{ steps.buf-lint.outputs.result || 'skipped' }}
 
 runs:
-  using: 'composite'
-  steps:
-    - name: 🦀 Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ inputs.toolchain }}
-        components: ${{ inputs.components }}
-        targets: ${{ inputs.targets }}
+    using: "composite"
+    steps:
+        - name: 📦 Install system dependencies
+          if: inputs.install-system-deps == 'true' || inputs.additional-apt-packages != ''
+          shell: bash
+          run: |
+              echo "📦 Installing system dependencies..."
+              sudo apt-get update -qq
 
-    - name: 📦 Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-registry-
+              PACKAGES=""
+              if [ "${{ inputs.install-system-deps }}" = "true" ]; then
+                PACKAGES="build-essential pkg-config libssl-dev"
+              fi
 
-    - name: 📦 Cache cargo index
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-git-
+              if [ -n "${{ inputs.additional-apt-packages }}" ]; then
+                PACKAGES="$PACKAGES ${{ inputs.additional-apt-packages }}"
+              fi
 
-    - name: 📦 Cache cargo build
-      uses: actions/cache@v4
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-${{ inputs.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-build-${{ inputs.toolchain }}-
+              if [ -n "$PACKAGES" ]; then
+                sudo apt-get install -y -qq $PACKAGES
+                echo "✅ System dependencies installed"
+              fi
 
-    - name: 🔧 Prepare feature flags
-      id: features
-      shell: bash
-      run: |
-        FEATURE_FLAGS=""
+        - name: 🦀 Install Rust toolchain
+          uses: dtolnay/rust-toolchain@master
+          with:
+              toolchain: ${{ inputs.toolchain }}
+              components: ${{ inputs.components }}
+              targets: ${{ inputs.targets }}
 
-        if [ "${{ inputs.all-features }}" = "true" ]; then
-          FEATURE_FLAGS="--all-features"
-        elif [ -n "${{ inputs.features }}" ]; then
-          FEATURE_FLAGS="--features ${{ inputs.features }}"
-        fi
+        - name: 📦 Install protobuf compiler
+          if: inputs.install-protobuf == 'true'
+          shell: bash
+          run: |
+              echo "📦 Installing protobuf compiler..."
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+              protoc --version
+              echo "✅ Protobuf compiler installed"
 
-        if [ "${{ inputs.no-default-features }}" = "true" ]; then
-          FEATURE_FLAGS="$FEATURE_FLAGS --no-default-features"
-        fi
+        - name: 📦 Install buf CLI
+          if: inputs.install-buf == 'true'
+          uses: bufbuild/buf-setup-action@v1
+          with:
+              github_token: ${{ github.token }}
 
-        echo "flags=$FEATURE_FLAGS" >> $GITHUB_OUTPUT
+        - name: 📦 Cache cargo registry
+          uses: actions/cache@v4
+          with:
+              path: |
+                  ~/.cargo/bin/
+                  ~/.cargo/registry/index/
+                  ~/.cargo/registry/cache/
+                  ~/.cargo/git/db/
+              key: ${{ runner.os }}-cargo-registry-${{ inputs.cache-key-suffix }}-${{ hashFiles('**/Cargo.lock') }}
+              restore-keys: |
+                  ${{ runner.os }}-cargo-registry-${{ inputs.cache-key-suffix }}-
+                  ${{ runner.os }}-cargo-registry-
 
-    - name: 📝 Run cargo fmt
-      id: fmt
-      if: inputs.run-fmt == 'true'
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        echo "🔍 Checking code formatting..."
-        if cargo fmt --all -- --check; then
-          echo "✅ Code formatting check passed"
-          echo "result=success" >> $GITHUB_OUTPUT
-        else
-          echo "❌ Code formatting check failed"
-          echo "result=failure" >> $GITHUB_OUTPUT
-          exit 1
-        fi
+        - name: 📦 Cache cargo build
+          uses: actions/cache@v4
+          with:
+              path: |
+                  target/
+                  ${{ inputs.working-directory }}/target/
+              key: ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-${{ inputs.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+              restore-keys: |
+                  ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-${{ inputs.toolchain }}-
+                  ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-
 
-    - name: 📝 Skip fmt (not requested)
-      if: inputs.run-fmt != 'true'
-      id: fmt-skip
-      shell: bash
-      run: echo "result=skipped" >> $GITHUB_OUTPUT
+        - name: 🔧 Prepare flags
+          id: flags
+          shell: bash
+          run: |
+              # Feature flags
+              FEATURE_FLAGS=""
+              if [ "${{ inputs.all-features }}" = "true" ]; then
+                FEATURE_FLAGS="--all-features"
+              elif [ -n "${{ inputs.features }}" ]; then
+                FEATURE_FLAGS="--features ${{ inputs.features }}"
+              fi
+              if [ "${{ inputs.no-default-features }}" = "true" ]; then
+                FEATURE_FLAGS="$FEATURE_FLAGS --no-default-features"
+              fi
+              echo "feature_flags=$FEATURE_FLAGS" >> $GITHUB_OUTPUT
 
-    - name: 📎 Run cargo clippy
-      id: clippy
-      if: inputs.run-clippy == 'true'
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        echo "🔍 Running clippy lints..."
-        if cargo clippy ${{ steps.features.outputs.flags }} ${{ inputs.clippy-args }}; then
-          echo "✅ Clippy checks passed"
-          echo "result=success" >> $GITHUB_OUTPUT
-        else
-          echo "❌ Clippy checks failed"
-          echo "result=failure" >> $GITHUB_OUTPUT
-          exit 1
-        fi
+              # Workspace/package flags
+              PACKAGE_FLAGS=""
+              if [ "${{ inputs.workspace }}" = "true" ]; then
+                PACKAGE_FLAGS="--workspace"
+              fi
+              if [ -n "${{ inputs.packages }}" ]; then
+                IFS=',' read -ra PKGS <<< "${{ inputs.packages }}"
+                for pkg in "${PKGS[@]}"; do
+                  pkg=$(echo "$pkg" | xargs)
+                  PACKAGE_FLAGS="$PACKAGE_FLAGS -p $pkg"
+                done
+              fi
+              if [ -n "${{ inputs.exclude-packages }}" ]; then
+                IFS=',' read -ra EXCLUDES <<< "${{ inputs.exclude-packages }}"
+                for exc in "${EXCLUDES[@]}"; do
+                  exc=$(echo "$exc" | xargs)
+                  PACKAGE_FLAGS="$PACKAGE_FLAGS --exclude $exc"
+                done
+              fi
+              echo "package_flags=$PACKAGE_FLAGS" >> $GITHUB_OUTPUT
 
-    - name: 📎 Skip clippy (not requested)
-      if: inputs.run-clippy != 'true'
-      id: clippy-skip
-      shell: bash
-      run: echo "result=skipped" >> $GITHUB_OUTPUT
+              # Release flag
+              RELEASE_FLAG=""
+              if [ "${{ inputs.build-release }}" = "true" ]; then
+                RELEASE_FLAG="--release"
+              fi
+              echo "release_flag=$RELEASE_FLAG" >> $GITHUB_OUTPUT
 
-    - name: 🧪 Run cargo test
-      id: test
-      if: inputs.run-tests == 'true'
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        echo "🧪 Running tests..."
-        if cargo test ${{ steps.features.outputs.flags }} ${{ inputs.test-args }}; then
-          echo "✅ All tests passed"
-          echo "result=success" >> $GITHUB_OUTPUT
-        else
-          echo "❌ Tests failed"
-          echo "result=failure" >> $GITHUB_OUTPUT
-          exit 1
-        fi
+        - name: 🔍 Buf lint
+          id: buf-lint
+          if: inputs.run-buf-lint == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🔍 Linting Protocol Buffers..."
+              cd ${{ inputs.proto-directory }}
+              if buf lint; then
+                echo "✅ Proto files pass linting"
+                echo "result=success" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Proto lint failed"
+                echo "result=failure" >> $GITHUB_OUTPUT
+                exit 1
+              fi
 
-    - name: 🧪 Skip tests (not requested)
-      if: inputs.run-tests != 'true'
-      id: test-skip
-      shell: bash
-      run: echo "result=skipped" >> $GITHUB_OUTPUT
+        - name: 🔒 Buf breaking change check
+          if: inputs.run-buf-breaking == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          continue-on-error: true
+          run: |
+              echo "🔒 Checking for breaking proto changes..."
+              cd ${{ inputs.proto-directory }}
+              buf breaking --against '${{ inputs.buf-breaking-against }}' || echo "⚠️ Breaking changes detected (non-fatal)"
 
-    - name: 🏗️ Run cargo build
-      id: build
-      if: inputs.run-build == 'true'
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        echo "🏗️ Building project..."
-        RELEASE_FLAG=""
-        if [ "${{ inputs.build-release }}" = "true" ]; then
-          RELEASE_FLAG="--release"
-        fi
+        - name: 📝 Run cargo fmt
+          id: fmt
+          if: inputs.run-fmt == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🔍 Checking code formatting..."
+              if cargo fmt --all -- --check; then
+                echo "✅ Code formatting check passed"
+                echo "result=success" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Code formatting check failed"
+                echo "result=failure" >> $GITHUB_OUTPUT
+                exit 1
+              fi
 
-        if cargo build $RELEASE_FLAG ${{ steps.features.outputs.flags }} ${{ inputs.build-args }}; then
-          echo "✅ Build successful"
-          echo "result=success" >> $GITHUB_OUTPUT
-        else
-          echo "❌ Build failed"
-          echo "result=failure" >> $GITHUB_OUTPUT
-          exit 1
-        fi
+        - name: 📝 Skip fmt
+          if: inputs.run-fmt != 'true'
+          id: fmt-skip
+          shell: bash
+          run: echo "result=skipped" >> $GITHUB_OUTPUT
 
-    - name: 🏗️ Skip build (not requested)
-      if: inputs.run-build != 'true'
-      id: build-skip
-      shell: bash
-      run: echo "result=skipped" >> $GITHUB_OUTPUT
+        - name: 📎 Run cargo clippy
+          id: clippy
+          if: inputs.run-clippy == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🔍 Running clippy lints..."
+              if cargo clippy ${{ steps.flags.outputs.package_flags }} ${{ steps.flags.outputs.feature_flags }} ${{ inputs.clippy-args }}; then
+                echo "✅ Clippy checks passed"
+                echo "result=success" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Clippy checks failed"
+                echo "result=failure" >> $GITHUB_OUTPUT
+                exit 1
+              fi
 
-    - name: 📊 Generate code coverage
-      id: coverage
-      if: inputs.coverage == 'true'
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        echo "📊 Installing cargo-tarpaulin..."
-        cargo install cargo-tarpaulin || true
+        - name: 📎 Skip clippy
+          if: inputs.run-clippy != 'true'
+          id: clippy-skip
+          shell: bash
+          run: echo "result=skipped" >> $GITHUB_OUTPUT
 
-        echo "📊 Generating coverage report..."
-        mkdir -p ${{ inputs.coverage-output-dir }}
-        cargo tarpaulin --out Xml --output-dir ${{ inputs.coverage-output-dir }} ${{ steps.features.outputs.flags }}
+        - name: 🔨 Pre-build packages
+          if: inputs.pre-build-packages != ''
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🔨 Building prerequisite packages..."
+              IFS=',' read -ra PKGS <<< "${{ inputs.pre-build-packages }}"
+              for pkg in "${PKGS[@]}"; do
+                pkg=$(echo "$pkg" | xargs)
+                echo "Building $pkg..."
+                cargo build -p $pkg ${{ steps.flags.outputs.feature_flags }}
+              done
+              echo "✅ Prerequisite packages built"
 
-        COVERAGE_FILE="${{ inputs.coverage-output-dir }}/cobertura.xml"
-        if [ -f "$COVERAGE_FILE" ]; then
-          echo "✅ Coverage report generated: $COVERAGE_FILE"
-          echo "coverage_file=$COVERAGE_FILE" >> $GITHUB_OUTPUT
-        else
-          echo "⚠️ Coverage file not found"
-          echo "coverage_file=" >> $GITHUB_OUTPUT
-        fi
+        - name: 🏗️ Run cargo build
+          id: build
+          if: inputs.run-build == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🏗️ Building project..."
+              if cargo build ${{ steps.flags.outputs.release_flag }} ${{ steps.flags.outputs.package_flags }} ${{ steps.flags.outputs.feature_flags }} ${{ inputs.build-args }}; then
+                echo "✅ Build successful"
+                echo "result=success" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Build failed"
+                echo "result=failure" >> $GITHUB_OUTPUT
+                exit 1
+              fi
 
-    - name: 📊 Skip coverage (not requested)
-      if: inputs.coverage != 'true'
-      id: coverage-skip
-      shell: bash
-      run: echo "coverage_file=" >> $GITHUB_OUTPUT
+        - name: 🏗️ Skip build
+          if: inputs.run-build != 'true'
+          id: build-skip
+          shell: bash
+          run: echo "result=skipped" >> $GITHUB_OUTPUT
 
-    - name: 📋 Summary
-      shell: bash
-      run: |
-        echo "## 🦀 Rust CI Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
-        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Toolchain | \`${{ inputs.toolchain }}\` |" >> $GITHUB_STEP_SUMMARY
+        - name: 🧪 Run cargo test (lib only)
+          id: test-lib
+          if: inputs.run-tests == 'true' && inputs.test-lib-only == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🧪 Running library tests..."
+              if cargo test --lib ${{ steps.flags.outputs.release_flag }} ${{ steps.flags.outputs.package_flags }} ${{ steps.flags.outputs.feature_flags }} ${{ inputs.test-args }}; then
+                echo "✅ Library tests passed"
+              else
+                echo "❌ Library tests failed"
+                exit 1
+              fi
 
-        if [ "${{ inputs.run-fmt }}" = "true" ]; then
-          echo "| Format (rustfmt) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "| Format (rustfmt) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-        fi
+        - name: 🧪 Run cargo test (integration)
+          id: test-integration
+          if: inputs.run-tests == 'true' && inputs.test-integration == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🧪 Running integration tests..."
+              if cargo test --tests ${{ steps.flags.outputs.release_flag }} ${{ steps.flags.outputs.package_flags }} ${{ steps.flags.outputs.feature_flags }} ${{ inputs.test-args }}; then
+                echo "✅ Integration tests passed"
+              else
+                echo "❌ Integration tests failed"
+                exit 1
+              fi
 
-        if [ "${{ inputs.run-clippy }}" = "true" ]; then
-          echo "| Lints (clippy) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "| Lints (clippy) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-        fi
+        - name: 🧪 Run cargo test (all)
+          id: test
+          if: inputs.run-tests == 'true' && inputs.test-lib-only != 'true' && inputs.test-integration != 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🧪 Running all tests..."
+              if cargo test ${{ steps.flags.outputs.release_flag }} ${{ steps.flags.outputs.package_flags }} ${{ steps.flags.outputs.feature_flags }} ${{ inputs.test-args }}; then
+                echo "✅ All tests passed"
+                echo "result=success" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Tests failed"
+                echo "result=failure" >> $GITHUB_OUTPUT
+                exit 1
+              fi
 
-        if [ "${{ inputs.run-tests }}" = "true" ]; then
-          echo "| Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "| Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-        fi
+        - name: 🧪 Set test result (lib+integration)
+          if: inputs.run-tests == 'true' && (inputs.test-lib-only == 'true' || inputs.test-integration == 'true')
+          id: test-combined
+          shell: bash
+          run: echo "result=success" >> $GITHUB_OUTPUT
 
-        if [ "${{ inputs.run-build }}" = "true" ]; then
-          MODE="${{ inputs.build-release == 'true' && 'release' || 'debug' }}"
-          echo "| Build ($MODE) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "| Build | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-        fi
+        - name: 🧪 Skip tests
+          if: inputs.run-tests != 'true'
+          id: test-skip
+          shell: bash
+          run: echo "result=skipped" >> $GITHUB_OUTPUT
 
-        if [ "${{ inputs.coverage }}" = "true" ]; then
-          echo "| Coverage | ✅ Generated |" >> $GITHUB_STEP_SUMMARY
-        fi
+        - name: 📊 Generate code coverage
+          id: coverage
+          if: inputs.coverage == 'true'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "📊 Installing cargo-tarpaulin..."
+              cargo install cargo-tarpaulin --locked || true
+
+              echo "📊 Generating coverage report..."
+              mkdir -p ${{ inputs.coverage-output-dir }}
+              cargo tarpaulin --out Xml --output-dir ${{ inputs.coverage-output-dir }} ${{ steps.flags.outputs.package_flags }} ${{ steps.flags.outputs.feature_flags }} || true
+
+              COVERAGE_FILE="${{ inputs.coverage-output-dir }}/cobertura.xml"
+              if [ -f "$COVERAGE_FILE" ]; then
+                echo "✅ Coverage report generated: $COVERAGE_FILE"
+                echo "coverage_file=$COVERAGE_FILE" >> $GITHUB_OUTPUT
+              else
+                echo "⚠️ Coverage file not found"
+                echo "coverage_file=" >> $GITHUB_OUTPUT
+              fi
+
+        - name: 📋 Summary
+          shell: bash
+          run: |
+              cat >> $GITHUB_STEP_SUMMARY << EOF
+              ## 🦀 Rust CI Summary
+
+              | Check | Result |
+              |-------|--------|
+              | Toolchain | \`${{ inputs.toolchain }}\` |
+              EOF
+
+              if [ "${{ inputs.run-buf-lint }}" = "true" ]; then
+                echo "| Proto Lint (buf) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+              fi
+
+              if [ "${{ inputs.run-fmt }}" = "true" ]; then
+                echo "| Format (rustfmt) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "| Format (rustfmt) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+              fi
+
+              if [ "${{ inputs.run-clippy }}" = "true" ]; then
+                echo "| Lints (clippy) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "| Lints (clippy) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+              fi
+
+              if [ "${{ inputs.run-tests }}" = "true" ]; then
+                echo "| Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "| Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+              fi
+
+              if [ "${{ inputs.run-build }}" = "true" ]; then
+                MODE="${{ inputs.build-release == 'true' && 'release' || 'debug' }}"
+                echo "| Build ($MODE) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "| Build | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+              fi
+
+              if [ "${{ inputs.coverage }}" = "true" ]; then
+                echo "| Coverage | ✅ Generated |" >> $GITHUB_STEP_SUMMARY
+              fi
+
+              # Show workspace info if applicable
+              if [ "${{ inputs.workspace }}" = "true" ] || [ -n "${{ inputs.packages }}" ]; then
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "### Workspace Configuration" >> $GITHUB_STEP_SUMMARY
+                if [ "${{ inputs.workspace }}" = "true" ]; then
+                  echo "- Mode: Full workspace" >> $GITHUB_STEP_SUMMARY
+                fi
+                if [ -n "${{ inputs.packages }}" ]; then
+                  echo "- Packages: \`${{ inputs.packages }}\`" >> $GITHUB_STEP_SUMMARY
+                fi
+                if [ -n "${{ inputs.exclude-packages }}" ]; then
+                  echo "- Excluded: \`${{ inputs.exclude-packages }}\`" >> $GITHUB_STEP_SUMMARY
+                fi
+                if [ -n "${{ inputs.pre-build-packages }}" ]; then
+                  echo "- Pre-built: \`${{ inputs.pre-build-packages }}\`" >> $GITHUB_STEP_SUMMARY
+                fi
+              fi

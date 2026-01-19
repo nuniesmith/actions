@@ -23,11 +23,13 @@ Looking for ready-to-use workflows? Check out our **[Workflow Templates](../temp
 | [discord-notify](#discord-notify) | Send rich embed notifications to Discord |
 | [tailscale-connect](#tailscale-connect) | Connect to Tailscale network and verify connectivity |
 | [docker-build-push](#docker-build-push) | Build and push multi-arch Docker images |
-| [rust-ci](#rust-ci) | Complete Rust CI pipeline with caching |
+| [rust-ci](#rust-ci) | Complete Rust CI pipeline with caching, protobuf, and workspace support |
 | [setup-rust](#setup-rust) | Setup Rust toolchain with protobuf and caching |
 | [kotlin-ci](#kotlin-ci) | Kotlin/KMP CI pipeline with Gradle |
 | [ssh-deploy](#ssh-deploy) | Deploy to remote server via SSH over Tailscale |
 | [llm-audit](#llm-audit) | LLM-powered code audits (xAI, Anthropic, Google) |
+| [cloudflare-dns-update](#cloudflare-dns-update) | Create or update Cloudflare DNS records |
+| [ssl-certbot-cloudflare](#ssl-certbot-cloudflare) | Generate SSL certificates with Let's Encrypt via Cloudflare DNS-01 |
 
 ---
 
@@ -154,7 +156,7 @@ Build and push multi-architecture Docker images to a registry.
 
 ## rust-ci
 
-Complete Rust CI pipeline with caching, linting, testing, and building.
+Complete Rust CI pipeline with caching, linting, testing, building, and optional protobuf/workspace support.
 
 ### Usage
 
@@ -170,11 +172,29 @@ Complete Rust CI pipeline with caching, linting, testing, and building.
     coverage: "true"
 ```
 
+### Advanced Usage (Workspace with Protobuf)
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/rust-ci@main
+  with:
+    toolchain: "1.92.0"
+    workspace: "true"
+    pre-build-packages: "my-proto-crate"
+    install-protobuf: "true"
+    install-buf: "true"
+    run-buf-lint: "true"
+    run-buf-breaking: "true"
+    proto-directory: "proto"
+    clippy-args: "--workspace --lib -- -D warnings"
+    test-lib-only: "true"
+    test-integration: "true"
+```
+
 ### Inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `toolchain` | No | `stable` | Rust toolchain (`stable`, `beta`, `nightly`) |
+| `toolchain` | No | `stable` | Rust toolchain (`stable`, `beta`, `nightly`, or version) |
 | `components` | No | `rustfmt, clippy` | Additional components |
 | `targets` | No | `''` | Additional targets to install |
 | `run-fmt` | No | `true` | Run `cargo fmt` check |
@@ -182,15 +202,30 @@ Complete Rust CI pipeline with caching, linting, testing, and building.
 | `run-tests` | No | `true` | Run `cargo test` |
 | `run-build` | No | `true` | Run `cargo build` |
 | `build-release` | No | `true` | Build in release mode |
-| `clippy-args` | No | `--all-targets --all-features -- -D warnings` | Additional clippy arguments |
-| `test-args` | No | `--verbose` | Additional test arguments |
-| `build-args` | No | `--verbose` | Additional build arguments |
+| `clippy-args` | No | `--all-targets --all-features -- -D warnings` | Clippy arguments |
+| `test-args` | No | `--verbose` | Test arguments |
+| `build-args` | No | `--verbose` | Build arguments |
 | `features` | No | `''` | Features to enable |
 | `all-features` | No | `false` | Enable all features |
 | `no-default-features` | No | `false` | Disable default features |
 | `working-directory` | No | `.` | Working directory |
-| `coverage` | No | `false` | Generate code coverage with cargo-tarpaulin |
+| `coverage` | No | `false` | Generate code coverage |
 | `coverage-output-dir` | No | `./coverage` | Coverage output directory |
+| `workspace` | No | `false` | Build/test entire workspace |
+| `packages` | No | `''` | Specific packages to build/test |
+| `exclude-packages` | No | `''` | Packages to exclude |
+| `install-protobuf` | No | `false` | Install protobuf compiler |
+| `install-buf` | No | `false` | Install buf CLI |
+| `run-buf-lint` | No | `false` | Run buf lint on proto files |
+| `run-buf-breaking` | No | `false` | Run buf breaking change detection |
+| `proto-directory` | No | `proto` | Directory containing proto files |
+| `buf-breaking-against` | No | `.git#branch=main` | Git ref for breaking check |
+| `pre-build-packages` | No | `''` | Packages to build first |
+| `test-lib-only` | No | `false` | Run only library tests |
+| `test-integration` | No | `false` | Run integration tests separately |
+| `install-system-deps` | No | `false` | Install common system dependencies |
+| `additional-apt-packages` | No | `''` | Additional apt packages |
+| `cache-key-suffix` | No | `rust-ci` | Cache key suffix |
 
 ### Outputs
 
@@ -201,6 +236,151 @@ Complete Rust CI pipeline with caching, linting, testing, and building.
 | `test-result` | Result of tests |
 | `build-result` | Result of build |
 | `coverage-file` | Path to coverage file |
+| `buf-lint-result` | Result of buf lint |
+
+---
+
+## cloudflare-dns-update
+
+Create or update Cloudflare DNS A records. Supports updating multiple records in a single action.
+
+### Usage
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/cloudflare-dns-update@main
+  with:
+    api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+    zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+    record-name: example.com
+    record-content: 100.64.0.1
+```
+
+### Usage with Multiple Records
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/cloudflare-dns-update@main
+  with:
+    api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+    zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+    record-name: example.com
+    record-content: 100.64.0.1
+    additional-records: '[{"name": "www.example.com"}, {"name": "api.example.com", "content": "100.64.0.2"}]'
+```
+
+### Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `api-token` | Yes | - | Cloudflare API token with DNS edit permissions |
+| `zone-id` | Yes | - | Cloudflare Zone ID |
+| `record-name` | Yes | - | DNS record name (e.g., `example.com`) |
+| `record-content` | Yes | - | IP address for the DNS record |
+| `record-type` | No | `A` | DNS record type |
+| `ttl` | No | `1` | TTL in seconds (1 = automatic) |
+| `proxied` | No | `false` | Whether to proxy through Cloudflare |
+| `additional-records` | No | `[]` | JSON array of additional records |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `updated` | Whether the DNS record was updated |
+| `record-id` | The Cloudflare record ID |
+| `records-updated` | Number of records updated |
+
+---
+
+## ssl-certbot-cloudflare
+
+Generate SSL certificates using Let's Encrypt with Cloudflare DNS-01 challenge. Supports automatic fallback to self-signed certificates if Let's Encrypt fails (rate limits, missing credentials, etc.). Optionally deploy certificates to a remote server.
+
+### Usage (Generate Only)
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+  with:
+    domain: example.com
+    additional-domains: "www.example.com,api.example.com"
+    cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+    email: admin@example.com
+```
+
+### Usage with Self-Signed Fallback
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+  with:
+    domain: example.com
+    additional-domains: "www.example.com"
+    cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+    email: admin@example.com
+    fallback-to-self-signed: "true"
+    self-signed-days: "365"
+```
+
+### Usage with Deployment
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+  with:
+    domain: example.com
+    additional-domains: "www.example.com"
+    cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+    email: admin@example.com
+    fallback-to-self-signed: "true"
+    deploy-to-server: "true"
+    ssh-host: ${{ secrets.PROD_IP }}
+    ssh-user: actions
+    ssh-key: ${{ secrets.PROD_SSH_KEY }}
+    docker-volume-name: my_ssl_certs
+```
+
+### Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `domain` | Yes | - | Primary domain for the certificate |
+| `additional-domains` | No | `''` | Additional domains (comma-separated) |
+| `cloudflare-api-token` | No | `''` | Cloudflare API token with DNS edit permissions |
+| `email` | Yes | - | Email for Let's Encrypt notifications |
+| `propagation-seconds` | No | `60` | DNS propagation wait time |
+| `staging` | No | `false` | Use Let's Encrypt staging server |
+| `fallback-to-self-signed` | No | `false` | Generate self-signed certs if Let's Encrypt fails |
+| `self-signed-days` | No | `365` | Validity period for self-signed certificates |
+| `deploy-to-server` | No | `false` | Deploy certificates to remote server |
+| `ssh-host` | No | `''` | SSH host for deployment |
+| `ssh-port` | No | `22` | SSH port |
+| `ssh-user` | No | `actions` | SSH username |
+| `ssh-key` | No | `''` | SSH private key |
+| `docker-volume-name` | No | `certbot_certs` | Docker volume for certificates |
+| `docker-username` | No | `''` | Docker Hub username (avoid rate limits) |
+| `docker-token` | No | `''` | Docker Hub token |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `cert-ready` | Whether certificates were generated |
+| `cert-type` | Type of certificate: `letsencrypt` or `self-signed` |
+| `cert-path` | Path to the certificate directory |
+| `expiry-date` | Certificate expiry date |
+| `deployed` | Whether certificates were deployed |
+
+### Self-Signed Fallback Behavior
+
+When `fallback-to-self-signed: "true"` is set, the action will generate self-signed certificates if:
+
+1. **Cloudflare API token is missing** - No credentials provided
+2. **Let's Encrypt rate limits** - Too many certificate requests
+3. **DNS propagation failures** - Cloudflare DNS-01 challenge fails
+4. **Any certbot error** - Network issues, invalid credentials, etc.
+
+The self-signed certificates:
+- Use the same directory structure as Let's Encrypt (compatible with nginx configs)
+- Include all specified domains in the SAN (Subject Alternative Name)
+- Are valid for the configured number of days (default: 365)
+- Will cause browser security warnings (expected for self-signed)
+- Are automatically replaced with real Let's Encrypt certs on the next successful run
 
 ---
 
@@ -304,8 +484,40 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-  deploy:
+  infrastructure:
     needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🔌 Connect to Tailscale
+        uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          target-ip: ${{ secrets.PROD_IP }}
+
+      - name: 🌐 Update DNS
+        uses: nuniesmith/actions/.github/actions/cloudflare-dns-update@main
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+          zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          record-name: myapp.example.com
+          record-content: ${{ secrets.PROD_IP }}
+
+      - name: 🔐 Generate SSL Certificates
+        uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+        with:
+          domain: myapp.example.com
+          cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+          email: admin@example.com
+          deploy-to-server: "true"
+          ssh-host: ${{ secrets.PROD_IP }}
+          ssh-key: ${{ secrets.PROD_SSH_KEY }}
+
+  deploy:
+    needs: infrastructure
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
@@ -352,6 +564,9 @@ For a complete setup, you'll need these repository secrets:
 | `PROD_SSH_PORT` | SSH port (default: `22`) |
 | `DOCKER_USERNAME` | Docker Hub username |
 | `DOCKER_TOKEN` | Docker Hub access token |
+| `CLOUDFLARE_API_KEY` | Cloudflare API token (DNS edit permissions) |
+| `CLOUDFLARE_ZONE_ID` | Cloudflare Zone ID |
+| `SSL_EMAIL` | Email for Let's Encrypt certificates |
 | `DISCORD_WEBHOOK` | Discord webhook URL (optional) |
 
 ---

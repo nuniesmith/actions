@@ -1,0 +1,420 @@
+name: "SSL Certbot Cloudflare"
+description: "Generate SSL certificates using Certbot with Cloudflare DNS-01 challenge, with optional self-signed fallback and remote server deployment"
+author: "nuniesmith"
+
+branding:
+    icon: "lock"
+    color: "green"
+
+inputs:
+    domain:
+        description: "Primary domain for the certificate"
+        required: true
+    additional-domains:
+        description: 'Additional domains (comma-separated, e.g., "www.example.com,api.example.com")'
+        required: false
+        default: ""
+    cloudflare-api-token:
+        description: "Cloudflare API token with DNS edit permissions"
+        required: false
+        default: ""
+    email:
+        description: "Email address for Let's Encrypt notifications"
+        required: true
+    propagation-seconds:
+        description: "Seconds to wait for DNS propagation"
+        required: false
+        default: "60"
+    staging:
+        description: "Use Let's Encrypt staging server (for testing)"
+        required: false
+        default: "false"
+    fallback-to-self-signed:
+        description: "Generate self-signed certificates if Let's Encrypt fails (rate limits, missing credentials, etc.)"
+        required: false
+        default: "false"
+    self-signed-days:
+        description: "Validity period for self-signed certificates in days"
+        required: false
+        default: "365"
+    deploy-to-server:
+        description: "Deploy certificates to a remote server"
+        required: false
+        default: "false"
+    ssh-host:
+        description: "SSH host for certificate deployment"
+        required: false
+        default: ""
+    ssh-port:
+        description: "SSH port for certificate deployment"
+        required: false
+        default: "22"
+    ssh-user:
+        description: "SSH user for certificate deployment"
+        required: false
+        default: "actions"
+    ssh-key:
+        description: "SSH private key for certificate deployment"
+        required: false
+        default: ""
+    docker-volume-name:
+        description: "Docker volume name to store certificates on remote server"
+        required: false
+        default: "certbot_certs"
+    docker-username:
+        description: "Docker Hub username (to avoid rate limits)"
+        required: false
+        default: ""
+    docker-token:
+        description: "Docker Hub token (to avoid rate limits)"
+        required: false
+        default: ""
+
+outputs:
+    cert-ready:
+        description: "Whether certificates were successfully generated"
+        value: ${{ steps.certbot.outputs.cert_ready }}
+    cert-type:
+        description: "Type of certificate generated (letsencrypt or self-signed)"
+        value: ${{ steps.certbot.outputs.cert_type }}
+    cert-path:
+        description: "Path to the certificate directory"
+        value: ${{ steps.certbot.outputs.cert_path }}
+    expiry-date:
+        description: "Certificate expiry date"
+        value: ${{ steps.certbot.outputs.expiry_date }}
+    deployed:
+        description: "Whether certificates were deployed to the server"
+        value: ${{ steps.deploy.outputs.deployed }}
+
+runs:
+    using: "composite"
+    steps:
+        - name: 🔐 Generate SSL Certificates
+          id: certbot
+          shell: bash
+          env:
+              CF_API_TOKEN: ${{ inputs.cloudflare-api-token }}
+              SSL_EMAIL: ${{ inputs.email }}
+              DOMAIN: ${{ inputs.domain }}
+              ADDITIONAL_DOMAINS: ${{ inputs.additional-domains }}
+              PROPAGATION_SECONDS: ${{ inputs.propagation-seconds }}
+              USE_STAGING: ${{ inputs.staging }}
+              FALLBACK_SELF_SIGNED: ${{ inputs.fallback-to-self-signed }}
+              SELF_SIGNED_DAYS: ${{ inputs.self-signed-days }}
+          run: |
+              echo "🔐 Generating SSL certificates..."
+
+              # Create temp directory for certs
+              mkdir -p /tmp/letsencrypt
+
+              # Build SAN list for self-signed fallback
+              SAN_LIST="DNS:$DOMAIN"
+              ALL_DOMAINS="$DOMAIN"
+              if [ -n "$ADDITIONAL_DOMAINS" ]; then
+                IFS=',' read -ra EXTRA_DOMAINS <<< "$ADDITIONAL_DOMAINS"
+                for extra in "${EXTRA_DOMAINS[@]}"; do
+                  extra=$(echo "$extra" | xargs)
+                  if [ -n "$extra" ]; then
+                    SAN_LIST="$SAN_LIST,DNS:$extra"
+                    ALL_DOMAINS="$ALL_DOMAINS,$extra"
+                  fi
+                done
+              fi
+
+              # Function to generate self-signed certificates
+              generate_self_signed() {
+                echo "🔒 Generating self-signed certificates..."
+                echo "📧 Email: $SSL_EMAIL"
+                echo "🌐 Domains: $ALL_DOMAINS"
+
+                # Create directory structure matching Let's Encrypt
+                sudo mkdir -p /tmp/letsencrypt/live/$DOMAIN
+                sudo mkdir -p /tmp/letsencrypt/archive/$DOMAIN
+
+                # Generate self-signed certificate using openssl
+                docker run --rm \
+                  -v /tmp/letsencrypt:/etc/letsencrypt \
+                  alpine/openssl \
+                  req -x509 -nodes -days $SELF_SIGNED_DAYS -newkey rsa:2048 \
+                  -keyout /etc/letsencrypt/archive/$DOMAIN/privkey1.pem \
+                  -out /etc/letsencrypt/archive/$DOMAIN/fullchain1.pem \
+                  -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN" \
+                  -addext "subjectAltName=$SAN_LIST"
+
+                # Create symlinks like Let's Encrypt does
+                sudo ln -sf ../../archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/fullchain.pem
+                sudo ln -sf ../../archive/$DOMAIN/privkey1.pem /tmp/letsencrypt/live/$DOMAIN/privkey.pem
+                sudo ln -sf ../../archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/cert.pem
+                sudo ln -sf ../../archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/chain.pem
+
+                # Verify self-signed cert was created
+                if sudo test -f "/tmp/letsencrypt/live/$DOMAIN/fullchain.pem"; then
+                  echo "✅ Self-signed certificates generated successfully"
+                  echo "cert_ready=true" >> $GITHUB_OUTPUT
+                  echo "cert_type=self-signed" >> $GITHUB_OUTPUT
+                  echo "cert_path=/tmp/letsencrypt/live/$DOMAIN" >> $GITHUB_OUTPUT
+
+                  # Get expiry date
+                  EXPIRY=$(docker run --rm \
+                    -v /tmp/letsencrypt:/etc/letsencrypt:ro \
+                    alpine/openssl \
+                    x509 -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2 || echo "unknown")
+                  echo "expiry_date=$EXPIRY" >> $GITHUB_OUTPUT
+                  echo "📅 Certificate expires: $EXPIRY"
+                  return 0
+                else
+                  echo "❌ Failed to generate self-signed certificates"
+                  echo "cert_ready=false" >> $GITHUB_OUTPUT
+                  return 1
+                fi
+              }
+
+              # Check if Cloudflare API token is set
+              if [ -z "$CF_API_TOKEN" ]; then
+                echo "⚠️ Cloudflare API token not provided"
+                if [ "$FALLBACK_SELF_SIGNED" = "true" ]; then
+                  echo "📜 Falling back to self-signed certificates..."
+                  generate_self_signed
+                  exit $?
+                else
+                  echo "❌ Error: CLOUDFLARE_API_KEY required (or enable fallback-to-self-signed)"
+                  echo "cert_ready=false" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+              fi
+
+              echo "✅ Cloudflare API token found"
+              echo "📧 Using email: $SSL_EMAIL"
+              echo "🌐 Primary domain: $DOMAIN"
+
+              # Create Cloudflare credentials file
+              echo "dns_cloudflare_api_token = $CF_API_TOKEN" > /tmp/cloudflare.ini
+              chmod 600 /tmp/cloudflare.ini
+
+              # Verify credentials file was created correctly
+              if [ ! -s /tmp/cloudflare.ini ]; then
+                echo "❌ Error: Failed to create credentials file"
+                if [ "$FALLBACK_SELF_SIGNED" = "true" ]; then
+                  echo "📜 Falling back to self-signed certificates..."
+                  generate_self_signed
+                  exit $?
+                else
+                  echo "cert_ready=false" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+              fi
+
+              # Build domain arguments
+              DOMAIN_ARGS="-d $DOMAIN"
+              if [ -n "$ADDITIONAL_DOMAINS" ]; then
+                IFS=',' read -ra EXTRA_DOMAINS <<< "$ADDITIONAL_DOMAINS"
+                for extra in "${EXTRA_DOMAINS[@]}"; do
+                  extra=$(echo "$extra" | xargs)
+                  if [ -n "$extra" ]; then
+                    DOMAIN_ARGS="$DOMAIN_ARGS -d $extra"
+                    echo "🌐 Additional domain: $extra"
+                  fi
+                done
+              fi
+
+              # Add staging flag if requested
+              STAGING_FLAG=""
+              if [ "$USE_STAGING" = "true" ]; then
+                STAGING_FLAG="--staging"
+                echo "⚠️ Using Let's Encrypt STAGING server (certificates will NOT be trusted)"
+              fi
+
+              # Run certbot with DNS-01 challenge
+              set +e
+              docker run --rm \
+                -v /tmp/letsencrypt:/etc/letsencrypt \
+                -v /tmp/cloudflare.ini:/tmp/cloudflare.ini:ro \
+                certbot/dns-cloudflare:latest \
+                certonly \
+                --dns-cloudflare \
+                --dns-cloudflare-credentials /tmp/cloudflare.ini \
+                --dns-cloudflare-propagation-seconds $PROPAGATION_SECONDS \
+                --email "$SSL_EMAIL" \
+                --agree-tos \
+                --no-eff-email \
+                --non-interactive \
+                --keep-until-expiring \
+                $STAGING_FLAG \
+                $DOMAIN_ARGS
+              CERTBOT_EXIT=$?
+              set -e
+
+              # Cleanup credentials immediately
+              rm -f /tmp/cloudflare.ini
+
+              # Debug: show what was created
+              echo "📁 Checking certificate directory..."
+              sudo ls -la /tmp/letsencrypt/ 2>/dev/null || true
+              sudo ls -la /tmp/letsencrypt/live/ 2>/dev/null || true
+              sudo ls -la /tmp/letsencrypt/live/$DOMAIN/ 2>/dev/null || true
+
+              # Check if certs were created/renewed
+              if sudo test -f "/tmp/letsencrypt/live/$DOMAIN/fullchain.pem"; then
+                echo "✅ Let's Encrypt certificates obtained successfully"
+                echo "cert_ready=true" >> $GITHUB_OUTPUT
+                echo "cert_type=letsencrypt" >> $GITHUB_OUTPUT
+                echo "cert_path=/tmp/letsencrypt/live/$DOMAIN" >> $GITHUB_OUTPUT
+
+                # Get expiry date
+                EXPIRY=$(docker run --rm \
+                  -v /tmp/letsencrypt:/etc/letsencrypt:ro \
+                  alpine/openssl \
+                  x509 -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2 || echo "unknown")
+                echo "expiry_date=$EXPIRY" >> $GITHUB_OUTPUT
+                echo "📅 Certificate expires: $EXPIRY"
+              else
+                echo "⚠️ Let's Encrypt failed (exit code: $CERTBOT_EXIT)"
+
+                if [ "$FALLBACK_SELF_SIGNED" = "true" ]; then
+                  echo "📜 Falling back to self-signed certificates..."
+                  generate_self_signed
+                  exit $?
+                else
+                  echo "❌ Certificate generation failed and self-signed fallback is disabled"
+                  echo "cert_ready=false" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+              fi
+
+        - name: 📦 Package Certificates
+          if: steps.certbot.outputs.cert_ready == 'true'
+          shell: bash
+          env:
+              DOMAIN: ${{ inputs.domain }}
+          run: |
+              echo "📦 Packaging certificates for transfer..."
+              echo "📜 Certificate type: ${{ steps.certbot.outputs.cert_type }}"
+
+              # Create tarball of certificates
+              cd /tmp/letsencrypt
+              sudo tar -czf /tmp/ssl-certs.tar.gz \
+                live/$DOMAIN \
+                archive/$DOMAIN \
+                renewal/$DOMAIN.conf 2>/dev/null || \
+              sudo tar -czf /tmp/ssl-certs.tar.gz \
+                live/$DOMAIN \
+                archive/$DOMAIN
+
+              echo "✅ Certificates packaged"
+              ls -la /tmp/ssl-certs.tar.gz
+
+        - name: 🚀 Deploy Certificates to Server
+          id: deploy
+          if: steps.certbot.outputs.cert_ready == 'true' && inputs.deploy-to-server == 'true'
+          shell: bash
+          env:
+              SSH_KEY: ${{ inputs.ssh-key }}
+              SSH_HOST: ${{ inputs.ssh-host }}
+              SSH_PORT: ${{ inputs.ssh-port }}
+              SSH_USER: ${{ inputs.ssh-user }}
+              DOCKER_VOLUME: ${{ inputs.docker-volume-name }}
+              DOCKER_USER: ${{ inputs.docker-username }}
+              DOCKER_TOKEN: ${{ inputs.docker-token }}
+              DOMAIN: ${{ inputs.domain }}
+              CERT_TYPE: ${{ steps.certbot.outputs.cert_type }}
+          run: |
+              echo "🚀 Deploying certificates to server..."
+              echo "📜 Certificate type: $CERT_TYPE"
+
+              if [ -z "$SSH_HOST" ] || [ -z "$SSH_KEY" ]; then
+                echo "❌ SSH host or key not provided for deployment"
+                echo "deployed=false" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+
+              # Setup SSH
+              mkdir -p ~/.ssh
+              echo "$SSH_KEY" > ~/.ssh/id_rsa
+              chmod 600 ~/.ssh/id_rsa
+              ssh-keyscan -p $SSH_PORT $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+              # Copy certificates to server
+              scp -P $SSH_PORT /tmp/ssl-certs.tar.gz $SSH_USER@$SSH_HOST:/tmp/ssl-certs.tar.gz
+
+              # Build docker login command if credentials provided
+              DOCKER_LOGIN_CMD=""
+              if [ -n "$DOCKER_USER" ] && [ -n "$DOCKER_TOKEN" ]; then
+                DOCKER_LOGIN_CMD="echo '$DOCKER_TOKEN' | docker login -u '$DOCKER_USER' --password-stdin 2>/dev/null && echo '✅ Logged in to Docker Hub' || echo '⚠️ Docker login failed, continuing...'"
+              fi
+
+              # Extract to Docker volume on server
+              ssh -p $SSH_PORT $SSH_USER@$SSH_HOST "
+                set -e
+                echo '📦 Extracting certificates on server...'
+
+                # Docker login if credentials provided
+                $DOCKER_LOGIN_CMD
+
+                # Create volume if it doesn't exist
+                docker volume create $DOCKER_VOLUME 2>/dev/null || true
+
+                # Use busybox for extraction
+                docker run --rm \
+                  -v /tmp/ssl-certs.tar.gz:/tmp/ssl-certs.tar.gz:ro \
+                  -v $DOCKER_VOLUME:/etc/letsencrypt \
+                  busybox:latest \
+                  sh -c 'cd /etc/letsencrypt && tar -xzf /tmp/ssl-certs.tar.gz && chmod -R 755 /etc/letsencrypt && chmod 600 /etc/letsencrypt/archive/*/privkey*.pem 2>/dev/null || true'
+
+                # Cleanup
+                rm -f /tmp/ssl-certs.tar.gz
+
+                # Verify
+                echo '✅ Certificates deployed to Docker volume: $DOCKER_VOLUME'
+                docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest ls -la /etc/letsencrypt/live/
+              "
+
+              # Cleanup local SSH key
+              rm -f ~/.ssh/id_rsa
+
+              echo "✅ SSL certificates deployed to production"
+              echo "deployed=true" >> $GITHUB_OUTPUT
+
+        - name: 📋 SSL Summary
+          if: always()
+          shell: bash
+          env:
+              CERT_READY: ${{ steps.certbot.outputs.cert_ready }}
+              CERT_TYPE: ${{ steps.certbot.outputs.cert_type }}
+              DEPLOYED: ${{ steps.deploy.outputs.deployed }}
+              DOMAIN: ${{ inputs.domain }}
+              EXPIRY: ${{ steps.certbot.outputs.expiry_date }}
+              DOCKER_VOLUME: ${{ inputs.docker-volume-name }}
+          run: |
+              echo "## 🔐 SSL Certificate Status" >> $GITHUB_STEP_SUMMARY
+
+              if [ "$CERT_READY" == "true" ]; then
+                if [ "$CERT_TYPE" == "letsencrypt" ]; then
+                  echo "✅ **Let's Encrypt** certificates generated for \`$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "⚠️ **Self-signed** certificates generated for \`$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "> **Note:** Using self-signed certs due to Let's Encrypt failure (rate limits, credentials, etc.)" >> $GITHUB_STEP_SUMMARY
+                  echo "> Browsers will show a security warning. Real certs will be obtained on next successful run." >> $GITHUB_STEP_SUMMARY
+                fi
+
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "📅 **Expires:** $EXPIRY" >> $GITHUB_STEP_SUMMARY
+
+                if [ "$DEPLOYED" == "true" ]; then
+                  echo "✅ **Deployed** to Docker volume: \`$DOCKER_VOLUME\`" >> $GITHUB_STEP_SUMMARY
+                elif [ "${{ inputs.deploy-to-server }}" == "true" ]; then
+                  echo "❌ **Deployment failed**" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "⏭️ **Deployment skipped** (not requested)" >> $GITHUB_STEP_SUMMARY
+                fi
+
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+                echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+                echo "| Type | \`$CERT_TYPE\` |" >> $GITHUB_STEP_SUMMARY
+                echo "| Domain | \`$DOMAIN\` |" >> $GITHUB_STEP_SUMMARY
+                echo "| Volume | \`$DOCKER_VOLUME\` |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "❌ Certificate generation failed" >> $GITHUB_STEP_SUMMARY
+              fi
