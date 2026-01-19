@@ -54,7 +54,7 @@ permissions:
     checks: write
 
 env:
-    RUST_VERSION: "1.87.0"
+    RUST_VERSION: "1.92.0"
     CARGO_TERM_COLOR: always
     REDIS_URL: redis://localhost:6379/0
     REGISTRY: docker.io
@@ -154,6 +154,31 @@ jobs:
                       type=raw,value=${{ matrix.service.name }}-${{ github.sha }}
                       type=raw,value=${{ matrix.service.name }}-${{ needs.setup.outputs.deploy_env }}
                   build-args: ${{ matrix.service.build_args }}
+                  target: ${{ matrix.service.target }}
+
+            - name: 🔍 Verify Image Contents
+              run: |
+                  echo "🔍 Verifying ${{ matrix.service.name }} image contents..."
+                  IMAGE="${{ env.IMAGE_NAME }}:${{ matrix.service.name }}-latest"
+
+                  # Pull the image we just pushed
+                  docker pull "$IMAGE"
+
+                  # List contents of /app directory
+                  echo "📁 Contents of /app:"
+                  docker run --rm --entrypoint ls "$IMAGE" -la /app
+
+                  # Verify the service binary exists and is executable
+                  echo "🔎 Checking /app/service binary:"
+                  docker run --rm --entrypoint file "$IMAGE" /app/service || true
+
+                  # Try to get version/help from the binary (if supported)
+                  echo "📋 Binary info:"
+                  docker run --rm "$IMAGE" --version 2>/dev/null || \
+                  docker run --rm "$IMAGE" --help 2>/dev/null | head -5 || \
+                  echo "Note: Binary does not support --version or --help flags"
+
+                  echo "✅ Image verification complete for ${{ matrix.service.name }}"
 
     # =========================================================================
     # STAGE 3: INFRASTRUCTURE SETUP
@@ -427,9 +452,9 @@ jobs:
                         git clone https://github.com/nuniesmith/fks.git ~/fks
                       fi
 
-                      # Ensure Docker volumes
+                      # Ensure Docker volumes (must match docker-compose.yml external volumes)
                       echo "📦 Ensuring Docker volumes..."
-                      for vol in fks_certbot_www fks_certbot_conf fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data; do
+                      for vol in fks_certbot_certs fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions; do
                         docker volume create $vol 2>/dev/null || true
                       done
                       echo "✅ Volumes ready"
@@ -442,7 +467,7 @@ jobs:
                       # Docker login
                       echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
 
-                      # Environment setup
+                      # Environment setup - create .env if missing
                       [ ! -f .env ] && touch .env
 
                       # Ensure required env vars
@@ -452,6 +477,8 @@ jobs:
                       }
 
                       ensure_env "POSTGRES_PASSWORD" "$(openssl rand -hex 16)"
+                      ensure_env "POSTGRES_USER" "fks_user"
+                      ensure_env "POSTGRES_DB" "fks"
                       ensure_env "REDIS_PASSWORD" "$(openssl rand -hex 16)"
                       ensure_env "QUESTDB_PASSWORD" "$(openssl rand -hex 16)"
                       ensure_env "GRAFANA_PASSWORD" "$(openssl rand -hex 16)"
@@ -465,33 +492,72 @@ jobs:
 
                       set -a && source .env && set +a
 
-                      COMPOSE_CMD="docker compose -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
+                      # Make run.sh executable
+                      chmod +x ./run.sh 2>/dev/null || true
 
-                      # Stop existing
-                      echo "🛑 Stopping containers..."
-                      $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
+                      # Use run.sh prod start for deployment (syntax: ./run.sh prod <command>)
+                      echo "🚀 Starting services with run.sh prod start..."
+                      if [ -x "./run.sh" ]; then
+                        # Stop existing containers first
+                        ./run.sh prod down 2>/dev/null || true
 
-                      # Pull images
-                      echo "📥 Pulling images..."
-                      for svc in janus execution; do
-                        docker pull ${REGISTRY}/${IMAGE_NAME}:${svc}-latest 2>&1 | tail -1 || echo "⚠️ ${svc} pull failed"
-                      done
+                        # Pull production images
+                        echo "📥 Pulling production images..."
+                        docker compose --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml pull --ignore-pull-failures 2>&1 || true
 
-                      # Start
-                      echo "🚀 Starting containers..."
-                      $COMPOSE_CMD up -d 2>&1
+                        # Start with run.sh (handles volumes, env, dependencies)
+                        ./run.sh prod start 2>&1
+                      else
+                        # Fallback to direct docker compose if run.sh not available
+                        echo "⚠️ run.sh not found, using direct docker compose..."
+                        COMPOSE_CMD="docker compose --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
 
-                      # Wait and check
-                      echo "⏳ Waiting for containers..."
-                      sleep 15
+                        # Stop existing
+                        echo "🛑 Stopping containers..."
+                        $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
 
+                        # Pull all images (including infrastructure)
+                        echo "📥 Pulling images..."
+                        $COMPOSE_CMD pull --ignore-pull-failures 2>&1 || true
+
+                        # Start services
+                        echo "🚀 Starting containers..."
+                        $COMPOSE_CMD up -d 2>&1
+                      fi
+
+                      # Wait for services to start
+                      echo "⏳ Waiting for services to initialize..."
+                      sleep 30
+
+                      # Check running containers
                       RUNNING=$(docker ps --filter "name=fks" --format '{{.Names}}' | wc -l)
                       echo "✅ Running: $RUNNING containers"
 
-                      if [ "$RUNNING" -eq 0 ]; then
-                        echo "❌ No containers running!"
-                        docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -10
-                        exit 1
+                      # Show container status
+                      echo ""
+                      echo "📊 Container Status:"
+                      docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -20
+
+                      # Check for critical services
+                      CRITICAL_SERVICES="fks_postgres fks_redis fks_questdb fks_prometheus"
+                      MISSING=""
+                      for svc in $CRITICAL_SERVICES; do
+                        if ! docker ps --format '{{.Names}}' | grep -q "^${svc}$"; then
+                          MISSING="$MISSING $svc"
+                        fi
+                      done
+
+                      if [ -n "$MISSING" ]; then
+                        echo ""
+                        echo "⚠️ Warning: Some critical services may not be running:$MISSING"
+                        echo "Check logs with: docker logs <container_name>"
+                      fi
+
+                      if [ "$RUNNING" -lt 6 ]; then
+                        echo ""
+                        echo "⚠️ Warning: Only $RUNNING containers running (expected 10+)"
+                        echo "Checking failed containers..."
+                        docker ps -a --filter "name=fks" --filter "status=exited" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
                       fi
 
                   post-deploy-command: |
