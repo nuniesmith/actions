@@ -27,6 +27,7 @@ Looking for ready-to-use workflows? Check out our **[Workflow Templates](../temp
 | [setup-rust](#setup-rust) | Setup Rust toolchain with protobuf and caching |
 | [kotlin-ci](#kotlin-ci) | Kotlin/KMP CI pipeline with Gradle |
 | [ssh-deploy](#ssh-deploy) | Deploy to remote server via SSH over Tailscale |
+| [health-check](#health-check) | Verify deployment health via HTTP, Docker containers, and custom commands |
 | [llm-audit](#llm-audit) | LLM-powered code audits (xAI, Anthropic, Google) |
 | [cloudflare-dns-update](#cloudflare-dns-update) | Create or update Cloudflare DNS records |
 | [ssl-certbot-cloudflare](#ssl-certbot-cloudflare) | Generate SSL certificates with Let's Encrypt via Cloudflare DNS-01 |
@@ -435,6 +436,85 @@ Deploy to a remote server via SSH over Tailscale. Supports Docker Compose deploy
 | `deployed` | Whether deployment was successful |
 | `ssh-method` | SSH method used (`tailscale`/`key`/`password`) |
 | `services-started` | Services that were started |
+
+---
+
+## health-check
+
+Verify deployment health via HTTP endpoints, Docker containers, and custom commands. Supports remote health checks over SSH.
+
+### Usage
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/health-check@main
+  with:
+    endpoints: |
+      [
+        {"url": "https://example.com/health", "expected_status": 200},
+        {"url": "http://localhost:3000/api/health", "expected_status": 200}
+      ]
+    containers: "app_postgres app_redis app_api"
+    initial-delay: "30"
+    retry-count: "3"
+    retry-delay: "10"
+```
+
+### Usage with Remote Server
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/health-check@main
+  with:
+    endpoints: |
+      [
+        {"url": "https://myapp.example.com/health", "expected_status": 200}
+      ]
+    containers: "myapp_web myapp_db myapp_cache"
+    ssh-host: ${{ secrets.PROD_TAILSCALE_IP }}
+    ssh-port: "22"
+    ssh-user: actions
+    ssh-key: ${{ secrets.PROD_SSH_KEY }}
+    custom-command: "docker compose ps --status running | grep -c 'running'"
+    initial-delay: "30"
+    retry-count: "3"
+    fail-on-unhealthy: "true"
+```
+
+### Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `endpoints` | No | `[]` | JSON array of HTTP endpoints `[{url, method, expected_status, timeout}]` |
+| `containers` | No | `''` | Space-separated Docker container names to verify |
+| `ssh-host` | No | `''` | SSH host for remote health checks |
+| `ssh-port` | No | `22` | SSH port |
+| `ssh-user` | No | `actions` | SSH username |
+| `ssh-key` | No | `''` | SSH private key |
+| `custom-command` | No | `''` | Custom command (must exit 0 for success) |
+| `retry-count` | No | `3` | Number of retries for failed checks |
+| `retry-delay` | No | `10` | Delay between retries (seconds) |
+| `initial-delay` | No | `30` | Initial delay before starting checks (seconds) |
+| `timeout` | No | `10` | Timeout for each check (seconds) |
+| `fail-on-unhealthy` | No | `true` | Fail the step if any check fails |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `healthy` | Whether all health checks passed |
+| `endpoints-healthy` | Number of healthy endpoints |
+| `containers-healthy` | Number of healthy containers |
+| `failed-checks` | List of failed checks |
+
+### Endpoint Configuration
+
+Each endpoint in the JSON array can have:
+
+| Property | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `url` | Yes | - | URL to check |
+| `method` | No | `GET` | HTTP method |
+| `expected_status` | No | `200` | Expected HTTP status code |
+| `timeout` | No | (global) | Timeout for this endpoint |
 
 ---
 

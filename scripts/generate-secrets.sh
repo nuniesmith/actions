@@ -4,10 +4,12 @@
 #
 # Usage:
 #   chmod +x generate-secrets.sh
-#   sudo ./generate-secrets.sh [--ci-output]
+#   sudo ./generate-secrets.sh [--ci-output] [--env ENV]
 #
 # Options:
 #   --ci-output    Output secrets in CI-friendly format for GitHub Actions
+#   --env ENV      Environment prefix for secrets (dev, prod, staging)
+#                  Default: prod
 #
 # This script will:
 # - Generate SSH keys for the actions user
@@ -15,18 +17,44 @@
 # - Generate secure passwords and API keys
 # - Create a credentials file for GitHub Secrets
 # - Output in CI-friendly format when --ci-output is used
+# - Prefix secrets with environment name (DEV_, PROD_, STAGING_)
 
 set -e
 
 # Parse arguments
 CI_OUTPUT=false
-for arg in "$@"; do
-    case "$arg" in
+ENVIRONMENT="prod"
+while [ $# -gt 0 ]; do
+    case "$1" in
         --ci-output)
             CI_OUTPUT=true
+            shift
+            ;;
+        --env)
+            ENVIRONMENT="$2"
+            shift 2
+            ;;
+        *)
+            shift
             ;;
     esac
 done
+
+# Normalize environment name
+case "$ENVIRONMENT" in
+    dev|DEV|development)
+        ENVIRONMENT="dev"
+        ENV_PREFIX="DEV"
+        ;;
+    staging|STAGING|stage)
+        ENVIRONMENT="staging"
+        ENV_PREFIX="STAGING"
+        ;;
+    prod|PROD|production|*)
+        ENVIRONMENT="prod"
+        ENV_PREFIX="PROD"
+        ;;
+esac
 
 # Colors for output (disabled in CI mode)
 if [ "$CI_OUTPUT" = true ]; then
@@ -97,8 +125,9 @@ if ! id "actions" >/dev/null 2>&1; then
     exit 1
 fi
 
-log_header "Secrets Generation"
+log_header "Secrets Generation for ${ENV_PREFIX} Environment"
 
+log_info "Environment: $ENVIRONMENT (prefix: ${ENV_PREFIX}_)"
 log_info "Generating secure credentials..."
 printf "\n"
 
@@ -267,12 +296,17 @@ ADMIN_PASSWORD=$ADMIN_PASSWORD
 # Copy these to your GitHub repository secrets:
 # https://github.com/YOUR_USERNAME/YOUR_REPO/settings/secrets/actions
 #
-# SECRET NAME          | VALUE
-# ---------------------|--------------------------------------------------
-# PROD_SSH_KEY         | (entire SSH_PRIVATE_KEY above)
-# PROD_SSH_PORT        | $SSH_PORT
-# PROD_HOST            | ${TAILSCALE_IP:-YOUR_TAILSCALE_IP}
-# PROD_USER            | actions
+# SECRET NAME              | VALUE
+# -------------------------|--------------------------------------------------
+# ${ENV_PREFIX}_SSH_KEY    | (entire SSH_PRIVATE_KEY above)
+# ${ENV_PREFIX}_SSH_PORT   | $SSH_PORT
+# ${ENV_PREFIX}_HOST       | ${TAILSCALE_IP:-YOUR_TAILSCALE_IP}
+# ${ENV_PREFIX}_USER       | actions
+# =============================================================================
+#
+# For multiple environments, run this script with different --env flags:
+#   sudo ./generate-secrets.sh --env dev    # Creates DEV_* secrets
+#   sudo ./generate-secrets.sh --env prod   # Creates PROD_* secrets
 # =============================================================================
 
 EOF
@@ -286,18 +320,18 @@ printf "\n"
 if [ "$CI_OUTPUT" = true ]; then
     log_header "CI OUTPUT - Copy Below This Line"
 
-    printf "::group::GitHub Secrets (Add these to your repository)\n"
+    printf "::group::GitHub Secrets for %s Environment (Add these to your repository)\n" "$ENV_PREFIX"
 
-    printf "\n=== PROD_SSH_KEY (copy entire key including BEGIN/END lines) ===\n"
+    printf "\n=== %s_SSH_KEY (copy entire key including BEGIN/END lines) ===\n" "$ENV_PREFIX"
     printf "%s\n" "$SSH_PRIVATE_KEY"
 
-    printf "\n=== PROD_SSH_PORT ===\n"
+    printf "\n=== %s_SSH_PORT ===\n" "$ENV_PREFIX"
     printf "%s\n" "$SSH_PORT"
 
-    printf "\n=== PROD_HOST ===\n"
+    printf "\n=== %s_HOST ===\n" "$ENV_PREFIX"
     printf "%s\n" "${TAILSCALE_IP:-CONFIGURE_TAILSCALE_FIRST}"
 
-    printf "\n=== PROD_USER ===\n"
+    printf "\n=== %s_USER ===\n" "$ENV_PREFIX"
     printf "actions\n"
 
     printf "\n=== SSH_PUBLIC_KEY (for reference) ===\n"
@@ -305,31 +339,33 @@ if [ "$CI_OUTPUT" = true ]; then
 
     printf "::endgroup::\n"
 
-    printf "\n::group::Application Secrets\n"
-    printf "JWT_SECRET=%s\n" "$JWT_SECRET"
-    printf "ENCRYPTION_KEY=%s\n" "$ENCRYPTION_KEY"
-    printf "API_KEY=%s\n" "$API_KEY"
-    printf "DB_PASSWORD=%s\n" "$DB_PASSWORD"
-    printf "SESSION_SECRET=%s\n" "$SESSION_SECRET"
-    printf "WEBHOOK_SECRET=%s\n" "$WEBHOOK_SECRET"
-    printf "ADMIN_PASSWORD=%s\n" "$ADMIN_PASSWORD"
+    printf "::group::Application Secrets (%s)\n" "$ENV_PREFIX"
+    printf "%s_JWT_SECRET=%s\n" "$ENV_PREFIX" "$JWT_SECRET"
+    printf "%s_ENCRYPTION_KEY=%s\n" "$ENV_PREFIX" "$ENCRYPTION_KEY"
+    printf "%s_API_KEY=%s\n" "$ENV_PREFIX" "$API_KEY"
+    printf "%s_DB_PASSWORD=%s\n" "$ENV_PREFIX" "$DB_PASSWORD"
+    printf "%s_SESSION_SECRET=%s\n" "$ENV_PREFIX" "$SESSION_SECRET"
+    printf "%s_WEBHOOK_SECRET=%s\n" "$ENV_PREFIX" "$WEBHOOK_SECRET"
+    printf "%s_ADMIN_PASSWORD=%s\n" "$ENV_PREFIX" "$ADMIN_PASSWORD"
     printf "::endgroup::\n"
 
     # Output for GitHub Actions environment
-    printf "\n::group::GitHub Actions Environment Variables\n"
-    printf "TAILSCALE_IP=%s\n" "${TAILSCALE_IP:-NOT_CONFIGURED}"
-    printf "SSH_PORT=%s\n" "$SSH_PORT"
-    printf "HOSTNAME=%s\n" "$HOSTNAME"
-    printf "SERVER_IP=%s\n" "$SERVER_IP"
+    printf "\n::group::GitHub Actions Environment Variables (%s)\n" "$ENV_PREFIX"
+    printf "%s_TAILSCALE_IP=%s\n" "$ENV_PREFIX" "${TAILSCALE_IP:-NOT_CONFIGURED}"
+    printf "%s_SSH_PORT=%s\n" "$ENV_PREFIX" "$SSH_PORT"
+    printf "%s_HOSTNAME=%s\n" "$ENV_PREFIX" "$HOSTNAME"
+    printf "%s_SERVER_IP=%s\n" "$ENV_PREFIX" "$SERVER_IP"
+    printf "ENVIRONMENT=%s\n" "$ENVIRONMENT"
     printf "::endgroup::\n"
 
     # Create summary file for GitHub Actions
     SUMMARY_FILE="/tmp/setup_summary.txt"
     cat > "$SUMMARY_FILE" <<EOF
-## Server Setup Complete
+## Server Setup Complete ($ENV_PREFIX Environment)
 
 | Property | Value |
 |----------|-------|
+| Environment | $ENV_PREFIX |
 | Hostname | $HOSTNAME |
 | Server IP | $SERVER_IP |
 | Tailscale IP | ${TAILSCALE_IP:-Not configured} |
@@ -340,10 +376,10 @@ if [ "$CI_OUTPUT" = true ]; then
 
 | Secret Name | Description |
 |-------------|-------------|
-| PROD_SSH_KEY | SSH private key for 'actions' user |
-| PROD_SSH_PORT | $SSH_PORT |
-| PROD_HOST | ${TAILSCALE_IP:-Your Tailscale IP} |
-| PROD_USER | actions |
+| ${ENV_PREFIX}_SSH_KEY | SSH private key for 'actions' user |
+| ${ENV_PREFIX}_SSH_PORT | $SSH_PORT |
+| ${ENV_PREFIX}_HOST | ${TAILSCALE_IP:-Your Tailscale IP} |
+| ${ENV_PREFIX}_USER | actions |
 
 ### Generated Application Secrets
 
@@ -358,7 +394,9 @@ $SSH_PUBLIC_KEY
 Add this public key to any servers you need to access FROM this server.
 EOF
 
-    printf "\n::set-output name=tailscale_ip::%s\n" "${TAILSCALE_IP:-NOT_CONFIGURED}"
+    printf "::set-output name=environment::%s\n" "$ENVIRONMENT"
+    printf "::set-output name=env_prefix::%s\n" "$ENV_PREFIX"
+    printf "::set-output name=tailscale_ip::%s\n" "${TAILSCALE_IP:-NOT_CONFIGURED}"
     printf "::set-output name=ssh_port::%s\n" "$SSH_PORT"
     printf "::set-output name=hostname::%s\n" "$HOSTNAME"
     printf "::set-output name=credentials_file::%s\n" "$CREDENTIALS_FILE"
@@ -381,18 +419,18 @@ else
     printf "${BOLD}1. Go to your GitHub repository settings:${NC}\n"
     printf "   ${CYAN}https://github.com/YOUR_USERNAME/YOUR_REPO/settings/secrets/actions${NC}\n\n"
 
-    printf "${BOLD}2. Add these REQUIRED secrets:${NC}\n\n"
+    printf "${BOLD}2. Add these REQUIRED secrets for %s environment:${NC}\n\n" "$ENV_PREFIX"
 
-    printf "   ${YELLOW}PROD_HOST${NC}\n"
+    printf "   ${YELLOW}%s_HOST${NC}\n" "$ENV_PREFIX"
     printf "   Value: ${CYAN}%s${NC}\n\n" "${TAILSCALE_IP:-⚠️ CONFIGURE TAILSCALE FIRST}"
 
-    printf "   ${YELLOW}PROD_SSH_KEY${NC}\n"
+    printf "   ${YELLOW}%s_SSH_KEY${NC}\n" "$ENV_PREFIX"
     printf "   Value: (entire private key from credentials file)\n\n"
 
-    printf "   ${YELLOW}PROD_SSH_PORT${NC}\n"
+    printf "   ${YELLOW}%s_SSH_PORT${NC}\n" "$ENV_PREFIX"
     printf "   Value: ${CYAN}%s${NC}\n\n" "$SSH_PORT"
 
-    printf "   ${YELLOW}PROD_USER${NC}\n"
+    printf "   ${YELLOW}%s_USER${NC}\n" "$ENV_PREFIX"
     printf "   Value: ${CYAN}actions${NC}\n\n"
 
     log_header "Quick Commands"
@@ -411,6 +449,13 @@ else
 
     printf "Test SSH connection (from another machine via Tailscale):\n"
     printf "   ${CYAN}ssh -p %s actions@%s${NC}\n\n" "$SSH_PORT" "${TAILSCALE_IP:-TAILSCALE_IP}"
+
+    log_header "Multiple Environments"
+
+    printf "To generate secrets for different environments:\n"
+    printf "   ${CYAN}sudo ./generate-secrets.sh --env dev${NC}     # DEV_ prefix\n"
+    printf "   ${CYAN}sudo ./generate-secrets.sh --env staging${NC} # STAGING_ prefix\n"
+    printf "   ${CYAN}sudo ./generate-secrets.sh --env prod${NC}    # PROD_ prefix\n\n"
 
     log_header "Security Best Practices"
 

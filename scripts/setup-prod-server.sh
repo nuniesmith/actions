@@ -3,15 +3,21 @@
 # Supports: Ubuntu/Debian, Fedora/RHEL/CentOS, Arch Linux
 #
 # Usage:
-#   chmod +x setup-server.sh
-#   sudo ./setup-server.sh
+#   chmod +x setup-prod-server.sh
+#   sudo ./setup-prod-server.sh
 #
 # This script will:
 # - Detect the Linux distribution
-# - Install Docker and dependencies
-# - Create/configure 'actions' user for CI/CD
-# - Setup SSH for actions user
+# - Install minimal production packages
+# - Install Docker and container runtime only
+# - Apply security hardening
+# - Create/configure 'actions' user for CI/CD (SSH key only)
+# - Setup SSH with secure configuration
+# - Configure firewall basics
 # - Optionally run generate-secrets.sh automatically
+#
+# NOTE: This is a PRODUCTION server setup - no development tools are installed.
+#       For development tools (Rust, protobuf, testing), use setup-dev-server.sh
 
 set -e
 
@@ -104,10 +110,10 @@ detect_distro() {
 }
 
 # =============================================================================
-# Package Installation Functions
+# Minimal Package Installation Functions (Production Only)
 # =============================================================================
 install_packages_debian() {
-    log_info "Installing packages using apt..."
+    log_info "Installing minimal production packages using apt..."
     apt-get update
     apt-get install -y \
         curl \
@@ -117,24 +123,24 @@ install_packages_debian() {
         gnupg \
         lsb-release \
         apt-transport-https \
-        software-properties-common \
         jq \
-        vim \
+        vim-tiny \
         htop \
         net-tools \
         openssh-server \
         openssl \
         sudo \
-        openjdk-21-jdk
+        fail2ban \
+        ufw \
+        logrotate \
+        unattended-upgrades
 
-    # Set JAVA_HOME for all users
-    echo 'export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64' > /etc/profile.d/java.sh
-    echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
-    chmod +x /etc/profile.d/java.sh
+    # Configure unattended upgrades for security
+    dpkg-reconfigure -plow unattended-upgrades 2>/dev/null || true
 }
 
 install_packages_fedora() {
-    log_info "Installing packages using $PKG_MANAGER..."
+    log_info "Installing minimal production packages using $PKG_MANAGER..."
     $PKG_MANAGER install -y \
         curl \
         wget \
@@ -142,23 +148,23 @@ install_packages_fedora() {
         ca-certificates \
         gnupg2 \
         jq \
-        vim \
+        vim-minimal \
         htop \
         net-tools \
         openssh-server \
         openssl \
         sudo \
-        dnf-plugins-core \
-        java-21-openjdk-devel
+        fail2ban \
+        firewalld \
+        logrotate \
+        dnf-automatic
 
-    # Set JAVA_HOME for all users
-    echo 'export JAVA_HOME=/usr/lib/jvm/java-21-openjdk' > /etc/profile.d/java.sh
-    echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
-    chmod +x /etc/profile.d/java.sh
+    # Enable automatic security updates
+    systemctl enable --now dnf-automatic-install.timer 2>/dev/null || true
 }
 
 install_packages_arch() {
-    log_info "Installing packages using pacman..."
+    log_info "Installing minimal production packages using pacman..."
     pacman -Syu --noconfirm
     pacman -S --noconfirm --needed \
         curl \
@@ -173,13 +179,9 @@ install_packages_arch() {
         openssh \
         openssl \
         sudo \
-        base-devel \
-        jdk21-openjdk
-
-    # Set JAVA_HOME for all users
-    echo 'export JAVA_HOME=/usr/lib/jvm/java-21-openjdk' > /etc/profile.d/java.sh
-    echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
-    chmod +x /etc/profile.d/java.sh
+        fail2ban \
+        ufw \
+        logrotate
 }
 
 install_packages() {
@@ -283,6 +285,35 @@ install_docker() {
 }
 
 # =============================================================================
+# Docker Security Hardening
+# =============================================================================
+harden_docker() {
+    log_info "Applying Docker security hardening..."
+
+    # Create daemon.json with security settings
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<'EOF'
+{
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    },
+    "live-restore": true,
+    "userland-proxy": false,
+    "no-new-privileges": true,
+    "icc": false,
+    "storage-driver": "overlay2"
+}
+EOF
+
+    # Restart Docker to apply settings
+    systemctl restart docker 2>/dev/null || true
+
+    log_success "Docker security hardening applied"
+}
+
+# =============================================================================
 # Tailscale Installation
 # =============================================================================
 install_tailscale() {
@@ -297,10 +328,10 @@ install_tailscale() {
 }
 
 # =============================================================================
-# User Setup
+# User Setup (Production - More Restrictive)
 # =============================================================================
 setup_users() {
-    log_info "Setting up users..."
+    log_info "Setting up users with production security..."
 
     # Detect current user (who invoked sudo)
     REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo '')}"
@@ -313,7 +344,7 @@ setup_users() {
         log_success "User 'actions' created"
     fi
 
-    # Add actions to docker group
+    # Add actions to docker group only
     usermod -aG docker actions
     log_success "User 'actions' added to docker group"
 
@@ -329,16 +360,19 @@ setup_users() {
         fi
     fi
 
-    # Disable password login for actions (SSH key only)
+    # PRODUCTION: Disable password login for actions (SSH key only)
     passwd -l actions 2>/dev/null || true
     log_info "Password login disabled for 'actions' user (SSH key only)"
+
+    # Set secure umask for actions user
+    echo "umask 027" >> /home/actions/.bashrc
 }
 
 # =============================================================================
-# SSH Setup
+# SSH Security Hardening
 # =============================================================================
 setup_ssh() {
-    log_info "Setting up SSH for 'actions' user..."
+    log_info "Setting up SSH with production security..."
 
     ACTIONS_HOME="/home/actions"
     SSH_DIR="$ACTIONS_HOME/.ssh"
@@ -351,19 +385,228 @@ setup_ssh() {
     sudo -u actions touch "$SSH_DIR/authorized_keys"
     chmod 600 "$SSH_DIR/authorized_keys"
 
+    # Backup original sshd_config
+    if [ ! -f /etc/ssh/sshd_config.bak ]; then
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+    fi
+
+    # Apply SSH hardening
+    log_info "Applying SSH security hardening..."
+
+    # Create drop-in config for hardening
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/99-production-hardening.conf <<'EOF'
+# Production SSH Hardening
+
+# Disable root login
+PermitRootLogin no
+
+# Disable password authentication (use keys only)
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM yes
+
+# Disable empty passwords
+PermitEmptyPasswords no
+
+# Limit authentication attempts
+MaxAuthTries 3
+MaxSessions 3
+
+# Set login grace time
+LoginGraceTime 30
+
+# Disable X11 forwarding
+X11Forwarding no
+
+# Disable TCP forwarding (uncomment if needed)
+# AllowTcpForwarding no
+
+# Use only Protocol 2
+Protocol 2
+
+# Strong ciphers only
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+
+# Strong MACs only
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+
+# Strong key exchange algorithms
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+
+# Disable agent forwarding (uncomment if needed)
+# AllowAgentForwarding no
+
+# Log level
+LogLevel VERBOSE
+
+# Client alive settings
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Allow only actions user via SSH (add more users as needed)
+AllowUsers actions
+EOF
+
     # Ensure SSH service is running
     case "$DISTRO_FAMILY" in
         debian|fedora)
             systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true
-            systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
             ;;
         arch)
             systemctl enable sshd
-            systemctl start sshd
+            systemctl restart sshd
             ;;
     esac
 
-    log_success "SSH directory created for actions user"
+    log_success "SSH hardening applied"
+}
+
+# =============================================================================
+# Firewall Setup
+# =============================================================================
+setup_firewall() {
+    log_info "Setting up firewall..."
+
+    case "$DISTRO_FAMILY" in
+        debian|arch)
+            if command -v ufw >/dev/null 2>&1; then
+                ufw --force reset
+                ufw default deny incoming
+                ufw default allow outgoing
+                ufw allow ssh
+                # Allow common ports (adjust as needed)
+                ufw allow 80/tcp    # HTTP
+                ufw allow 443/tcp   # HTTPS
+                ufw --force enable
+                log_success "UFW firewall configured"
+            fi
+            ;;
+        fedora)
+            if command -v firewall-cmd >/dev/null 2>&1; then
+                systemctl enable firewalld
+                systemctl start firewalld
+                firewall-cmd --permanent --add-service=ssh
+                firewall-cmd --permanent --add-service=http
+                firewall-cmd --permanent --add-service=https
+                firewall-cmd --reload
+                log_success "Firewalld configured"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
+# Fail2ban Setup
+# =============================================================================
+setup_fail2ban() {
+    log_info "Configuring fail2ban..."
+
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        # Create jail.local for SSH protection
+        cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 3
+backend = systemd
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+EOF
+
+        # Adjust log path for different distros
+        if [ "$DISTRO_FAMILY" = "fedora" ]; then
+            sed -i 's|/var/log/auth.log|/var/log/secure|g' /etc/fail2ban/jail.local
+        fi
+
+        systemctl enable fail2ban
+        systemctl restart fail2ban
+
+        log_success "Fail2ban configured"
+    else
+        log_warn "Fail2ban not installed"
+    fi
+}
+
+# =============================================================================
+# System Hardening
+# =============================================================================
+apply_system_hardening() {
+    log_info "Applying system hardening..."
+
+    # Kernel hardening via sysctl
+    cat > /etc/sysctl.d/99-production-hardening.conf <<'EOF'
+# IP Spoofing protection
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Ignore ICMP broadcast requests
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+# Disable source packet routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+
+# Ignore send redirects
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# Block SYN attacks
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 5
+
+# Log Martians
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# Ignore ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+
+# Disable IPv6 if not needed (uncomment if desired)
+# net.ipv6.conf.all.disable_ipv6 = 1
+# net.ipv6.conf.default.disable_ipv6 = 1
+
+# Increase system file descriptor limit
+fs.file-max = 65535
+
+# Increase inotify limits for Docker
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 512
+
+# Virtual memory tuning
+vm.swappiness = 10
+vm.dirty_ratio = 60
+vm.dirty_background_ratio = 2
+EOF
+
+    # Apply sysctl settings
+    sysctl --system 2>/dev/null || sysctl -p /etc/sysctl.d/99-production-hardening.conf
+
+    # Set secure permissions on sensitive files
+    chmod 600 /etc/shadow 2>/dev/null || true
+    chmod 600 /etc/gshadow 2>/dev/null || true
+    chmod 644 /etc/passwd
+    chmod 644 /etc/group
+
+    # Disable core dumps
+    echo "* hard core 0" >> /etc/security/limits.conf
+    echo "fs.suid_dumpable = 0" >> /etc/sysctl.d/99-production-hardening.conf
+
+    log_success "System hardening applied"
 }
 
 # =============================================================================
@@ -381,7 +624,14 @@ setup_directories() {
     sudo -u actions mkdir -p "$ACTIONS_HOME/data"
     sudo -u actions mkdir -p "$ACTIONS_HOME/.config"
 
-    log_success "Directories created"
+    # Set restrictive permissions
+    chmod 750 "$ACTIONS_HOME"
+    chmod 700 "$ACTIONS_HOME/logs"
+    chmod 700 "$ACTIONS_HOME/backups"
+    chmod 700 "$ACTIONS_HOME/data"
+    chmod 700 "$ACTIONS_HOME/.config"
+
+    log_success "Directories created with secure permissions"
     log_info "Repositories will be cloned to: /home/actions/<repo-name>"
 }
 
@@ -396,8 +646,8 @@ create_env_template() {
 
     if [ ! -f "$ENV_FILE" ]; then
         sudo -u actions tee "$ENV_FILE" > /dev/null <<'EOF'
-# Server Environment Variables
-# Generated by setup-server.sh
+# Production Server Environment Variables
+# Generated by setup-prod-server.sh
 # Update these values as needed
 
 # =============================================================================
@@ -419,6 +669,13 @@ DATA_PATH=/home/actions/data
 # =============================================================================
 DOCKER_BUILDKIT=1
 COMPOSE_DOCKER_CLI_BUILD=1
+
+# =============================================================================
+# SECURITY
+# =============================================================================
+# Disable debug features in production
+RUST_BACKTRACE=0
+RUST_LOG=warn
 EOF
 
         chmod 600 "$ENV_FILE"
@@ -431,10 +688,36 @@ EOF
 }
 
 # =============================================================================
+# Logrotate Configuration
+# =============================================================================
+setup_logrotate() {
+    log_info "Configuring log rotation..."
+
+    cat > /etc/logrotate.d/actions <<'EOF'
+/home/actions/logs/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 actions actions
+    sharedscripts
+}
+EOF
+
+    log_success "Log rotation configured"
+}
+
+# =============================================================================
 # Main Setup Flow
 # =============================================================================
 main() {
-    log_header "Multi-Distro Server Setup"
+    log_header "Multi-Distro Production Server Setup"
+
+    log_warn "This is a PRODUCTION server setup."
+    log_warn "For development tools, use setup-dev-server.sh instead."
+    printf "\n"
 
     # Detect distribution
     detect_distro
@@ -453,28 +736,26 @@ main() {
         exit 1
     fi
 
-    # Step 1: Update system and install packages
-    log_info "Step 1/7: Installing system packages..."
+    # Step 1: Update system and install minimal packages
+    log_info "Step 1/10: Installing minimal production packages..."
     install_packages
-    log_success "System packages installed"
-
-    # Verify Java installation
-    if command -v java >/dev/null 2>&1; then
-        log_success "Java installed: $(java -version 2>&1 | head -1)"
-    else
-        log_warn "Java installation may require a shell restart"
-    fi
+    log_success "Minimal packages installed"
     printf "\n"
 
     # Step 2: Install Docker
-    log_info "Step 2/7: Installing Docker..."
+    log_info "Step 2/10: Installing Docker..."
     install_docker
     docker --version
     docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || true
     printf "\n"
 
-    # Step 3: Install Tailscale (if not present)
-    log_info "Step 3/7: Checking Tailscale..."
+    # Step 3: Harden Docker
+    log_info "Step 3/10: Hardening Docker..."
+    harden_docker
+    printf "\n"
+
+    # Step 4: Install Tailscale (if not present)
+    log_info "Step 4/10: Checking Tailscale..."
     if command -v tailscale >/dev/null 2>&1; then
         log_success "Tailscale already installed"
         TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "Not connected")
@@ -489,24 +770,36 @@ main() {
     fi
     printf "\n"
 
-    # Step 4: Setup users
-    log_info "Step 4/7: Setting up users..."
+    # Step 5: Setup users
+    log_info "Step 5/10: Setting up users with production security..."
     setup_users
     printf "\n"
 
-    # Step 5: Setup SSH
-    log_info "Step 5/7: Setting up SSH..."
+    # Step 6: Setup SSH with hardening
+    log_info "Step 6/10: Setting up SSH with security hardening..."
     setup_ssh
     printf "\n"
 
-    # Step 6: Create directories
-    log_info "Step 6/7: Creating directories..."
-    setup_directories
+    # Step 7: Setup firewall
+    log_info "Step 7/10: Configuring firewall..."
+    setup_firewall
     printf "\n"
 
-    # Step 7: Create env template
-    log_info "Step 7/7: Creating environment template..."
+    # Step 8: Setup fail2ban
+    log_info "Step 8/10: Configuring fail2ban..."
+    setup_fail2ban
+    printf "\n"
+
+    # Step 9: Apply system hardening
+    log_info "Step 9/10: Applying system hardening..."
+    apply_system_hardening
+    printf "\n"
+
+    # Step 10: Create directories and configuration
+    log_info "Step 10/10: Creating directories and configuration..."
+    setup_directories
     create_env_template
+    setup_logrotate
     printf "\n"
 
     # Run generate-secrets.sh if available
@@ -526,7 +819,7 @@ main() {
     # =============================================================================
     # Summary
     # =============================================================================
-    log_header "Setup Complete!"
+    log_header "Production Server Setup Complete!"
 
     log_info "System Information:"
     printf "  OS: %s\n" "$DISTRO_NAME"
@@ -537,6 +830,15 @@ main() {
     printf "  Disk: %s available\n" "$(df -h / | awk 'NR==2 {print $4}')"
     printf "\n"
 
+    log_info "Security Features Applied:"
+    printf "  ✓ SSH hardened (key-only authentication)\n"
+    printf "  ✓ Firewall configured\n"
+    printf "  ✓ Fail2ban protecting SSH\n"
+    printf "  ✓ Docker security hardened\n"
+    printf "  ✓ Kernel security parameters set\n"
+    printf "  ✓ Automatic security updates enabled\n"
+    printf "\n"
+
     log_header "Next Steps"
 
     printf "${BOLD}${GREEN}1. Connect to Tailscale (if not already):${NC}\n"
@@ -545,14 +847,29 @@ main() {
     printf "${BOLD}${GREEN}2. Generate secrets (if not done):${NC}\n"
     printf "   ${CYAN}sudo %s${NC}\n\n" "$GENERATE_SECRETS_SCRIPT"
 
-    printf "${BOLD}${GREEN}3. Test Docker:${NC}\n"
+    printf "${BOLD}${GREEN}3. Add your SSH public key:${NC}\n"
+    printf "   ${CYAN}echo 'your-public-key' >> /home/actions/.ssh/authorized_keys${NC}\n\n"
+
+    printf "${BOLD}${GREEN}4. Test SSH connection (from remote):${NC}\n"
+    printf "   ${CYAN}ssh actions@YOUR_TAILSCALE_IP${NC}\n\n"
+
+    printf "${BOLD}${GREEN}5. Test Docker:${NC}\n"
     printf "   ${CYAN}docker ps${NC}\n"
     printf "   ${YELLOW}Note: Log out and back in for docker group to take effect${NC}\n\n"
 
-    printf "${BOLD}${GREEN}4. Get Tailscale IP:${NC}\n"
+    printf "${BOLD}${GREEN}6. Get Tailscale IP:${NC}\n"
     printf "   ${CYAN}tailscale ip -4${NC}\n\n"
 
-    log_success "Server is ready!"
+    log_header "Security Reminders"
+
+    printf "${YELLOW}⚠  Password authentication is DISABLED for SSH${NC}\n"
+    printf "${YELLOW}⚠  Only the 'actions' user can SSH (key-only)${NC}\n"
+    printf "${YELLOW}⚠  Firewall allows: SSH, HTTP (80), HTTPS (443)${NC}\n"
+    printf "${YELLOW}⚠  Review /etc/ssh/sshd_config.d/99-production-hardening.conf${NC}\n"
+    printf "${YELLOW}⚠  Review /etc/sysctl.d/99-production-hardening.conf${NC}\n"
+    printf "\n"
+
+    log_success "Production server is ready and hardened!"
     printf "\n"
 }
 

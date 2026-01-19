@@ -1,0 +1,393 @@
+name: "Health Check"
+description: "Verify deployment health via HTTP endpoints, Docker containers, and custom commands"
+author: "nuniesmith"
+
+branding:
+    icon: "heart"
+    color: "green"
+
+inputs:
+    endpoints:
+        description: "JSON array of HTTP endpoints to check [{url, method, expected_status, timeout}]"
+        required: false
+        default: "[]"
+    containers:
+        description: "Space-separated list of Docker container names to verify"
+        required: false
+        default: ""
+    ssh-host:
+        description: "SSH host for remote health checks"
+        required: false
+        default: ""
+    ssh-port:
+        description: "SSH port"
+        required: false
+        default: "22"
+    ssh-user:
+        description: "SSH username"
+        required: false
+        default: "actions"
+    ssh-key:
+        description: "SSH private key"
+        required: false
+        default: ""
+    custom-command:
+        description: "Custom command to run for health verification (must exit 0 for success)"
+        required: false
+        default: ""
+    retry-count:
+        description: "Number of retries for failed checks"
+        required: false
+        default: "3"
+    retry-delay:
+        description: "Delay between retries in seconds"
+        required: false
+        default: "10"
+    initial-delay:
+        description: "Initial delay before starting checks (seconds)"
+        required: false
+        default: "30"
+    timeout:
+        description: "Timeout for each check in seconds"
+        required: false
+        default: "10"
+    fail-on-unhealthy:
+        description: "Fail the step if any health check fails"
+        required: false
+        default: "true"
+
+outputs:
+    healthy:
+        description: "Whether all health checks passed"
+        value: ${{ steps.summary.outputs.healthy }}
+    endpoints-healthy:
+        description: "Number of healthy endpoints"
+        value: ${{ steps.check-endpoints.outputs.healthy_count }}
+    containers-healthy:
+        description: "Number of healthy containers"
+        value: ${{ steps.check-containers.outputs.healthy_count }}
+    failed-checks:
+        description: "List of failed checks"
+        value: ${{ steps.summary.outputs.failed }}
+
+runs:
+    using: "composite"
+    steps:
+        - name: ⏳ Initial delay
+          shell: bash
+          run: |
+              DELAY="${{ inputs.initial-delay }}"
+              if [ "$DELAY" -gt 0 ]; then
+                echo "⏳ Waiting ${DELAY}s for services to initialize..."
+                sleep "$DELAY"
+              fi
+
+        - name: 🔐 Setup SSH (if needed)
+          id: ssh-setup
+          if: inputs.ssh-host != '' && inputs.ssh-key != ''
+          shell: bash
+          env:
+              SSH_KEY: ${{ inputs.ssh-key }}
+              SSH_HOST: ${{ inputs.ssh-host }}
+              SSH_PORT: ${{ inputs.ssh-port }}
+          run: |
+              mkdir -p ~/.ssh
+              chmod 700 ~/.ssh
+              echo "$SSH_KEY" > ~/.ssh/health_check_key
+              chmod 600 ~/.ssh/health_check_key
+
+              cat >> ~/.ssh/config << EOF
+              Host $SSH_HOST
+                  StrictHostKeyChecking no
+                  UserKnownHostsFile /dev/null
+                  ConnectTimeout 10
+                  Port $SSH_PORT
+              EOF
+
+              echo "ssh_ready=true" >> $GITHUB_OUTPUT
+
+        - name: 🌐 Check HTTP endpoints
+          id: check-endpoints
+          shell: bash
+          env:
+              ENDPOINTS: ${{ inputs.endpoints }}
+              RETRY_COUNT: ${{ inputs.retry-count }}
+              RETRY_DELAY: ${{ inputs.retry-delay }}
+              TIMEOUT: ${{ inputs.timeout }}
+          run: |
+              if [ "$ENDPOINTS" = "[]" ] || [ -z "$ENDPOINTS" ]; then
+                echo "No endpoints to check"
+                echo "healthy_count=0" >> $GITHUB_OUTPUT
+                echo "total_count=0" >> $GITHUB_OUTPUT
+                echo "failed=" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+
+              HEALTHY=0
+              TOTAL=0
+              FAILED_LIST=""
+
+              echo "🌐 Checking HTTP endpoints..."
+              echo ""
+
+              # Parse JSON endpoints array
+              while read -r endpoint; do
+                URL=$(echo "$endpoint" | jq -r '.url // empty')
+                METHOD=$(echo "$endpoint" | jq -r '.method // "GET"')
+                EXPECTED=$(echo "$endpoint" | jq -r '.expected_status // 200')
+                EP_TIMEOUT=$(echo "$endpoint" | jq -r ".timeout // $TIMEOUT")
+
+                if [ -z "$URL" ]; then
+                  continue
+                fi
+
+                TOTAL=$((TOTAL + 1))
+                echo "Checking: $URL ($METHOD)"
+
+                SUCCESS=false
+                for i in $(seq 1 $RETRY_COUNT); do
+                  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                    -X "$METHOD" \
+                    --connect-timeout "$EP_TIMEOUT" \
+                    --max-time "$EP_TIMEOUT" \
+                    "$URL" 2>/dev/null || echo "000")
+
+                  if [ "$HTTP_CODE" = "$EXPECTED" ]; then
+                    echo "  ✅ Status: $HTTP_CODE (expected: $EXPECTED)"
+                    SUCCESS=true
+                    HEALTHY=$((HEALTHY + 1))
+                    break
+                  else
+                    echo "  ⚠️ Attempt $i: Status $HTTP_CODE (expected: $EXPECTED)"
+                    if [ "$i" -lt "$RETRY_COUNT" ]; then
+                      sleep "$RETRY_DELAY"
+                    fi
+                  fi
+                done
+
+                if [ "$SUCCESS" = false ]; then
+                  echo "  ❌ Failed after $RETRY_COUNT attempts"
+                  FAILED_LIST="${FAILED_LIST}endpoint:${URL},"
+                fi
+                echo ""
+              done < <(echo "$ENDPOINTS" | jq -c '.[]')
+
+              echo "healthy_count=$HEALTHY" >> $GITHUB_OUTPUT
+              echo "total_count=$TOTAL" >> $GITHUB_OUTPUT
+              echo "failed=${FAILED_LIST%,}" >> $GITHUB_OUTPUT
+
+              echo "📊 Endpoint Summary: $HEALTHY/$TOTAL healthy"
+
+        - name: 🐳 Check Docker containers
+          id: check-containers
+          shell: bash
+          env:
+              CONTAINERS: ${{ inputs.containers }}
+              SSH_HOST: ${{ inputs.ssh-host }}
+              SSH_USER: ${{ inputs.ssh-user }}
+              SSH_READY: ${{ steps.ssh-setup.outputs.ssh_ready }}
+              RETRY_COUNT: ${{ inputs.retry-count }}
+              RETRY_DELAY: ${{ inputs.retry-delay }}
+          run: |
+              if [ -z "$CONTAINERS" ]; then
+                echo "No containers to check"
+                echo "healthy_count=0" >> $GITHUB_OUTPUT
+                echo "total_count=0" >> $GITHUB_OUTPUT
+                echo "failed=" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+
+              # Function to run docker commands (local or remote)
+              docker_cmd() {
+                if [ "$SSH_READY" = "true" ] && [ -n "$SSH_HOST" ]; then
+                  ssh -i ~/.ssh/health_check_key ${SSH_USER}@${SSH_HOST} "$1"
+                else
+                  eval "$1"
+                fi
+              }
+
+              HEALTHY=0
+              TOTAL=0
+              FAILED_LIST=""
+
+              echo "🐳 Checking Docker containers..."
+              echo ""
+
+              for container in $CONTAINERS; do
+                TOTAL=$((TOTAL + 1))
+                echo "Checking: $container"
+
+                SUCCESS=false
+                for i in $(seq 1 $RETRY_COUNT); do
+                  # Check if container exists and is running
+                  STATUS=$(docker_cmd "docker inspect --format='{{.State.Status}}' $container 2>/dev/null" || echo "not_found")
+                  HEALTH=$(docker_cmd "docker inspect --format='{{.State.Health.Status}}' $container 2>/dev/null" || echo "no_healthcheck")
+
+                  if [ "$STATUS" = "running" ]; then
+                    if [ "$HEALTH" = "healthy" ] || [ "$HEALTH" = "no_healthcheck" ]; then
+                      echo "  ✅ Status: $STATUS, Health: $HEALTH"
+                      SUCCESS=true
+                      HEALTHY=$((HEALTHY + 1))
+                      break
+                    elif [ "$HEALTH" = "starting" ]; then
+                      echo "  ⏳ Attempt $i: Starting..."
+                      if [ "$i" -lt "$RETRY_COUNT" ]; then
+                        sleep "$RETRY_DELAY"
+                      fi
+                    else
+                      echo "  ⚠️ Attempt $i: Health status: $HEALTH"
+                      if [ "$i" -lt "$RETRY_COUNT" ]; then
+                        sleep "$RETRY_DELAY"
+                      fi
+                    fi
+                  else
+                    echo "  ⚠️ Attempt $i: Container status: $STATUS"
+                    if [ "$i" -lt "$RETRY_COUNT" ]; then
+                      sleep "$RETRY_DELAY"
+                    fi
+                  fi
+                done
+
+                if [ "$SUCCESS" = false ]; then
+                  echo "  ❌ Failed after $RETRY_COUNT attempts"
+                  FAILED_LIST="${FAILED_LIST}container:${container},"
+                fi
+                echo ""
+              done
+
+              echo "healthy_count=$HEALTHY" >> $GITHUB_OUTPUT
+              echo "total_count=$TOTAL" >> $GITHUB_OUTPUT
+              echo "failed=${FAILED_LIST%,}" >> $GITHUB_OUTPUT
+
+              echo "📊 Container Summary: $HEALTHY/$TOTAL healthy"
+
+        - name: ⚙️ Run custom health command
+          id: custom-check
+          if: inputs.custom-command != ''
+          shell: bash
+          env:
+              CUSTOM_CMD: ${{ inputs.custom-command }}
+              SSH_HOST: ${{ inputs.ssh-host }}
+              SSH_USER: ${{ inputs.ssh-user }}
+              SSH_READY: ${{ steps.ssh-setup.outputs.ssh_ready }}
+              RETRY_COUNT: ${{ inputs.retry-count }}
+              RETRY_DELAY: ${{ inputs.retry-delay }}
+          run: |
+              echo "⚙️ Running custom health command..."
+
+              SUCCESS=false
+              for i in $(seq 1 $RETRY_COUNT); do
+                echo "Attempt $i/$RETRY_COUNT"
+
+                if [ "$SSH_READY" = "true" ] && [ -n "$SSH_HOST" ]; then
+                  if ssh -i ~/.ssh/health_check_key ${SSH_USER}@${SSH_HOST} "$CUSTOM_CMD"; then
+                    SUCCESS=true
+                    break
+                  fi
+                else
+                  if eval "$CUSTOM_CMD"; then
+                    SUCCESS=true
+                    break
+                  fi
+                fi
+
+                if [ "$i" -lt "$RETRY_COUNT" ]; then
+                  echo "Retrying in ${RETRY_DELAY}s..."
+                  sleep "$RETRY_DELAY"
+                fi
+              done
+
+              if [ "$SUCCESS" = true ]; then
+                echo "✅ Custom health check passed"
+                echo "success=true" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Custom health check failed"
+                echo "success=false" >> $GITHUB_OUTPUT
+              fi
+
+        - name: 📊 Health Check Summary
+          id: summary
+          shell: bash
+          env:
+              FAIL_ON_UNHEALTHY: ${{ inputs.fail-on-unhealthy }}
+              ENDPOINT_HEALTHY: ${{ steps.check-endpoints.outputs.healthy_count }}
+              ENDPOINT_TOTAL: ${{ steps.check-endpoints.outputs.total_count }}
+              ENDPOINT_FAILED: ${{ steps.check-endpoints.outputs.failed }}
+              CONTAINER_HEALTHY: ${{ steps.check-containers.outputs.healthy_count }}
+              CONTAINER_TOTAL: ${{ steps.check-containers.outputs.total_count }}
+              CONTAINER_FAILED: ${{ steps.check-containers.outputs.failed }}
+              CUSTOM_SUCCESS: ${{ steps.custom-check.outputs.success }}
+              CUSTOM_COMMAND: ${{ inputs.custom-command }}
+          run: |
+              echo "## 🏥 Health Check Summary" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+
+              ALL_HEALTHY=true
+              FAILED_LIST=""
+
+              # Check endpoints
+              if [ "${ENDPOINT_TOTAL:-0}" -gt 0 ]; then
+                echo "### 🌐 HTTP Endpoints" >> $GITHUB_STEP_SUMMARY
+                echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
+                echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+                echo "| Healthy | ${ENDPOINT_HEALTHY:-0} |" >> $GITHUB_STEP_SUMMARY
+                echo "| Total | ${ENDPOINT_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+
+                if [ "${ENDPOINT_HEALTHY:-0}" -lt "${ENDPOINT_TOTAL:-0}" ]; then
+                  ALL_HEALTHY=false
+                  FAILED_LIST="${FAILED_LIST}${ENDPOINT_FAILED},"
+                fi
+              fi
+
+              # Check containers
+              if [ "${CONTAINER_TOTAL:-0}" -gt 0 ]; then
+                echo "### 🐳 Docker Containers" >> $GITHUB_STEP_SUMMARY
+                echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
+                echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+                echo "| Healthy | ${CONTAINER_HEALTHY:-0} |" >> $GITHUB_STEP_SUMMARY
+                echo "| Total | ${CONTAINER_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+
+                if [ "${CONTAINER_HEALTHY:-0}" -lt "${CONTAINER_TOTAL:-0}" ]; then
+                  ALL_HEALTHY=false
+                  FAILED_LIST="${FAILED_LIST}${CONTAINER_FAILED},"
+                fi
+              fi
+
+              # Check custom command
+              if [ -n "$CUSTOM_COMMAND" ]; then
+                echo "### ⚙️ Custom Command" >> $GITHUB_STEP_SUMMARY
+                if [ "$CUSTOM_SUCCESS" = "true" ]; then
+                  echo "✅ Passed" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "❌ Failed" >> $GITHUB_STEP_SUMMARY
+                  ALL_HEALTHY=false
+                  FAILED_LIST="${FAILED_LIST}custom:command,"
+                fi
+                echo "" >> $GITHUB_STEP_SUMMARY
+              fi
+
+              # Final status
+              echo "---" >> $GITHUB_STEP_SUMMARY
+              if [ "$ALL_HEALTHY" = true ]; then
+                echo "## ✅ All Health Checks Passed" >> $GITHUB_STEP_SUMMARY
+                echo "healthy=true" >> $GITHUB_OUTPUT
+                echo "failed=" >> $GITHUB_OUTPUT
+              else
+                echo "## ❌ Some Health Checks Failed" >> $GITHUB_STEP_SUMMARY
+                echo "healthy=false" >> $GITHUB_OUTPUT
+                echo "failed=${FAILED_LIST%,}" >> $GITHUB_OUTPUT
+
+                if [ "$FAIL_ON_UNHEALTHY" = "true" ]; then
+                  echo ""
+                  echo "❌ Health check failed"
+                  exit 1
+                fi
+              fi
+
+        - name: 🧹 Cleanup
+          if: always()
+          shell: bash
+          run: |
+              rm -f ~/.ssh/health_check_key 2>/dev/null || true

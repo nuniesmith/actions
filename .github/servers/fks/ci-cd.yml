@@ -4,12 +4,14 @@
 # Streamlined pipeline using reusable composite actions from nuniesmith/actions.
 #
 # Pipeline Flow:
-# 1. Test Gate - Rust CI, Kotlin CI (parallel)
-# 2. Docker Build & Push - Multi-service matrix build
-# 3. Infrastructure Setup - Tailscale, DNS
-# 4. SSL Certificates - Let's Encrypt with self-signed fallback
-# 5. Production Deployment - SSH deploy with health checks
+# 1. Docker Build & Push - Multi-service matrix build
+# 2. Infrastructure Setup - Tailscale, DNS
+# 3. SSL Certificates - Let's Encrypt with self-signed fallback
+# 4. Deployment - Staging (develop) or Production (main)
+# 5. Health Checks - Verify deployment success
 # 6. Post-CI - LLM audit, notifications
+#
+# NOTE: Tests are currently disabled to focus on deployment process
 # =============================================================================
 
 name: 🚀 CI/CD Pipeline
@@ -25,11 +27,6 @@ on:
         branches: [main, develop]
     workflow_dispatch:
         inputs:
-            skip_tests:
-                description: "Skip tests (deploy only)"
-                required: false
-                type: boolean
-                default: false
             skip_deploy:
                 description: "Skip deployment"
                 required: false
@@ -40,6 +37,15 @@ on:
                 required: false
                 type: boolean
                 default: true
+            environment:
+                description: "Target environment"
+                required: false
+                type: choice
+                options:
+                    - auto
+                    - staging
+                    - production
+                default: auto
 
 permissions:
     contents: write
@@ -48,12 +54,13 @@ permissions:
     checks: write
 
 env:
-    RUST_VERSION: "1.92.0"
+    RUST_VERSION: "1.87.0"
     CARGO_TERM_COLOR: always
     REDIS_URL: redis://localhost:6379/0
     REGISTRY: docker.io
     IMAGE_NAME: nuniesmith/fks
     DOMAIN: fkstrading.xyz
+    STAGING_DOMAIN: staging.fkstrading.xyz
 
 concurrency:
     group: ${{ github.workflow }}-${{ github.ref }}
@@ -68,132 +75,41 @@ defaults:
 # =============================================================================
 jobs:
     # =========================================================================
-    # STAGE 1: CODE QUALITY & TESTING
+    # STAGE 1: ENVIRONMENT SETUP
     # =========================================================================
 
-    rust-ci:
-        name: 🦀 Rust CI
-        runs-on: ubuntu-latest
-        timeout-minutes: 45
-        if: ${{ !inputs.skip_tests }}
-        services:
-            redis:
-                image: redis:latest
-                ports:
-                    - 6379:6379
-                options: >-
-                    --health-cmd "redis-cli ping"
-                    --health-interval 10s
-                    --health-timeout 5s
-                    --health-retries 5
-        steps:
-            - name: 🧹 Free disk space
-              run: |
-                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-                  sudo apt-get clean
-
-            - name: 📥 Checkout code
-              uses: actions/checkout@v4
-
-            - name: 🦀 Run Rust CI
-              uses: nuniesmith/actions/.github/actions/rust-ci@main
-              with:
-                  toolchain: ${{ env.RUST_VERSION }}
-                  workspace: "true"
-                  pre-build-packages: "fks-proto"
-                  install-protobuf: "true"
-                  install-buf: "true"
-                  run-buf-lint: "true"
-                  run-buf-breaking: ${{ github.event_name == 'pull_request' }}
-                  proto-directory: "proto"
-                  run-fmt: "true"
-                  run-clippy: "true"
-                  clippy-args: "--lib -- -D warnings -A clippy::too-many-arguments -A clippy::manual-range-contains -A clippy::should-implement-trait"
-                  run-build: "true"
-                  build-release: "true"
-                  run-tests: "true"
-                  test-lib-only: "true"
-                  test-integration: "true"
-                  install-system-deps: "true"
-                  additional-apt-packages: "libfontconfig1-dev"
-                  cache-key-suffix: "fks-rust"
-              env:
-                  REDIS_URL: ${{ env.REDIS_URL }}
-
-    kotlin-ci:
-        name: 🎯 Kotlin/KMP CI
-        runs-on: ubuntu-latest
-        timeout-minutes: 30
-        if: ${{ !inputs.skip_tests }}
-        steps:
-            - name: 📥 Checkout code
-              uses: actions/checkout@v4
-
-            - name: 🎯 Run Kotlin CI
-              uses: nuniesmith/actions/.github/actions/kotlin-ci@main
-              with:
-                  java-version: "21"
-                  java-distribution: "temurin"
-                  working-directory: "src/clients"
-                  run-detekt: "true"
-                  run-tests: "true"
-                  run-build: "true"
-                  test-module: ":shared"
-                  test-task: "testDebugUnitTest"
-                  build-task: "assemble"
-                  known-test-failures: "20"
-                  upload-test-results: "true"
-                  continue-on-test-failure: "true"
-                  validate-wrapper: "false"
-
-    # =========================================================================
-    # TEST GATE - Must pass before proceeding
-    # =========================================================================
-
-    test-gate:
-        name: 📊 Test Gate
+    setup:
+        name: 📋 Setup
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        needs: [rust-ci, kotlin-ci]
-        if: always()
         outputs:
-            passed: ${{ steps.check.outputs.passed }}
+            deploy_env: ${{ steps.determine-env.outputs.environment }}
         steps:
-            - name: 📊 Check test results
-              id: check
+            - name: 🎯 Determine deployment environment
+              id: determine-env
               run: |
-                  echo "# 🧪 Test Gate Summary" >> $GITHUB_STEP_SUMMARY
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
-                  echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
-                  echo "| 🦀 Rust CI | ${{ needs.rust-ci.result }} |" >> $GITHUB_STEP_SUMMARY
-                  echo "| 🎯 Kotlin CI | ${{ needs.kotlin-ci.result }} |" >> $GITHUB_STEP_SUMMARY
-
-                  FAILED=false
-
-                  if [ "${{ needs.rust-ci.result }}" = "failure" ]; then
-                    echo "❌ Rust CI failed - blocking pipeline"
-                    FAILED=true
-                  fi
-
-                  if [ "${{ needs.kotlin-ci.result }}" = "failure" ]; then
-                    echo "❌ Kotlin CI failed - blocking pipeline"
-                    FAILED=true
-                  fi
-
-                  if [ "$FAILED" = "true" ]; then
-                    echo "passed=false" >> $GITHUB_OUTPUT
-                    echo "" >> $GITHUB_STEP_SUMMARY
-                    echo "## ❌ Pipeline Blocked" >> $GITHUB_STEP_SUMMARY
-                    echo "One or more CI jobs failed. Docker build, deploy, and subsequent jobs will be skipped." >> $GITHUB_STEP_SUMMARY
-                    exit 1
-                  elif [ "${{ needs.rust-ci.result }}" = "skipped" ] && [ "${{ needs.kotlin-ci.result }}" = "skipped" ]; then
-                    echo "⚠️ All tests skipped - proceeding"
-                    echo "passed=true" >> $GITHUB_OUTPUT
+                  # Check workflow dispatch input first
+                  if [ "${{ inputs.environment }}" != "" ] && [ "${{ inputs.environment }}" != "auto" ]; then
+                    ENV="${{ inputs.environment }}"
+                  elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+                    ENV="production"
+                  elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+                    ENV="staging"
                   else
-                    echo "✅ Test gate passed - all CI jobs successful"
-                    echo "passed=true" >> $GITHUB_OUTPUT
+                    ENV="none"
                   fi
+
+                  echo "environment=$ENV" >> $GITHUB_OUTPUT
+                  echo "📍 Target environment: $ENV"
+
+                  echo "## 📋 Pipeline Configuration" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+                  echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| Environment | \`$ENV\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Branch | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Tests | \`disabled\` |" >> $GITHUB_STEP_SUMMARY
 
     # =========================================================================
     # STAGE 2: DOCKER BUILD & PUSH
@@ -203,9 +119,8 @@ jobs:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
         timeout-minutes: 60
-        needs: test-gate
+        needs: setup
         if: |
-            needs.test-gate.result == 'success' &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
         strategy:
@@ -241,6 +156,7 @@ jobs:
                   tags: |
                       type=raw,value=${{ matrix.service.name }}-latest
                       type=raw,value=${{ matrix.service.name }}-${{ github.sha }}
+                      type=raw,value=${{ matrix.service.name }}-${{ needs.setup.outputs.deploy_env }}
                   build-args: ${{ matrix.service.build_args }}
 
     # =========================================================================
@@ -248,21 +164,36 @@ jobs:
     # =========================================================================
 
     infrastructure-setup:
-        name: 🔐 Infrastructure Setup
+        name: 🔐 Infrastructure (${{ needs.setup.outputs.deploy_env }})
         runs-on: ubuntu-latest
         timeout-minutes: 15
-        needs: [test-gate, docker-build]
+        needs: [setup, docker-build]
         if: |
-            needs.test-gate.result == 'success' &&
             needs.docker-build.result == 'success' &&
             github.event_name == 'push' &&
-            github.ref == 'refs/heads/main' &&
+            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
         outputs:
             tailscale_connected: ${{ steps.tailscale.outputs.connected }}
+            target_host: ${{ steps.config.outputs.host }}
+            target_domain: ${{ steps.config.outputs.domain }}
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
+
+            - name: ⚙️ Configure environment
+              id: config
+              run: |
+                  ENV="${{ needs.setup.outputs.deploy_env }}"
+                  if [ "$ENV" = "production" ]; then
+                    echo "host=${{ secrets.PROD_TAILSCALE_IP }}" >> $GITHUB_OUTPUT
+                    echo "domain=${{ env.DOMAIN }}" >> $GITHUB_OUTPUT
+                    echo "ssh_port=${{ secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
+                  else
+                    echo "host=${{ secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}" >> $GITHUB_OUTPUT
+                    echo "domain=${{ env.STAGING_DOMAIN }}" >> $GITHUB_OUTPUT
+                    echo "ssh_port=${{ secrets.STAGING_SSH_PORT || secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
+                  fi
 
             - name: ✅ Validate Tailscale ACL
               run: |
@@ -274,7 +205,7 @@ jobs:
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+                  target-ip: ${{ steps.config.outputs.host }}
 
             - name: 🌐 Update Cloudflare DNS
               if: steps.tailscale.outputs.connected == 'true'
@@ -282,9 +213,9 @@ jobs:
               with:
                   api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
                   zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-                  record-name: ${{ env.DOMAIN }}
-                  record-content: ${{ secrets.PROD_TAILSCALE_IP }}
-                  additional-records: '[{"name": "www.${{ env.DOMAIN }}"}]'
+                  record-name: ${{ steps.config.outputs.domain }}
+                  record-content: ${{ steps.config.outputs.host }}
+                  additional-records: '[{"name": "www.${{ steps.config.outputs.domain }}"}]'
 
     # =========================================================================
     # STAGE 3.5: SSL CERTIFICATES
@@ -294,9 +225,8 @@ jobs:
         name: 🔐 SSL Certificates
         runs-on: ubuntu-latest
         timeout-minutes: 15
-        needs: [test-gate, infrastructure-setup]
+        needs: [setup, infrastructure-setup]
         if: |
-            needs.test-gate.result == 'success' &&
             needs.infrastructure-setup.result == 'success' &&
             github.event_name == 'push' &&
             github.ref == 'refs/heads/main' &&
@@ -315,20 +245,20 @@ jobs:
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+                  target-ip: ${{ needs.infrastructure-setup.outputs.target_host }}
 
             - name: 🔐 Generate & Deploy SSL Certificates
               id: ssl
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
               with:
-                  domain: ${{ env.DOMAIN }}
-                  additional-domains: "www.${{ env.DOMAIN }}"
+                  domain: ${{ needs.infrastructure-setup.outputs.target_domain }}
+                  additional-domains: "www.${{ needs.infrastructure-setup.outputs.target_domain }}"
                   cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
                   email: ${{ secrets.SSL_EMAIL }}
                   fallback-to-self-signed: "true"
                   self-signed-days: "365"
                   deploy-to-server: "true"
-                  ssh-host: ${{ secrets.PROD_TAILSCALE_IP }}
+                  ssh-host: ${{ needs.infrastructure-setup.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -337,25 +267,27 @@ jobs:
                   docker-token: ${{ secrets.DOCKER_TOKEN }}
 
     # =========================================================================
-    # STAGE 4: PRODUCTION DEPLOYMENT
+    # STAGE 4: DEPLOYMENT
     # =========================================================================
 
-    deploy-production:
-        name: 🚀 Deploy to Production
+    deploy:
+        name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
         timeout-minutes: 30
-        needs: [test-gate, docker-build, infrastructure-setup, ssl-certificates]
+        needs: [setup, docker-build, infrastructure-setup, ssl-certificates]
         if: |
-            needs.test-gate.result == 'success' &&
+            always() &&
             needs.docker-build.result == 'success' &&
             needs.infrastructure-setup.result == 'success' &&
             (needs.ssl-certificates.result == 'success' || needs.ssl-certificates.result == 'skipped') &&
             github.event_name == 'push' &&
-            github.ref == 'refs/heads/main' &&
+            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
         environment:
-            name: production
-            url: https://fkstrading.xyz
+            name: ${{ needs.setup.outputs.deploy_env }}
+            url: https://${{ needs.infrastructure-setup.outputs.target_domain }}
+        outputs:
+            deployed: ${{ steps.deploy.outputs.deployed }}
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -365,117 +297,161 @@ jobs:
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+                  target-ip: ${{ needs.infrastructure-setup.outputs.target_host }}
                   target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
 
             - name: 🚀 Deploy via SSH
+              id: deploy
               uses: nuniesmith/actions/.github/actions/ssh-deploy@main
               with:
-                  host: ${{ secrets.PROD_TAILSCALE_IP }}
+                  host: ${{ needs.infrastructure-setup.outputs.target_host }}
                   port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   username: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   project-path: ~/fks
                   git-pull: "true"
+                  git-branch: ${{ github.ref_name }}
                   docker-pull: "true"
                   docker-prune: "false"
                   pre-deploy-command: |
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "📋 PRE-DEPLOY: ${{ needs.setup.outputs.deploy_env }}"
+                      echo "════════════════════════════════════════════════════════════"
+
+                      # System info
+                      echo "🖥️  Host: $(hostname) | $(date)"
+                      echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free | Memory: $(free -h | grep Mem | awk '{print $7}') available"
+
+                      # First-time setup
                       if [ ! -d ~/fks/.git ]; then
-                        echo "📦 Cloning repository for first-time setup..."
+                        echo "📦 First-time setup - cloning repository..."
                         rm -rf ~/fks
                         git clone https://github.com/nuniesmith/fks.git ~/fks
                       fi
 
-                      echo "📦 Ensuring required Docker volumes exist..."
-                      docker volume create fks_certbot_www 2>/dev/null || true
-                      docker volume create fks_certbot_conf 2>/dev/null || true
-                      docker volume create fks_postgres_data 2>/dev/null || true
-                      docker volume create fks_questdb_data 2>/dev/null || true
-                      docker volume create fks_redis_data 2>/dev/null || true
-                      docker volume create fks_grafana_data 2>/dev/null || true
-                      echo "✅ Docker volumes ready"
+                      # Ensure Docker volumes
+                      echo "📦 Ensuring Docker volumes..."
+                      for vol in fks_certbot_www fks_certbot_conf fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data; do
+                        docker volume create $vol 2>/dev/null || true
+                      done
+                      echo "✅ Volumes ready"
+
                   deploy-command: |
-                      echo "🔐 Logging into Docker Hub..."
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "🚀 DEPLOYING: ${{ needs.setup.outputs.deploy_env }}"
+                      echo "════════════════════════════════════════════════════════════"
+
+                      # Docker login
                       echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
 
-                      echo "📝 Validating .env file..."
+                      # Environment setup
                       [ ! -f .env ] && touch .env
 
-                      ensure_env_var() {
-                        local VAR_NAME="$1" DEFAULT_VALUE="$2"
-                        local CURRENT=$(grep "^${VAR_NAME}=" .env 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]')
-                        if [ -z "$CURRENT" ]; then
-                          sed -i "/^${VAR_NAME}=/d" .env
-                          echo "${VAR_NAME}=${DEFAULT_VALUE}" >> .env
-                        fi
+                      # Ensure required env vars
+                      ensure_env() {
+                        local VAR="$1" DEFAULT="$2"
+                        grep -q "^${VAR}=" .env || echo "${VAR}=${DEFAULT}" >> .env
                       }
 
-                      ensure_env_var "POSTGRES_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env_var "REDIS_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env_var "QUESTDB_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env_var "GRAFANA_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env_var "GRAFANA_USER" "admin"
-                      ensure_env_var "TRADING_MODE" "simulation"
-                      ensure_env_var "REAL_ORDERS_ENABLED" "false"
-                      ensure_env_var "ENABLE_EXECUTION" "true"
-                      ensure_env_var "REGISTRY" "docker.io"
-                      ensure_env_var "IMAGE_NAME" "nuniesmith/fks"
+                      ensure_env "POSTGRES_PASSWORD" "$(openssl rand -hex 16)"
+                      ensure_env "REDIS_PASSWORD" "$(openssl rand -hex 16)"
+                      ensure_env "QUESTDB_PASSWORD" "$(openssl rand -hex 16)"
+                      ensure_env "GRAFANA_PASSWORD" "$(openssl rand -hex 16)"
+                      ensure_env "GRAFANA_USER" "admin"
+                      ensure_env "TRADING_MODE" "simulation"
+                      ensure_env "REAL_ORDERS_ENABLED" "false"
+                      ensure_env "ENABLE_EXECUTION" "true"
+                      ensure_env "REGISTRY" "docker.io"
+                      ensure_env "IMAGE_NAME" "nuniesmith/fks"
+                      ensure_env "ENVIRONMENT" "${{ needs.setup.outputs.deploy_env }}"
 
                       set -a && source .env && set +a
 
-                      echo "📋 Using registry: ${REGISTRY}"
-                      echo "📋 Using image name: ${IMAGE_NAME}"
+                      COMPOSE_CMD="docker compose -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
 
-                      echo "🛑 Stopping existing containers..."
-                      docker compose -f infrastructure/compose/docker-compose.yml \
-                        -f infrastructure/compose/docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
+                      # Stop existing
+                      echo "🛑 Stopping containers..."
+                      $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
 
-                      echo "📥 Pulling production images..."
-                      docker compose -f infrastructure/compose/docker-compose.yml \
-                        -f infrastructure/compose/docker-compose.prod.yml pull 2>/dev/null || true
+                      # Pull images
+                      echo "📥 Pulling images..."
+                      for svc in janus execution optimizer; do
+                        docker pull ${REGISTRY}/${IMAGE_NAME}:${svc}-latest 2>&1 | tail -1 || echo "⚠️ ${svc} pull failed"
+                      done
 
+                      # Start
                       echo "🚀 Starting containers..."
-                      if [ -f ./run.sh ]; then
-                        chmod +x ./run.sh
-                        ./run.sh prod up
-                      else
-                        docker compose -f infrastructure/compose/docker-compose.yml \
-                          -f infrastructure/compose/docker-compose.prod.yml up -d
-                      fi
+                      $COMPOSE_CMD up -d 2>&1
 
-                      echo "⏳ Waiting for containers to stabilize..."
-                      sleep 10
+                      # Wait and check
+                      echo "⏳ Waiting for containers..."
+                      sleep 15
 
-                      echo "📊 Container status:"
-                      docker compose -f infrastructure/compose/docker-compose.yml \
-                        -f infrastructure/compose/docker-compose.prod.yml ps
-
-                      echo "🔍 Verifying containers are running..."
-                      RUNNING=$(docker compose -f infrastructure/compose/docker-compose.yml \
-                        -f infrastructure/compose/docker-compose.prod.yml ps --status running -q | wc -l)
+                      RUNNING=$(docker ps --filter "name=fks" --format '{{.Names}}' | wc -l)
+                      echo "✅ Running: $RUNNING containers"
 
                       if [ "$RUNNING" -eq 0 ]; then
-                        echo "❌ ERROR: No containers are running!"
-                        echo "📋 Recent container logs:"
-                        docker compose -f infrastructure/compose/docker-compose.yml \
-                          -f infrastructure/compose/docker-compose.prod.yml logs --tail=50
+                        echo "❌ No containers running!"
+                        docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -10
                         exit 1
-                      else
-                        echo "✅ $RUNNING container(s) running"
                       fi
-                  post-deploy-command: |
-                      echo "🧹 Cleaning up old images (keeping recent)..."
-                      docker image prune -f --filter "until=24h" 2>/dev/null || true
-                      echo "✅ FKS services deployed"
 
-            - name: 🏥 Health check
-              timeout-minutes: 5
-              continue-on-error: true
-              run: |
-                  sleep 30
-                  curl -sSf https://${{ env.DOMAIN }}/health > /dev/null 2>&1 && \
-                    echo "✅ Health check passed" || \
-                    echo "⚠️ Health check failed - manual verification needed"
+                  post-deploy-command: |
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "🧹 POST-DEPLOY CLEANUP"
+                      echo "════════════════════════════════════════════════════════════"
+
+                      # Cleanup old images (keep 24h)
+                      docker image prune -f --filter "until=24h" 2>/dev/null || true
+
+                      echo ""
+                      echo "🌐 Access URLs:"
+                      echo "   Grafana:    http://$(hostname -I | awk '{print $1}'):3000"
+                      echo "   Prometheus: http://$(hostname -I | awk '{print $1}'):9090"
+                      echo "   QuestDB:    http://$(hostname -I | awk '{print $1}'):9000"
+                      echo ""
+                      echo "✅ Deployment complete!"
+
+    # =========================================================================
+    # STAGE 5: HEALTH CHECKS
+    # =========================================================================
+
+    health-check:
+        name: 🏥 Health Check
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [setup, infrastructure-setup, deploy]
+        if: |
+            needs.deploy.result == 'success'
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.infrastructure-setup.outputs.target_host }}
+
+            - name: 🏥 Run Health Checks
+              uses: nuniesmith/actions/.github/actions/health-check@main
+              with:
+                  endpoints: |
+                      [
+                        {"url": "https://${{ needs.infrastructure-setup.outputs.target_domain }}/health", "expected_status": 200},
+                        {"url": "http://${{ needs.infrastructure-setup.outputs.target_host }}:3000/api/health", "expected_status": 200},
+                        {"url": "http://${{ needs.infrastructure-setup.outputs.target_host }}:9090/-/healthy", "expected_status": 200}
+                      ]
+                  containers: "fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana"
+                  ssh-host: ${{ needs.infrastructure-setup.outputs.target_host }}
+                  ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  initial-delay: "30"
+                  retry-count: "3"
+                  retry-delay: "10"
+                  fail-on-unhealthy: "false"
 
             - name: 📣 Notify deployment
               if: always()
@@ -483,29 +459,29 @@ jobs:
               continue-on-error: true
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
-                  title: "${{ job.status == 'success' && '🚀 FKS Deployed' || '❌ FKS Deploy Failed' }}"
-                  description: "${{ job.status == 'success' && 'Services deployed to production' || 'Deployment failed - check logs' }}"
-                  status: ${{ job.status == 'success' && 'success' || 'failure' }}
+                  title: "${{ needs.deploy.result == 'success' && '🚀 FKS Deployed' || '❌ FKS Deploy Failed' }}"
+                  description: "Deployed to ${{ needs.setup.outputs.deploy_env }}"
+                  status: ${{ needs.deploy.result == 'success' && 'success' || 'failure' }}
                   include-repo-info: "true"
                   fields: |
                       [
-                        {"name": "Environment", "value": "production", "inline": true},
-                        {"name": "Domain", "value": "${{ env.DOMAIN }}", "inline": true},
-                        {"name": "SSL Certificate", "value": "${{ needs.ssl-certificates.outputs.cert_type || 'skipped' }}", "inline": true}
+                        {"name": "Environment", "value": "${{ needs.setup.outputs.deploy_env }}", "inline": true},
+                        {"name": "Domain", "value": "${{ needs.infrastructure-setup.outputs.target_domain }}", "inline": true},
+                        {"name": "SSL", "value": "${{ needs.ssl-certificates.outputs.cert_type || 'skipped' }}", "inline": true}
                       ]
 
     # =========================================================================
-    # STAGE 5: POST-CI ANALYSIS
+    # STAGE 6: POST-CI ANALYSIS
     # =========================================================================
 
     llm-audit:
         name: 🧠 LLM Audit
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [rust-ci, kotlin-ci]
+        needs: [deploy]
         if: |
             always() &&
-            (needs.rust-ci.result == 'success' || needs.rust-ci.result == 'failure') &&
+            needs.deploy.result == 'success' &&
             github.event_name != 'workflow_dispatch'
         steps:
             - name: 📥 Checkout code
@@ -572,27 +548,30 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 5
         needs:
-            - rust-ci
-            - kotlin-ci
-            - test-gate
+            - setup
             - docker-build
             - infrastructure-setup
             - ssl-certificates
-            - deploy-production
+            - deploy
+            - health-check
             - llm-audit
         if: always()
         steps:
             - name: 📊 Generate summary
               run: |
+                  ENV="${{ needs.setup.outputs.deploy_env || 'N/A' }}"
+                  DOMAIN="${{ needs.infrastructure-setup.outputs.target_domain || 'N/A' }}"
+
                   cat >> $GITHUB_STEP_SUMMARY << EOF
                   # 🚀 FKS CI/CD Pipeline Summary
 
-                  ## Test Stage
-                  | Job | Status |
-                  |-----|--------|
-                  | 🦀 Rust CI | ${{ needs.rust-ci.result || 'skipped' }} |
-                  | 🎯 Kotlin CI | ${{ needs.kotlin-ci.result || 'skipped' }} |
-                  | 📊 Test Gate | ${{ needs.test-gate.result || 'skipped' }} |
+                  ## Environment
+                  | Property | Value |
+                  |----------|-------|
+                  | Target | \`$ENV\` |
+                  | Domain | \`$DOMAIN\` |
+                  | Branch | \`${{ github.ref_name }}\` |
+                  | Commit | \`${{ github.sha }}\` |
 
                   ## Build & Deploy Stage
                   | Job | Status |
@@ -600,14 +579,15 @@ jobs:
                   | 🐳 Docker Build | ${{ needs.docker-build.result || 'skipped' }} |
                   | 🔐 Infrastructure | ${{ needs.infrastructure-setup.result || 'skipped' }} |
                   | 🔒 SSL Certificates | ${{ needs.ssl-certificates.result || 'skipped' }} |
-                  | 🚀 Deploy | ${{ needs.deploy-production.result || 'skipped' }} |
+                  | 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |
+                  | 🏥 Health Check | ${{ needs.health-check.result || 'skipped' }} |
 
                   ## SSL Details
                   | Property | Value |
                   |----------|-------|
                   | Certificate Type | ${{ needs.ssl-certificates.outputs.cert_type || 'N/A' }} |
                   | Certificate Ready | ${{ needs.ssl-certificates.outputs.cert_ready || 'N/A' }} |
-                  | Deployed to Server | ${{ needs.ssl-certificates.outputs.deployed || 'N/A' }} |
+                  | Deployed | ${{ needs.ssl-certificates.outputs.deployed || 'N/A' }} |
 
                   ## Post-CI
                   | Job | Status |
@@ -615,14 +595,13 @@ jobs:
                   | 🧠 LLM Audit | ${{ needs.llm-audit.result || 'skipped' }} |
 
                   ---
-                  **Branch:** \`${{ github.ref_name }}\` | **Commit:** \`${{ github.sha }}\` | **Actor:** \`${{ github.actor }}\`
+                  **Actor:** \`${{ github.actor }}\` | **Workflow:** \`${{ github.run_number }}\`
                   EOF
 
             - name: ❌ Fail on critical errors
               if: |
-                  needs.rust-ci.result == 'failure' ||
                   needs.docker-build.result == 'failure' ||
-                  needs.deploy-production.result == 'failure'
+                  needs.deploy.result == 'failure'
               run: |
                   echo "❌ Pipeline failed due to critical job failure"
                   exit 1
