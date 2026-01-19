@@ -1,129 +1,134 @@
-name: 'Tailscale Connect'
-description: 'Connect to Tailscale network and optionally verify connectivity to a target'
-author: 'nuniesmith'
+name: "Tailscale Connect"
+description: "Connect to Tailscale network and optionally verify connectivity to a target"
+author: "nuniesmith"
 
 branding:
-  icon: 'link'
-  color: 'blue'
+    icon: "link"
+    color: "blue"
 
 inputs:
-  oauth-client-id:
-    description: 'Tailscale OAuth Client ID'
-    required: true
-  oauth-secret:
-    description: 'Tailscale OAuth Secret'
-    required: true
-  tags:
-    description: 'Tailscale ACL tags (e.g., tag:ci)'
-    required: false
-    default: 'tag:ci'
-  version:
-    description: 'Tailscale version to install'
-    required: false
-    default: ''
-  target-ip:
-    description: 'Target Tailscale IP to verify connectivity (optional)'
-    required: false
-    default: ''
-  target-ssh-port:
-    description: 'SSH port to check on target (optional)'
-    required: false
-    default: '22'
-  wait-time:
-    description: 'Seconds to wait for Tailscale to connect'
-    required: false
-    default: '5'
+    oauth-client-id:
+        description: "Tailscale OAuth Client ID"
+        required: true
+    oauth-secret:
+        description: "Tailscale OAuth Secret"
+        required: true
+    tags:
+        description: "Tailscale ACL tags (e.g., tag:ci)"
+        required: false
+        default: "tag:ci"
+    version:
+        description: "Tailscale version to install (e.g., 1.66.0, latest, unstable)"
+        required: false
+        default: "latest"
+    target-ip:
+        description: "Target Tailscale IP to verify connectivity (optional)"
+        required: false
+        default: ""
+    target-ssh-port:
+        description: "SSH port to check on target (optional)"
+        required: false
+        default: "22"
+    wait-time:
+        description: "Seconds to wait for Tailscale to connect"
+        required: false
+        default: "5"
+    use-cache:
+        description: "Whether to cache Tailscale binaries (reduces download failures)"
+        required: false
+        default: "true"
 
 outputs:
-  connected:
-    description: 'Whether Tailscale connected successfully'
-    value: ${{ steps.verify.outputs.connected }}
-  tailscale-ip:
-    description: 'Our Tailscale IPv4 address'
-    value: ${{ steps.verify.outputs.tailscale_ip }}
-  target-reachable:
-    description: 'Whether the target IP is reachable'
-    value: ${{ steps.verify.outputs.target_reachable }}
-  ssh-reachable:
-    description: 'Whether SSH port is reachable on target'
-    value: ${{ steps.verify.outputs.ssh_reachable }}
+    connected:
+        description: "Whether Tailscale connected successfully"
+        value: ${{ steps.verify.outputs.connected }}
+    tailscale-ip:
+        description: "Our Tailscale IPv4 address"
+        value: ${{ steps.verify.outputs.tailscale_ip }}
+    target-reachable:
+        description: "Whether the target IP is reachable"
+        value: ${{ steps.verify.outputs.target_reachable }}
+    ssh-reachable:
+        description: "Whether SSH port is reachable on target"
+        value: ${{ steps.verify.outputs.ssh_reachable }}
 
 runs:
-  using: 'composite'
-  steps:
-    - name: 🔌 Connect to Tailscale
-      id: connect
-      uses: tailscale/github-action@v2
-      with:
-        oauth-client-id: ${{ inputs.oauth-client-id }}
-        oauth-secret: ${{ inputs.oauth-secret }}
-        tags: ${{ inputs.tags }}
-        version: ${{ inputs.version }}
+    using: "composite"
+    steps:
+        - name: 🔌 Connect to Tailscale
+          id: connect
+          uses: tailscale/github-action@v4
+          with:
+              oauth-client-id: ${{ inputs.oauth-client-id }}
+              oauth-secret: ${{ inputs.oauth-secret }}
+              tags: ${{ inputs.tags }}
+              version: ${{ inputs.version }}
+              use-cache: ${{ inputs.use-cache }}
 
-    - name: 📡 Verify Tailscale Connection
-      id: verify
-      shell: bash
-      env:
-        TARGET_IP: ${{ inputs.target-ip }}
-        TARGET_SSH_PORT: ${{ inputs.target-ssh-port }}
-        WAIT_TIME: ${{ inputs.wait-time }}
-      run: |
-        echo "⏳ Waiting ${WAIT_TIME}s for Tailscale to fully connect..."
-        sleep "$WAIT_TIME"
+        - name: 📡 Verify Tailscale Connection
+          id: verify
+          shell: bash
+          env:
+              TARGET_IP: ${{ inputs.target-ip }}
+              TARGET_SSH_PORT: ${{ inputs.target-ssh-port }}
+              WAIT_TIME: ${{ inputs.wait-time }}
+          run: |
+              echo "⏳ Waiting ${WAIT_TIME}s for Tailscale to fully connect..."
+              sleep "$WAIT_TIME"
 
-        # Get our Tailscale IP
-        MY_IP=$(tailscale ip -4 2>/dev/null || echo "")
+              # Get our Tailscale IP
+              MY_IP=$(tailscale ip -4 2>/dev/null || echo "")
 
-        if [ -z "$MY_IP" ]; then
-          echo "❌ Failed to get Tailscale IP"
-          echo "connected=false" >> $GITHUB_OUTPUT
-          echo "tailscale_ip=" >> $GITHUB_OUTPUT
-          exit 1
-        fi
+              if [ -z "$MY_IP" ]; then
+                echo "❌ Failed to get Tailscale IP"
+                echo "connected=false" >> $GITHUB_OUTPUT
+                echo "tailscale_ip=" >> $GITHUB_OUTPUT
+                exit 1
+              fi
 
-        echo "✅ Connected to Tailscale"
-        echo "📍 Our Tailscale IP: $MY_IP"
-        echo "connected=true" >> $GITHUB_OUTPUT
-        echo "tailscale_ip=$MY_IP" >> $GITHUB_OUTPUT
+              echo "✅ Connected to Tailscale"
+              echo "📍 Our Tailscale IP: $MY_IP"
+              echo "connected=true" >> $GITHUB_OUTPUT
+              echo "tailscale_ip=$MY_IP" >> $GITHUB_OUTPUT
 
-        # Show Tailscale status
-        echo ""
-        echo "📊 Tailscale Status:"
-        tailscale status || true
+              # Show Tailscale status
+              echo ""
+              echo "📊 Tailscale Status:"
+              tailscale status || true
 
-        # If target IP provided, test connectivity
-        if [ -n "$TARGET_IP" ]; then
-          echo ""
-          echo "🎯 Target: $TARGET_IP"
-          echo "Testing connectivity..."
+              # If target IP provided, test connectivity
+              if [ -n "$TARGET_IP" ]; then
+                echo ""
+                echo "🎯 Target: $TARGET_IP"
+                echo "Testing connectivity..."
 
-          # Test Tailscale ping
-          if tailscale ping -c 3 "$TARGET_IP" 2>/dev/null; then
-            echo "✅ Target is reachable via Tailscale"
-            echo "target_reachable=true" >> $GITHUB_OUTPUT
-          else
-            echo "⚠️ Tailscale ping failed, but SSH may still work"
-            echo "target_reachable=false" >> $GITHUB_OUTPUT
-          fi
+                # Test Tailscale ping
+                if tailscale ping -c 3 "$TARGET_IP" 2>/dev/null; then
+                  echo "✅ Target is reachable via Tailscale"
+                  echo "target_reachable=true" >> $GITHUB_OUTPUT
+                else
+                  echo "⚠️ Tailscale ping failed, but SSH may still work"
+                  echo "target_reachable=false" >> $GITHUB_OUTPUT
+                fi
 
-          # Test SSH port if specified
-          if [ -n "$TARGET_SSH_PORT" ]; then
-            echo ""
-            echo "🔐 Testing SSH port $TARGET_SSH_PORT..."
-            if nc -zv -w 5 "$TARGET_IP" "$TARGET_SSH_PORT" 2>&1 | grep -qE '(succeeded|open)'; then
-              echo "✅ SSH port $TARGET_SSH_PORT is reachable"
-              echo "ssh_reachable=true" >> $GITHUB_OUTPUT
-            else
-              echo "⚠️ SSH port $TARGET_SSH_PORT not directly reachable"
-              echo "ssh_reachable=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "ssh_reachable=" >> $GITHUB_OUTPUT
-          fi
-        else
-          echo "target_reachable=" >> $GITHUB_OUTPUT
-          echo "ssh_reachable=" >> $GITHUB_OUTPUT
-        fi
+                # Test SSH port if specified
+                if [ -n "$TARGET_SSH_PORT" ]; then
+                  echo ""
+                  echo "🔐 Testing SSH port $TARGET_SSH_PORT..."
+                  if nc -zv -w 5 "$TARGET_IP" "$TARGET_SSH_PORT" 2>&1 | grep -qE '(succeeded|open)'; then
+                    echo "✅ SSH port $TARGET_SSH_PORT is reachable"
+                    echo "ssh_reachable=true" >> $GITHUB_OUTPUT
+                  else
+                    echo "⚠️ SSH port $TARGET_SSH_PORT not directly reachable"
+                    echo "ssh_reachable=false" >> $GITHUB_OUTPUT
+                  fi
+                else
+                  echo "ssh_reachable=" >> $GITHUB_OUTPUT
+                fi
+              else
+                echo "target_reachable=" >> $GITHUB_OUTPUT
+                echo "ssh_reachable=" >> $GITHUB_OUTPUT
+              fi
 
-        echo ""
-        echo "🎉 Tailscale setup complete!"
+              echo ""
+              echo "🎉 Tailscale setup complete!"
