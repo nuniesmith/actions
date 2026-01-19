@@ -108,7 +108,7 @@ jobs:
                   proto-directory: "proto"
                   run-fmt: "true"
                   run-clippy: "true"
-                  clippy-args: "--workspace --lib -- -D warnings -A clippy::too-many-arguments -A clippy::manual-range-contains -A clippy::should-implement-trait"
+                  clippy-args: "--lib -- -D warnings -A clippy::too-many-arguments -A clippy::manual-range-contains -A clippy::should-implement-trait"
                   run-build: "true"
                   build-release: "true"
                   run-tests: "true"
