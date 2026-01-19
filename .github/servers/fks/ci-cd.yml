@@ -125,7 +125,6 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 30
         if: ${{ !inputs.skip_tests }}
-        continue-on-error: true
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -145,6 +144,7 @@ jobs:
                   known-test-failures: "20"
                   upload-test-results: "true"
                   continue-on-test-failure: "true"
+                  validate-wrapper: "false"
 
     # =========================================================================
     # TEST GATE - Must pass before proceeding
@@ -169,15 +169,29 @@ jobs:
                   echo "| 🦀 Rust CI | ${{ needs.rust-ci.result }} |" >> $GITHUB_STEP_SUMMARY
                   echo "| 🎯 Kotlin CI | ${{ needs.kotlin-ci.result }} |" >> $GITHUB_STEP_SUMMARY
 
+                  FAILED=false
+
                   if [ "${{ needs.rust-ci.result }}" = "failure" ]; then
                     echo "❌ Rust CI failed - blocking pipeline"
+                    FAILED=true
+                  fi
+
+                  if [ "${{ needs.kotlin-ci.result }}" = "failure" ]; then
+                    echo "❌ Kotlin CI failed - blocking pipeline"
+                    FAILED=true
+                  fi
+
+                  if [ "$FAILED" = "true" ]; then
                     echo "passed=false" >> $GITHUB_OUTPUT
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "## ❌ Pipeline Blocked" >> $GITHUB_STEP_SUMMARY
+                    echo "One or more CI jobs failed. Docker build, deploy, and subsequent jobs will be skipped." >> $GITHUB_STEP_SUMMARY
                     exit 1
                   elif [ "${{ needs.rust-ci.result }}" = "skipped" ] && [ "${{ needs.kotlin-ci.result }}" = "skipped" ]; then
                     echo "⚠️ All tests skipped - proceeding"
                     echo "passed=true" >> $GITHUB_OUTPUT
                   else
-                    echo "✅ Test gate passed"
+                    echo "✅ Test gate passed - all CI jobs successful"
                     echo "passed=true" >> $GITHUB_OUTPUT
                   fi
 
@@ -191,8 +205,7 @@ jobs:
         timeout-minutes: 60
         needs: test-gate
         if: |
-            always() &&
-            (needs.test-gate.result == 'success' || needs.test-gate.result == 'skipped') &&
+            needs.test-gate.result == 'success' &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
         strategy:
@@ -238,9 +251,9 @@ jobs:
         name: 🔐 Infrastructure Setup
         runs-on: ubuntu-latest
         timeout-minutes: 15
-        needs: docker-build
+        needs: [test-gate, docker-build]
         if: |
-            always() &&
+            needs.test-gate.result == 'success' &&
             needs.docker-build.result == 'success' &&
             github.event_name == 'push' &&
             github.ref == 'refs/heads/main' &&
@@ -281,9 +294,9 @@ jobs:
         name: 🔐 SSL Certificates
         runs-on: ubuntu-latest
         timeout-minutes: 15
-        needs: infrastructure-setup
+        needs: [test-gate, infrastructure-setup]
         if: |
-            always() &&
+            needs.test-gate.result == 'success' &&
             needs.infrastructure-setup.result == 'success' &&
             github.event_name == 'push' &&
             github.ref == 'refs/heads/main' &&
@@ -331,9 +344,9 @@ jobs:
         name: 🚀 Deploy to Production
         runs-on: ubuntu-latest
         timeout-minutes: 30
-        needs: [docker-build, infrastructure-setup, ssl-certificates]
+        needs: [test-gate, docker-build, infrastructure-setup, ssl-certificates]
         if: |
-            always() &&
+            needs.test-gate.result == 'success' &&
             needs.docker-build.result == 'success' &&
             needs.infrastructure-setup.result == 'success' &&
             (needs.ssl-certificates.result == 'success' || needs.ssl-certificates.result == 'skipped') &&
@@ -382,6 +395,9 @@ jobs:
                       docker volume create fks_grafana_data 2>/dev/null || true
                       echo "✅ Docker volumes ready"
                   deploy-command: |
+                      echo "🔐 Logging into Docker Hub..."
+                      echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
+
                       echo "📝 Validating .env file..."
                       [ ! -f .env ] && touch .env
 
@@ -403,8 +419,12 @@ jobs:
                       ensure_env_var "REAL_ORDERS_ENABLED" "false"
                       ensure_env_var "ENABLE_EXECUTION" "true"
                       ensure_env_var "REGISTRY" "docker.io"
+                      ensure_env_var "IMAGE_NAME" "nuniesmith/fks"
 
                       set -a && source .env && set +a
+
+                      echo "📋 Using registry: ${REGISTRY}"
+                      echo "📋 Using image name: ${IMAGE_NAME}"
 
                       echo "🛑 Stopping existing containers..."
                       docker compose -f infrastructure/compose/docker-compose.yml \

@@ -71,6 +71,10 @@ inputs:
         description: "Only read from cache, do not write (useful during outages or for PRs)"
         required: false
         default: "false"
+    validate-wrapper:
+        description: "Validate Gradle wrapper JAR against known checksums (disable for custom/unknown wrappers)"
+        required: false
+        default: "true"
 
 outputs:
     build-result:
@@ -107,6 +111,7 @@ runs:
               gradle-version: ${{ inputs.gradle-version }}
               cache-disabled: ${{ inputs.gradle-cache-enabled != 'true' }}
               cache-read-only: ${{ inputs.gradle-cache-read-only == 'true' }}
+              validate-wrappers: ${{ inputs.validate-wrapper == 'true' }}
 
         - name: 📦 Validate Gradle wrapper
           shell: bash
