@@ -173,6 +173,7 @@ jobs:
             tailscale_connected: ${{ steps.tailscale.outputs.connected }}
             target_host: ${{ steps.config.outputs.host }}
             target_domain: ${{ steps.config.outputs.domain }}
+            target_hostname: ${{ steps.config.outputs.hostname }}
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -220,12 +221,16 @@ jobs:
                   ENV="${{ needs.setup.outputs.deploy_env }}"
                   if [ "$ENV" = "production" ]; then
                     HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+                    HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
                     echo "host=$HOST" >> $GITHUB_OUTPUT
+                    echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
                     echo "domain=${{ env.DOMAIN }}" >> $GITHUB_OUTPUT
                     echo "ssh_port=${{ secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
                   else
                     HOST="${{ secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}"
+                    HOSTNAME="${{ secrets.STAGING_HOSTNAME || secrets.PROD_HOSTNAME }}"
                     echo "host=$HOST" >> $GITHUB_OUTPUT
+                    echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
                     echo "domain=${{ env.STAGING_DOMAIN }}" >> $GITHUB_OUTPUT
                     echo "ssh_port=${{ secrets.STAGING_SSH_PORT || secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
                   fi
@@ -238,7 +243,7 @@ jobs:
                     exit 1
                   fi
 
-                  echo "✅ Configured for $ENV: host=$HOST"
+                  echo "✅ Configured for $ENV: host=$HOST, hostname=${HOSTNAME:-not set}"
 
             - name: ✅ Validate Tailscale ACL
               run: |
@@ -288,46 +293,25 @@ jobs:
             - name: ⚙️ Configure SSL target
               id: ssl-config
               run: |
-                  # Try infrastructure outputs first, fallback to secrets directly
-                  TARGET_HOST="${{ needs.infrastructure-setup.outputs.target_host }}"
-                  TARGET_DOMAIN="${{ needs.infrastructure-setup.outputs.target_domain }}"
-
-                  # Fallback to secrets if outputs are empty
-                  if [ -z "$TARGET_HOST" ]; then
-                    echo "⚠️ Infrastructure output target_host is empty, using secret directly"
-                    TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
-                  fi
-
-                  if [ -z "$TARGET_DOMAIN" ]; then
-                    echo "⚠️ Infrastructure output target_domain is empty, using env directly"
-                    TARGET_DOMAIN="${{ env.DOMAIN }}"
-                  fi
+                  # Use secrets directly for reliability
+                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+                  TARGET_DOMAIN="${{ env.DOMAIN }}"
+                  TARGET_HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
 
                   # Final validation
                   if [ -z "$TARGET_HOST" ]; then
-                    echo "❌ ERROR: Could not determine target host!"
-                    echo ""
-                    echo "Neither infrastructure-setup outputs nor PROD_TAILSCALE_IP secret are available."
-                    echo ""
-                    echo "To fix this, add the PROD_TAILSCALE_IP secret:"
-                    echo "1. Go to your repository Settings"
-                    echo "2. Navigate to Secrets and variables → Actions"
-                    echo "3. Add: PROD_TAILSCALE_IP = Your server's Tailscale IP (e.g., 100.x.x.x)"
-                    echo ""
+                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
                     echo "## ❌ Missing: PROD_TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
-                    exit 1
-                  fi
-
-                  if [ -z "$TARGET_DOMAIN" ]; then
-                    echo "❌ ERROR: Could not determine target domain!"
                     exit 1
                   fi
 
                   echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
                   echo "domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
+                  echo "hostname=$TARGET_HOSTNAME" >> $GITHUB_OUTPUT
 
                   echo "✅ SSL target configured:"
                   echo "   Host: $TARGET_HOST"
+                  echo "   Hostname: ${TARGET_HOSTNAME:-not set}"
                   echo "   Domain: $TARGET_DOMAIN"
 
             - name: 🔌 Connect to Tailscale
@@ -382,19 +366,43 @@ jobs:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
+            - name: ⚙️ Configure deploy target
+              id: deploy-config
+              run: |
+                  # Use secrets directly for reliability
+                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+                  TARGET_DOMAIN="${{ env.DOMAIN }}"
+                  TARGET_HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
+
+                  # Final validation
+                  if [ -z "$TARGET_HOST" ]; then
+                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
+                    echo "## ❌ Missing: PROD_TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+                    exit 1
+                  fi
+
+                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
+                  echo "domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
+                  echo "hostname=$TARGET_HOSTNAME" >> $GITHUB_OUTPUT
+
+                  echo "✅ Deploy target configured:"
+                  echo "   Host: $TARGET_HOST"
+                  echo "   Hostname: ${TARGET_HOSTNAME:-not set}"
+                  echo "   Domain: $TARGET_DOMAIN"
+
             - name: 🔌 Connect to Tailscale
               uses: nuniesmith/actions/.github/actions/tailscale-connect@main
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ needs.infrastructure-setup.outputs.target_host }}
+                  target-ip: ${{ steps.deploy-config.outputs.host }}
                   target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
 
             - name: 🚀 Deploy via SSH
               id: deploy
               uses: nuniesmith/actions/.github/actions/ssh-deploy@main
               with:
-                  host: ${{ needs.infrastructure-setup.outputs.target_host }}
+                  host: ${{ steps.deploy-config.outputs.host }}
                   port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   username: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -517,24 +525,47 @@ jobs:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
+            - name: ⚙️ Configure health-check target
+              id: health-config
+              run: |
+                  # Use secrets directly for reliability
+                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+                  TARGET_DOMAIN="${{ env.DOMAIN }}"
+                  TARGET_HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
+
+                  # Final validation
+                  if [ -z "$TARGET_HOST" ]; then
+                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
+                    exit 1
+                  fi
+
+                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
+                  echo "domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
+                  echo "hostname=$TARGET_HOSTNAME" >> $GITHUB_OUTPUT
+
+                  echo "✅ Health-check target configured:"
+                  echo "   Host: $TARGET_HOST"
+                  echo "   Hostname: ${TARGET_HOSTNAME:-not set}"
+                  echo "   Domain: $TARGET_DOMAIN"
+
             - name: 🔌 Connect to Tailscale
               uses: nuniesmith/actions/.github/actions/tailscale-connect@main
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ needs.infrastructure-setup.outputs.target_host }}
+                  target-ip: ${{ steps.health-config.outputs.host }}
 
             - name: 🏥 Run Health Checks
               uses: nuniesmith/actions/.github/actions/health-check@main
               with:
                   endpoints: |
                       [
-                        {"url": "https://${{ needs.infrastructure-setup.outputs.target_domain }}/health", "expected_status": 200},
-                        {"url": "http://${{ needs.infrastructure-setup.outputs.target_host }}:3000/api/health", "expected_status": 200},
-                        {"url": "http://${{ needs.infrastructure-setup.outputs.target_host }}:9090/-/healthy", "expected_status": 200}
+                        {"url": "https://${{ steps.health-config.outputs.domain }}/health", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}:3000/api/health", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}:9090/-/healthy", "expected_status": 200}
                       ]
                   containers: "fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana"
-                  ssh-host: ${{ needs.infrastructure-setup.outputs.target_host }}
+                  ssh-host: ${{ steps.health-config.outputs.host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -556,7 +587,7 @@ jobs:
                   fields: |
                       [
                         {"name": "Environment", "value": "${{ needs.setup.outputs.deploy_env }}", "inline": true},
-                        {"name": "Domain", "value": "${{ needs.infrastructure-setup.outputs.target_domain }}", "inline": true},
+                        {"name": "Domain", "value": "${{ steps.health-config.outputs.domain || env.DOMAIN }}", "inline": true},
                         {"name": "SSL", "value": "${{ needs.ssl-certificates.outputs.cert_type || 'skipped' }}", "inline": true}
                       ]
 
