@@ -135,10 +135,6 @@ jobs:
                       dockerfile: infrastructure/docker/base/rust/Dockerfile
                       target: execution
                       build_args: SERVICE_NAME=execution
-                    - name: optimizer
-                      dockerfile: src/optimizer/Dockerfile
-                      target: ""
-                      build_args: ""
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -181,19 +177,68 @@ jobs:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
+            - name: 🔍 Validate required secrets
+              run: |
+                  ENV="${{ needs.setup.outputs.deploy_env }}"
+                  MISSING_SECRETS=""
+
+                  # Check PROD_TAILSCALE_IP (always required)
+                  if [ -z "${{ secrets.PROD_TAILSCALE_IP }}" ]; then
+                    MISSING_SECRETS="${MISSING_SECRETS}\n  - PROD_TAILSCALE_IP (required for all deployments)"
+                  fi
+
+                  # Check PROD_SSH_KEY (always required)
+                  if [ -z "${{ secrets.PROD_SSH_KEY }}" ]; then
+                    MISSING_SECRETS="${MISSING_SECRETS}\n  - PROD_SSH_KEY (required for SSH deployment)"
+                  fi
+
+                  # Check Tailscale OAuth (required for VPN connection)
+                  if [ -z "${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}" ]; then
+                    MISSING_SECRETS="${MISSING_SECRETS}\n  - TAILSCALE_OAUTH_CLIENT_ID (required for Tailscale connection)"
+                  fi
+                  if [ -z "${{ secrets.TAILSCALE_OAUTH_SECRET }}" ]; then
+                    MISSING_SECRETS="${MISSING_SECRETS}\n  - TAILSCALE_OAUTH_SECRET (required for Tailscale connection)"
+                  fi
+
+                  if [ -n "$MISSING_SECRETS" ]; then
+                    echo "❌ Missing required secrets for $ENV deployment:"
+                    echo -e "$MISSING_SECRETS"
+                    echo ""
+                    echo "📝 Please add these secrets in: Settings → Secrets and variables → Actions"
+                    echo ""
+                    echo "## ❌ Missing Secrets" >> $GITHUB_STEP_SUMMARY
+                    echo "The following secrets are required but not configured:" >> $GITHUB_STEP_SUMMARY
+                    echo -e "$MISSING_SECRETS" >> $GITHUB_STEP_SUMMARY
+                    exit 1
+                  fi
+
+                  echo "✅ All required secrets are configured"
+
             - name: ⚙️ Configure environment
               id: config
               run: |
                   ENV="${{ needs.setup.outputs.deploy_env }}"
                   if [ "$ENV" = "production" ]; then
-                    echo "host=${{ secrets.PROD_TAILSCALE_IP }}" >> $GITHUB_OUTPUT
+                    HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+                    echo "host=$HOST" >> $GITHUB_OUTPUT
                     echo "domain=${{ env.DOMAIN }}" >> $GITHUB_OUTPUT
                     echo "ssh_port=${{ secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
                   else
-                    echo "host=${{ secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}" >> $GITHUB_OUTPUT
+                    HOST="${{ secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}"
+                    echo "host=$HOST" >> $GITHUB_OUTPUT
                     echo "domain=${{ env.STAGING_DOMAIN }}" >> $GITHUB_OUTPUT
                     echo "ssh_port=${{ secrets.STAGING_SSH_PORT || secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
                   fi
+
+                  # Double-check host is not empty
+                  if [ -z "$HOST" ]; then
+                    echo "❌ Host IP is empty after configuration!"
+                    echo "Environment: $ENV"
+                    echo "This should not happen if secrets validation passed."
+                    exit 1
+                  fi
+
+                  echo "✅ Configured for $ENV: host=$HOST"
 
             - name: ✅ Validate Tailscale ACL
               run: |
@@ -240,25 +285,70 @@ jobs:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
+            - name: ⚙️ Configure SSL target
+              id: ssl-config
+              run: |
+                  # Try infrastructure outputs first, fallback to secrets directly
+                  TARGET_HOST="${{ needs.infrastructure-setup.outputs.target_host }}"
+                  TARGET_DOMAIN="${{ needs.infrastructure-setup.outputs.target_domain }}"
+
+                  # Fallback to secrets if outputs are empty
+                  if [ -z "$TARGET_HOST" ]; then
+                    echo "⚠️ Infrastructure output target_host is empty, using secret directly"
+                    TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+                  fi
+
+                  if [ -z "$TARGET_DOMAIN" ]; then
+                    echo "⚠️ Infrastructure output target_domain is empty, using env directly"
+                    TARGET_DOMAIN="${{ env.DOMAIN }}"
+                  fi
+
+                  # Final validation
+                  if [ -z "$TARGET_HOST" ]; then
+                    echo "❌ ERROR: Could not determine target host!"
+                    echo ""
+                    echo "Neither infrastructure-setup outputs nor PROD_TAILSCALE_IP secret are available."
+                    echo ""
+                    echo "To fix this, add the PROD_TAILSCALE_IP secret:"
+                    echo "1. Go to your repository Settings"
+                    echo "2. Navigate to Secrets and variables → Actions"
+                    echo "3. Add: PROD_TAILSCALE_IP = Your server's Tailscale IP (e.g., 100.x.x.x)"
+                    echo ""
+                    echo "## ❌ Missing: PROD_TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+                    exit 1
+                  fi
+
+                  if [ -z "$TARGET_DOMAIN" ]; then
+                    echo "❌ ERROR: Could not determine target domain!"
+                    exit 1
+                  fi
+
+                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
+                  echo "domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
+
+                  echo "✅ SSL target configured:"
+                  echo "   Host: $TARGET_HOST"
+                  echo "   Domain: $TARGET_DOMAIN"
+
             - name: 🔌 Connect to Tailscale
               uses: nuniesmith/actions/.github/actions/tailscale-connect@main
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ needs.infrastructure-setup.outputs.target_host }}
+                  target-ip: ${{ steps.ssl-config.outputs.host }}
 
             - name: 🔐 Generate & Deploy SSL Certificates
               id: ssl
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
               with:
-                  domain: ${{ needs.infrastructure-setup.outputs.target_domain }}
-                  additional-domains: "www.${{ needs.infrastructure-setup.outputs.target_domain }}"
+                  domain: ${{ steps.ssl-config.outputs.domain }}
+                  additional-domains: "www.${{ steps.ssl-config.outputs.domain }}"
                   cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
                   email: ${{ secrets.SSL_EMAIL }}
                   fallback-to-self-signed: "true"
                   self-signed-days: "365"
                   deploy-to-server: "true"
-                  ssh-host: ${{ needs.infrastructure-setup.outputs.target_host }}
+                  ssh-host: ${{ steps.ssl-config.outputs.host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -375,7 +465,7 @@ jobs:
 
                       # Pull images
                       echo "📥 Pulling images..."
-                      for svc in janus execution optimizer; do
+                      for svc in janus execution; do
                         docker pull ${REGISTRY}/${IMAGE_NAME}:${svc}-latest 2>&1 | tail -1 || echo "⚠️ ${svc} pull failed"
                       done
 
@@ -458,7 +548,7 @@ jobs:
               uses: nuniesmith/actions/.github/actions/discord-notify@main
               continue-on-error: true
               with:
-                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_GITHUB }}
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
                   title: "${{ needs.deploy.result == 'success' && '🚀 FKS Deployed' || '❌ FKS Deploy Failed' }}"
                   description: "Deployed to ${{ needs.setup.outputs.deploy_env }}"
                   status: ${{ needs.deploy.result == 'success' && 'success' || 'failure' }}
