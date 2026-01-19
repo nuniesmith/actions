@@ -242,18 +242,18 @@ runs:
                 done || echo "  (No env files to create or JSON parsing skipped)"
               fi
 
+              # Git pull (always runs if enabled, regardless of custom deploy command)
+              if [ "$GIT_PULL" = "true" ]; then
+                echo "📥 Pulling latest changes from git (${GIT_BRANCH})..."
+                ssh_exec "cd ${PROJECT_PATH} && git fetch origin && git checkout ${GIT_BRANCH} 2>/dev/null || true && git pull origin ${GIT_BRANCH}"
+              fi
+
               # Custom deploy command takes precedence
               if [ -n "$DEPLOY_COMMAND" ]; then
                 echo "⚙️ Running custom deploy command..."
                 ssh_exec "cd ${PROJECT_PATH} && ${DEPLOY_COMMAND}"
               else
                 # Standard Docker Compose deployment
-
-                # Git pull
-                if [ "$GIT_PULL" = "true" ]; then
-                  echo "📥 Pulling latest changes from git (${GIT_BRANCH})..."
-                  ssh_exec "cd ${PROJECT_PATH} && git fetch origin && git checkout ${GIT_BRANCH} 2>/dev/null || true && git pull origin ${GIT_BRANCH}"
-                fi
 
                 # Stop containers
                 echo "🛑 Stopping current containers..."
@@ -286,6 +286,12 @@ runs:
                 echo ""
                 echo "📊 Container status:"
                 ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} ps || docker-compose -f ${COMPOSE_FILE} ps" || true
+              fi
+
+              # Docker prune (runs for both custom and standard deployments if enabled)
+              if [ "$DOCKER_PRUNE" = "true" ] && [ -n "$DEPLOY_COMMAND" ]; then
+                echo "🧹 Pruning unused Docker resources..."
+                ssh_exec "docker image prune -af && docker container prune -f && docker builder prune -af" || true
               fi
 
               # Run post-deploy command
