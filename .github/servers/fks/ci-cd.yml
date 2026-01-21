@@ -99,6 +99,18 @@ jobs:
                   PROD_DOMAIN: ${{ env.DOMAIN }}
                   STAGE_DOMAIN: ${{ env.STAGING_DOMAIN }}
               run: |
+                  # Early validation - fail fast if critical secrets are missing
+                  if [ -z "$PROD_TAILSCALE_IP" ]; then
+                    echo "❌ FATAL: PROD_TAILSCALE_IP secret is not set or empty!"
+                    echo "## ❌ Missing Required Secret" >> $GITHUB_STEP_SUMMARY
+                    echo "The \`PROD_TAILSCALE_IP\` secret must be configured in repository settings." >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "Go to: **Settings → Secrets and variables → Actions → New repository secret**" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "Set \`PROD_TAILSCALE_IP\` to your production server's Tailscale IP (e.g., \`100.x.x.x\`)" >> $GITHUB_STEP_SUMMARY
+                    exit 1
+                  fi
+
                   # Determine environment
                   if [ -n "$INPUT_ENV" ] && [ "$INPUT_ENV" != "auto" ]; then
                     ENV="$INPUT_ENV"
