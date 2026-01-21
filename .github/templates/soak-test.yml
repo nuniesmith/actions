@@ -1,0 +1,757 @@
+# =============================================================================
+# Soak Test / Long-Running Test Workflow Template
+# =============================================================================
+# A template for running extended duration tests (12-72+ hours) with periodic
+# health checks and notifications on a remote production server via Tailscale/SSH.
+#
+# ⚠️ IMPORTANT: GitHub-hosted runners have a 6-hour job timeout limit.
+# This template is designed for SELF-HOSTED RUNNERS with no timeout limits.
+# See the "Runner Requirements" section below for alternatives.
+#
+# Features:
+# - Manual trigger with configurable duration and options
+# - Paper trading / simulation mode support
+# - Connects to production server via Tailscale VPN
+# - Runs tests remotely via SSH
+# - Periodic health checks at configurable intervals
+# - Discord notifications for status updates
+# - Automatic log collection
+# - Clean shutdown and final reporting
+#
+# Runner Requirements:
+# --------------------
+# Option 1: Self-hosted runner (RECOMMENDED for soak tests)
+#   - No timeout limits
+#   - Change `runs-on: ubuntu-latest` to `runs-on: self-hosted`
+#   - Ensure runner has Docker, SSH client installed
+#
+# Option 2: Use scheduled workflows (for GitHub-hosted runners)
+#   - Split into separate workflows triggered by cron
+#   - Store test state externally (e.g., in a file on the server)
+#   - Not covered by this template
+#
+# Usage:
+# ------
+# 1. Copy this file to your repo's .github/workflows/ directory
+# 2. Update the CUSTOMIZATION SECTION below
+# 3. Add required secrets to your repository
+# 4. Trigger manually from GitHub Actions UI
+#
+# Required Secrets:
+# -----------------
+# - PROD_SSH_KEY: SSH private key for deployment
+# - PROD_SSH_USER: SSH username (or set default in env)
+# - PROD_SSH_PORT: SSH port (default: 22)
+# - PROD_TAILSCALE_IP: Target server's Tailscale IP (100.x.x.x)
+# - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth client ID
+# - TAILSCALE_OAUTH_SECRET: Tailscale OAuth secret
+# - DISCORD_WEBHOOK_ACTIONS: Discord webhook URL (optional)
+# - DOCKER_USERNAME: Docker Hub username (if rebuilding images)
+# - DOCKER_TOKEN: Docker Hub token (if rebuilding images)
+# =============================================================================
+
+name: 🧪 Soak Test
+
+on:
+    workflow_dispatch:
+        inputs:
+            duration_hours:
+                description: "Test duration in hours"
+                required: false
+                type: choice
+                options:
+                    - "1"
+                    - "6"
+                    - "12"
+                    - "24"
+                    - "48"
+                    - "72"
+                default: "48"
+            # ─────────────────────────────────────────────────────────────────
+            # CUSTOMIZE: Add your test-specific inputs below
+            # ─────────────────────────────────────────────────────────────────
+            test_targets:
+                description: "Test targets (comma-separated)"
+                required: false
+                type: string
+                default: "target1,target2,target3"
+            health_check_interval:
+                description: "Health check interval"
+                required: false
+                type: choice
+                options:
+                    - "15m"
+                    - "30m"
+                    - "1h"
+                    - "2h"
+                    - "4h"
+                default: "1h"
+            rebuild_images:
+                description: "Force rebuild Docker images"
+                required: false
+                type: boolean
+                default: false
+            clean_state:
+                description: "Clean state before starting (fresh DB/volumes)"
+                required: false
+                type: boolean
+                default: false
+            notify_on_health_checks:
+                description: "Send Discord notifications for each health check"
+                required: false
+                type: boolean
+                default: false
+
+permissions:
+    contents: read
+    actions: write
+
+# =============================================================================
+# CUSTOMIZATION SECTION - Update these for your project
+# =============================================================================
+env:
+    # Project settings
+    PROJECT_NAME: my-project
+    PROJECT_PATH: ~/my-project
+    COMPOSE_FILE: docker-compose.yml
+
+    # Docker settings (leave empty to skip Docker builds)
+    REGISTRY: docker.io
+    IMAGE_NAME: myuser/my-project
+
+    # Container names to monitor (space-separated)
+    MONITORED_CONTAINERS: "my-project_app my-project_worker my-project_db"
+
+    # Test identification
+    TEST_ID: "soak-${{ github.run_number }}-${{ github.run_attempt }}"
+
+# =============================================================================
+# END CUSTOMIZATION SECTION
+# =============================================================================
+
+concurrency:
+    group: soak-test-${{ github.repository }}
+    cancel-in-progress: false # Don't cancel running soak tests
+
+jobs:
+    # =========================================================================
+    # STAGE 1: SETUP AND VALIDATION
+    # =========================================================================
+    setup:
+        name: 📋 Setup Test
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        outputs:
+            test_id: ${{ steps.config.outputs.test_id }}
+            start_time: ${{ steps.config.outputs.start_time }}
+            end_time: ${{ steps.config.outputs.end_time }}
+            duration_seconds: ${{ steps.config.outputs.duration_seconds }}
+            health_interval_seconds: ${{ steps.config.outputs.health_interval_seconds }}
+            health_check_count: ${{ steps.config.outputs.health_check_count }}
+            target_host: ${{ steps.target.outputs.host }}
+        steps:
+            - name: 🎯 Configure test parameters
+              id: config
+              run: |
+                  START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                  DURATION_HOURS=${{ inputs.duration_hours }}
+                  DURATION_SECONDS=$((DURATION_HOURS * 3600))
+                  END_TIME=$(date -u -d "+${DURATION_HOURS} hours" +"%Y-%m-%dT%H:%M:%SZ")
+
+                  # Calculate health check interval in seconds
+                  INTERVAL="${{ inputs.health_check_interval }}"
+                  case "$INTERVAL" in
+                    "15m") INTERVAL_SECONDS=900 ;;
+                    "30m") INTERVAL_SECONDS=1800 ;;
+                    "1h")  INTERVAL_SECONDS=3600 ;;
+                    "2h")  INTERVAL_SECONDS=7200 ;;
+                    "4h")  INTERVAL_SECONDS=14400 ;;
+                    *)     INTERVAL_SECONDS=3600 ;;
+                  esac
+
+                  # Calculate number of health checks
+                  HEALTH_CHECK_COUNT=$((DURATION_SECONDS / INTERVAL_SECONDS))
+
+                  # Output values
+                  echo "test_id=${{ env.TEST_ID }}" >> $GITHUB_OUTPUT
+                  echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
+                  echo "end_time=$END_TIME" >> $GITHUB_OUTPUT
+                  echo "duration_seconds=$DURATION_SECONDS" >> $GITHUB_OUTPUT
+                  echo "health_interval_seconds=$INTERVAL_SECONDS" >> $GITHUB_OUTPUT
+                  echo "health_check_count=$HEALTH_CHECK_COUNT" >> $GITHUB_OUTPUT
+
+                  # Display configuration
+                  echo "╔══════════════════════════════════════════════════════════════╗"
+                  echo "║               SOAK TEST CONFIGURATION                        ║"
+                  echo "╠══════════════════════════════════════════════════════════════╣"
+                  echo "║  Test ID:           ${{ env.TEST_ID }}"
+                  echo "║  Duration:          ${DURATION_HOURS} hours"
+                  echo "║  Health Interval:   ${{ inputs.health_check_interval }}"
+                  echo "║  Health Checks:     ~${HEALTH_CHECK_COUNT} checks planned"
+                  echo "║  Test Targets:      ${{ inputs.test_targets }}"
+                  echo "║  Start:             $START_TIME"
+                  echo "║  Expected End:      $END_TIME"
+                  echo "╚══════════════════════════════════════════════════════════════╝"
+
+            - name: ⚙️ Configure target host
+              id: target
+              run: |
+                  # Use Tailscale IP from secrets
+                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+
+                  if [ -z "$TARGET_HOST" ]; then
+                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
+                    echo "## ❌ Missing: PROD_TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+                    exit 1
+                  fi
+
+                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
+                  echo "✅ Target host configured: $TARGET_HOST"
+
+            - name: 🔍 Validate configuration
+              env:
+                  HAS_SSH_KEY: ${{ secrets.PROD_SSH_KEY != '' }}
+                  HAS_TAILSCALE_IP: ${{ secrets.PROD_TAILSCALE_IP != '' }}
+                  HAS_TAILSCALE_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID != '' }}
+                  HAS_TAILSCALE_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET != '' }}
+              run: |
+                  ERRORS=""
+
+                  if [ "$HAS_SSH_KEY" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - PROD_SSH_KEY"
+                  fi
+                  if [ "$HAS_TAILSCALE_IP" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - PROD_TAILSCALE_IP"
+                  fi
+                  if [ "$HAS_TAILSCALE_ID" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - TAILSCALE_OAUTH_CLIENT_ID"
+                  fi
+                  if [ "$HAS_TAILSCALE_SECRET" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - TAILSCALE_OAUTH_SECRET"
+                  fi
+
+                  if [ -n "$ERRORS" ]; then
+                    echo -e "❌ Missing required secrets:$ERRORS"
+                    exit 1
+                  fi
+
+                  echo "✅ All required secrets present"
+
+            - name: ⚠️ Verify runner capability
+              run: |
+                  DURATION_HOURS=${{ inputs.duration_hours }}
+
+                  if [ "$DURATION_HOURS" -gt 5 ]; then
+                    echo "╔══════════════════════════════════════════════════════════════╗"
+                    echo "║  ⚠️  WARNING: Long-duration test selected                    ║"
+                    echo "╠══════════════════════════════════════════════════════════════╣"
+                    echo "║  Duration: ${DURATION_HOURS} hours                                          "
+                    echo "║                                                              ║"
+                    echo "║  GitHub-hosted runners have a 6-hour job timeout.            ║"
+                    echo "║  For tests longer than ~5 hours, ensure you're using a       ║"
+                    echo "║  self-hosted runner with no timeout limits.                  ║"
+                    echo "║                                                              ║"
+                    echo "║  To use self-hosted runner, change 'runs-on' in the          ║"
+                    echo "║  'run-test' job from 'ubuntu-latest' to 'self-hosted'.       ║"
+                    echo "╚══════════════════════════════════════════════════════════════╝"
+                  fi
+
+    # =========================================================================
+    # STAGE 2: BUILD IMAGES (Optional)
+    # =========================================================================
+    build:
+        name: 🐳 Build Images
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: setup
+        if: ${{ inputs.rebuild_images }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            # ─────────────────────────────────────────────────────────────────
+            # CUSTOMIZE: Update this section for your Docker build process
+            # ─────────────────────────────────────────────────────────────────
+            - name: 🐳 Build and Push
+              uses: nuniesmith/actions/.github/actions/docker-build-push@main
+              with:
+                  image-name: ${{ env.IMAGE_NAME }}
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
+                  dockerfile: Dockerfile
+                  context: .
+                  platforms: linux/amd64
+                  push: true
+                  tags: |
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+    # =========================================================================
+    # STAGE 3: DEPLOY TEST ENVIRONMENT VIA TAILSCALE/SSH
+    # =========================================================================
+    deploy:
+        name: 🚀 Deploy Test Environment
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [setup, build]
+        if: always() && needs.setup.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+        outputs:
+            deployed: ${{ steps.deploy.outputs.deployed }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🚀 Deploy Test Environment
+              id: deploy
+              uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+              with:
+                  host: ${{ needs.setup.outputs.target_host }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  project-path: ${{ env.PROJECT_PATH }}
+                  git-pull: "true"
+                  git-branch: ${{ github.ref_name }}
+                  docker-pull: "true"
+                  # ───────────────────────────────────────────────────────────
+                  # CUSTOMIZE: Update deployment commands for your project
+                  # ───────────────────────────────────────────────────────────
+                  pre-deploy-command: |
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "🧪 PREPARING SOAK TEST ENVIRONMENT"
+                      echo "════════════════════════════════════════════════════════════"
+
+                      # System info
+                      echo "🖥️  Host: $(hostname) | $(date)"
+                      echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free | Memory: $(free -h | grep Mem | awk '{print $7}') available"
+
+                      # Create test configuration
+                      TEST_ENV_FILE=".env.soak-test"
+                      cat > "$TEST_ENV_FILE" << 'ENVEOF'
+                      # Soak Test Configuration
+                      # Test ID: ${{ needs.setup.outputs.test_id }}
+                      # Generated: ${{ needs.setup.outputs.start_time }}
+
+                      # Test Mode Settings
+                      TEST_MODE=true
+                      SIMULATION_MODE=true
+
+                      # Test Parameters
+                      TEST_ID=${{ needs.setup.outputs.test_id }}
+                      TEST_START_TIME=${{ needs.setup.outputs.start_time }}
+                      TEST_DURATION_HOURS=${{ inputs.duration_hours }}
+                      TEST_TARGETS=${{ inputs.test_targets }}
+                      ENVEOF
+
+                      # Merge with existing .env if present (keep passwords, etc.)
+                      if [ -f .env ]; then
+                        grep -E "^[A-Z_]+=" .env | grep -v "^TEST_" >> "$TEST_ENV_FILE" 2>/dev/null || true
+                      fi
+
+                      # Create log directory
+                      TEST_LOG_DIR="logs/soak-test-$(date +%Y%m%d-%H%M%S)"
+                      mkdir -p "$TEST_LOG_DIR"
+                      echo "TEST_LOG_DIR=$TEST_LOG_DIR" >> "$TEST_ENV_FILE"
+
+                      echo "✅ Test configuration created: $TEST_ENV_FILE"
+
+                  deploy-command: |
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "🚀 STARTING SOAK TEST"
+                      echo "════════════════════════════════════════════════════════════"
+
+                      # Docker login (if credentials available)
+                      if [ -n "${{ secrets.DOCKER_TOKEN }}" ]; then
+                        echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
+                      fi
+
+                      # Source test environment
+                      set -a && source .env.soak-test && set +a
+
+                      # Clean state if requested
+                      if [ "${{ inputs.clean_state }}" = "true" ]; then
+                        echo "🧹 Cleaning existing state..."
+                        docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans 2>/dev/null || true
+                      else
+                        echo "🛑 Stopping existing containers..."
+                        docker compose -f ${{ env.COMPOSE_FILE }} down --remove-orphans 2>/dev/null || true
+                      fi
+
+                      # Pull latest images
+                      echo "📥 Pulling images..."
+                      docker compose -f ${{ env.COMPOSE_FILE }} pull --ignore-pull-failures 2>&1 || true
+
+                      # Start services
+                      echo "🏗️ Starting services..."
+                      docker compose -f ${{ env.COMPOSE_FILE }} up -d
+
+                      echo "⏳ Waiting for services to initialize..."
+                      sleep 30
+
+                      # Start log collection
+                      TEST_LOG_DIR=$(grep TEST_LOG_DIR .env.soak-test | cut -d= -f2)
+                      nohup docker compose -f ${{ env.COMPOSE_FILE }} logs -f --timestamps > "$TEST_LOG_DIR/all-services.log" 2>&1 &
+                      echo $! > "$TEST_LOG_DIR/log-collector.pid"
+
+                      # Save test metadata
+                      cat > "$TEST_LOG_DIR/test-info.json" << EOF
+                      {
+                        "test_id": "${{ needs.setup.outputs.test_id }}",
+                        "test_type": "soak_test",
+                        "start_time": "${{ needs.setup.outputs.start_time }}",
+                        "expected_end_time": "${{ needs.setup.outputs.end_time }}",
+                        "duration_hours": ${{ inputs.duration_hours }},
+                        "test_targets": "${{ inputs.test_targets }}",
+                        "github_run_id": "${{ github.run_id }}",
+                        "github_sha": "${{ github.sha }}",
+                        "triggered_by": "${{ github.actor }}"
+                      }
+                      EOF
+
+                      # Display status
+                      echo ""
+                      echo "╔══════════════════════════════════════════════════════════════╗"
+                      echo "║              SOAK TEST DEPLOYED SUCCESSFULLY                 ║"
+                      echo "╚══════════════════════════════════════════════════════════════╝"
+                      echo ""
+                      echo "📊 Container Status:"
+                      docker ps --format "table {{.Names}}\t{{.Status}}" | head -15
+                      echo ""
+                      echo "📁 Logs: $TEST_LOG_DIR"
+
+                      # Verify deployment
+                      RUNNING=$(docker ps --format '{{.Names}}' | wc -l)
+                      if [ "$RUNNING" -ge 1 ]; then
+                        echo "deployed=true" >> $GITHUB_OUTPUT
+                      else
+                        echo "deployed=false" >> $GITHUB_OUTPUT
+                      fi
+
+                  post-deploy-command: |
+                      echo ""
+                      echo "🔍 Initial health check..."
+                      docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+                      echo ""
+                      echo "✅ Deployment complete! Test is running on remote server."
+
+            - name: 📣 Notify test started
+              if: steps.deploy.outputs.deployed == 'true'
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🧪 Soak Test Started"
+                  description: "Soak test has been deployed and started on production server."
+                  status: success
+                  include-repo-info: true
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Duration|${{ inputs.duration_hours }} hours|true
+                      Targets|${{ inputs.test_targets }}|true
+                      Health Interval|${{ inputs.health_check_interval }}|true
+                      Start Time|${{ needs.setup.outputs.start_time }}|false
+                      Expected End|${{ needs.setup.outputs.end_time }}|false
+
+    # =========================================================================
+    # STAGE 4: RUN TEST WITH HEALTH CHECKS VIA SSH
+    # =========================================================================
+    # ⚠️ This job runs for the full duration of the test.
+    # For GitHub-hosted runners, max is ~6 hours.
+    # For longer tests, use a self-hosted runner.
+    # =========================================================================
+    run-test:
+        name: 🏃 Run Soak Test
+        # ─────────────────────────────────────────────────────────────────────
+        # IMPORTANT: For tests > 5 hours, change to: runs-on: self-hosted
+        # ─────────────────────────────────────────────────────────────────────
+        runs-on: ubuntu-latest
+        timeout-minutes: 21600 # 15 days max (self-hosted), GitHub-hosted will use 6h limit
+        needs: [setup, deploy]
+        if: needs.deploy.outputs.deployed == 'true'
+        steps:
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🏃 Run test with periodic health checks via SSH
+              env:
+                  DURATION_SECONDS: ${{ needs.setup.outputs.duration_seconds }}
+                  HEALTH_INTERVAL: ${{ needs.setup.outputs.health_interval_seconds }}
+                  TEST_ID: ${{ needs.setup.outputs.test_id }}
+                  SSH_HOST: ${{ needs.setup.outputs.target_host }}
+                  SSH_PORT: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  SSH_USER: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+                  NOTIFY_HEALTH_CHECKS: ${{ inputs.notify_on_health_checks }}
+                  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  PROJECT_PATH: ${{ env.PROJECT_PATH }}
+                  COMPOSE_FILE: ${{ env.COMPOSE_FILE }}
+                  MONITORED_CONTAINERS: ${{ env.MONITORED_CONTAINERS }}
+              run: |
+                  # Setup SSH key
+                  mkdir -p ~/.ssh
+                  chmod 700 ~/.ssh
+                  echo "$SSH_KEY" > ~/.ssh/soak_test_key
+                  chmod 600 ~/.ssh/soak_test_key
+
+                  # SSH config for stable long-running connections
+                  cat >> ~/.ssh/config << EOF
+                  Host soak-test-target
+                      HostName $SSH_HOST
+                      Port $SSH_PORT
+                      User $SSH_USER
+                      IdentityFile ~/.ssh/soak_test_key
+                      StrictHostKeyChecking no
+                      UserKnownHostsFile /dev/null
+                      ConnectTimeout 30
+                      ServerAliveInterval 60
+                      ServerAliveCountMax 10
+                  EOF
+
+                  ssh_cmd() {
+                    ssh soak-test-target "$1"
+                  }
+
+                  send_discord() {
+                    if [ -n "$DISCORD_WEBHOOK" ] && [ "$NOTIFY_HEALTH_CHECKS" = "true" ]; then
+                      local title="$1"
+                      local desc="$2"
+                      local color="$3"
+                      curl -s -H "Content-Type: application/json" \
+                        -d "{\"embeds\":[{\"title\":\"$title\",\"description\":\"$desc\",\"color\":$color}]}" \
+                        "$DISCORD_WEBHOOK" > /dev/null 2>&1 || true
+                    fi
+                  }
+
+                  echo "╔══════════════════════════════════════════════════════════════╗"
+                  echo "║              SOAK TEST MONITORING STARTED                    ║"
+                  echo "╚══════════════════════════════════════════════════════════════╝"
+                  echo ""
+                  echo "Test ID: $TEST_ID"
+                  echo "Target Host: $SSH_HOST"
+                  echo "Duration: $((DURATION_SECONDS / 3600)) hours"
+                  echo "Health check interval: $((HEALTH_INTERVAL / 60)) minutes"
+                  echo ""
+
+                  START_TIME=$(date +%s)
+                  END_TIME=$((START_TIME + DURATION_SECONDS))
+                  CHECK_NUMBER=0
+                  FAILURES=0
+
+                  while [ $(date +%s) -lt $END_TIME ]; do
+                    CHECK_NUMBER=$((CHECK_NUMBER + 1))
+                    ELAPSED=$(($(date +%s) - START_TIME))
+                    ELAPSED_HOURS=$((ELAPSED / 3600))
+                    ELAPSED_MINS=$(((ELAPSED % 3600) / 60))
+                    REMAINING=$((END_TIME - $(date +%s)))
+                    REMAINING_HOURS=$((REMAINING / 3600))
+
+                    echo ""
+                    echo "═══════════════════════════════════════════════════════════"
+                    echo "🏥 HEALTH CHECK #$CHECK_NUMBER (via SSH to $SSH_HOST)"
+                    echo "   Elapsed: ${ELAPSED_HOURS}h ${ELAPSED_MINS}m | Remaining: ~${REMAINING_HOURS}h"
+                    echo "═══════════════════════════════════════════════════════════"
+
+                    # Run health check via SSH to remote server
+                    HEALTH_OUTPUT=$(ssh_cmd "cd $PROJECT_PATH && \
+                      echo '📊 Container Status:' && \
+                      docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}' && \
+                      echo '' && \
+                      echo '💾 Resource Usage:' && \
+                      docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' | head -10 && \
+                      echo '' && \
+                      echo '📝 Recent Logs (last 5 lines per container):' && \
+                      for c in $MONITORED_CONTAINERS; do \
+                        echo \"--- \$c ---\" && \
+                        docker logs --tail 5 \"\$c\" 2>&1 || echo 'Container not found'; \
+                      done" 2>&1) || HEALTH_OUTPUT="❌ SSH connection failed"
+
+                    echo "$HEALTH_OUTPUT"
+
+                    # Check for failures
+                    if echo "$HEALTH_OUTPUT" | grep -qi "error\|fail\|unhealthy\|exited"; then
+                      FAILURES=$((FAILURES + 1))
+                      echo ""
+                      echo "⚠️ Potential issue detected (failure count: $FAILURES)"
+                      send_discord "⚠️ Soak Test Health Warning" "Check #$CHECK_NUMBER found potential issues. Test ID: $TEST_ID" "16776960"
+                    else
+                      echo ""
+                      echo "✅ Health check passed"
+                    fi
+
+                    # Milestone notifications (25%, 50%, 75%)
+                    PROGRESS=$((ELAPSED * 100 / DURATION_SECONDS))
+                    if [ "$PROGRESS" -ge 25 ] && [ "$PROGRESS" -lt 30 ] && [ "$CHECK_NUMBER" -gt 1 ]; then
+                      send_discord "🏥 Soak Test: 25% Complete" "Test ID: $TEST_ID - Running for ${ELAPSED_HOURS}h" "3447003"
+                    elif [ "$PROGRESS" -ge 50 ] && [ "$PROGRESS" -lt 55 ]; then
+                      send_discord "🏥 Soak Test: 50% Complete (Halfway!)" "Test ID: $TEST_ID - Running for ${ELAPSED_HOURS}h" "3447003"
+                    elif [ "$PROGRESS" -ge 75 ] && [ "$PROGRESS" -lt 80 ]; then
+                      send_discord "🏥 Soak Test: 75% Complete" "Test ID: $TEST_ID - Running for ${ELAPSED_HOURS}h" "3447003"
+                    fi
+
+                    # Wait for next health check (unless test is complete)
+                    if [ $(date +%s) -lt $END_TIME ]; then
+                      SLEEP_TIME=$HEALTH_INTERVAL
+                      # Don't sleep past end time
+                      if [ $(($(date +%s) + SLEEP_TIME)) -gt $END_TIME ]; then
+                        SLEEP_TIME=$((END_TIME - $(date +%s)))
+                      fi
+                      if [ "$SLEEP_TIME" -gt 0 ]; then
+                        echo ""
+                        echo "⏳ Next health check in $((SLEEP_TIME / 60)) minutes..."
+                        sleep $SLEEP_TIME
+                      fi
+                    fi
+                  done
+
+                  echo ""
+                  echo "╔══════════════════════════════════════════════════════════════╗"
+                  echo "║              SOAK TEST DURATION COMPLETE                     ║"
+                  echo "╚══════════════════════════════════════════════════════════════╝"
+                  echo ""
+                  echo "Total health checks: $CHECK_NUMBER"
+                  echo "Potential issues detected: $FAILURES"
+
+                  # Cleanup SSH key
+                  rm -f ~/.ssh/soak_test_key
+
+    # =========================================================================
+    # STAGE 5: FINAL REPORT VIA SSH
+    # =========================================================================
+    final-report:
+        name: 📊 Final Report
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        needs: [setup, deploy, run-test]
+        if: always() && needs.deploy.outputs.deployed == 'true'
+        outputs:
+            end_time: ${{ steps.end_time.outputs.value }}
+        steps:
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 📊 Generate final report via SSH
+              id: report
+              uses: appleboy/ssh-action@v1.0.3
+              with:
+                  host: ${{ needs.setup.outputs.target_host }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  key: ${{ secrets.PROD_SSH_KEY }}
+                  script: |
+                      cd ${{ env.PROJECT_PATH }}
+                      END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+                      echo "═══════════════════════════════════════════════════════════"
+                      echo "📊 FINAL REPORT - ${{ needs.setup.outputs.test_id }}"
+                      echo "═══════════════════════════════════════════════════════════"
+
+                      TEST_LOG_DIR=$(grep TEST_LOG_DIR .env.soak-test 2>/dev/null | cut -d= -f2 || echo "logs")
+
+                      echo ""
+                      echo "📦 Final Container Status:"
+                      docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+
+                      echo ""
+                      echo "💾 Final Resource Usage:"
+                      docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"
+
+                      echo ""
+                      echo "⚠️ Error Summary:"
+                      for container in ${{ env.MONITORED_CONTAINERS }}; do
+                        ERROR_COUNT=$(docker logs "$container" 2>&1 | grep -ci "error\|panic\|fatal" || echo "0")
+                        echo "  $container: $ERROR_COUNT errors"
+                      done
+
+                      echo ""
+                      echo "📁 Log files saved to: $TEST_LOG_DIR"
+                      ls -la "$TEST_LOG_DIR" 2>/dev/null || echo "Log directory not found"
+
+                      # Stop log collector
+                      if [ -f "$TEST_LOG_DIR/log-collector.pid" ]; then
+                        kill $(cat "$TEST_LOG_DIR/log-collector.pid") 2>/dev/null || true
+                      fi
+
+                      # Create summary file
+                      cat > "$TEST_LOG_DIR/final-report.txt" << EOF
+                      ════════════════════════════════════════════════════════════
+                      SOAK TEST - FINAL REPORT
+                      ════════════════════════════════════════════════════════════
+                      Test ID: ${{ needs.setup.outputs.test_id }}
+                      Duration: ${{ inputs.duration_hours }} hours
+                      Start: ${{ needs.setup.outputs.start_time }}
+                      End: $END_TIME
+                      Test Targets: ${{ inputs.test_targets }}
+
+                      Container Status:
+                      $(docker ps -a --format "{{.Names}}: {{.Status}}")
+
+                      Resource Usage:
+                      $(docker stats --no-stream --format "{{.Name}}: {{.MemUsage}} ({{.CPUPerc}} CPU)")
+                      ════════════════════════════════════════════════════════════
+                      EOF
+
+                      echo ""
+                      echo "✅ Test completed!"
+
+            - name: 🕐 Capture end time
+              id: end_time
+              run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+            - name: 📣 Notify test complete
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "✅ Soak Test Complete!"
+                  description: "The ${{ inputs.duration_hours }}-hour soak test has finished on production server."
+                  status: ${{ needs.run-test.result == 'success' && 'success' || 'warning' }}
+                  include-repo-info: true
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Duration|${{ inputs.duration_hours }} hours|true
+                      Test Targets|${{ inputs.test_targets }}|true
+                      Result|${{ needs.run-test.result }}|true
+                      Start Time|${{ needs.setup.outputs.start_time }}|false
+                      End Time|${{ steps.end_time.outputs.value }}|false
+
+    # =========================================================================
+    # CLEANUP ON FAILURE
+    # =========================================================================
+    cleanup-on-failure:
+        name: 🧹 Cleanup on Failure
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [setup, deploy, run-test]
+        if: failure()
+        steps:
+            - name: 📣 Notify failure
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "❌ Soak Test Failed"
+                  description: "The soak test failed to complete successfully on production server."
+                  status: failure
+                  include-repo-info: true
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Failed Stage|Check workflow logs|true
+                      Duration Planned|${{ inputs.duration_hours }} hours|true

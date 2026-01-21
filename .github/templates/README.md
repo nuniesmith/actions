@@ -11,6 +11,8 @@ Ready-to-use CI/CD workflow templates for different project types. These templat
 | [nodejs-project.yml](./nodejs-project.yml) | Node.js/TypeScript CI with npm/yarn/pnpm | Node.js, TypeScript |
 | [python-project.yml](./python-project.yml) | Python CI with pip/poetry/pipenv | Python |
 | [simple-deploy.yml](./simple-deploy.yml) | Minimal deployment-only workflow | Any |
+| [soak-test.yml](./soak-test.yml) | Generic long-running soak test template | Any |
+| [48hr-paper-trading-test.yml](./48hr-paper-trading-test.yml) | 48-hour paper trading soak test (FKS-specific) | Trading Systems |
 
 ---
 
@@ -71,7 +73,7 @@ No secrets required! The workflows will run tests without any configuration.
 |--------|-------------|
 | `TAILSCALE_OAUTH_CLIENT_ID` | Tailscale OAuth Client ID |
 | `TAILSCALE_OAUTH_SECRET` | Tailscale OAuth Secret |
-| `PROD_TAILSCALE_IP` | Server's Tailscale IP (100.x.x.x) |
+| `PROD_TAILSCALE_IP` | Server's Tailscale IP (100.x.x.x) - **required for soak tests** |
 | `PROD_SSH_KEY` | SSH private key for `actions` user |
 | `PROD_SSH_USER` | SSH username (default: `actions`) |
 | `PROD_SSH_PORT` | SSH port (default: `22`) |
@@ -81,6 +83,7 @@ No secrets required! The workflows will run tests without any configuration.
 | Secret | Description |
 |--------|-------------|
 | `DISCORD_WEBHOOK` | Discord webhook for notifications |
+| `DISCORD_WEBHOOK_ACTIONS` | Discord webhook for CI/CD notifications (soak tests) |
 | `CODECOV_TOKEN` | Codecov token for coverage reports |
 
 ---
@@ -141,6 +144,67 @@ No secrets required! The workflows will run tests without any configuration.
   - Manual trigger with environment selection
   - Git pull or deploy current state
   - Docker Compose deployment
+
+### 🧪 Soak Test Template (`soak-test.yml`)
+
+- **Stages**: Setup → Build (optional) → Deploy → Run Test with Health Checks → Final Report
+- **Features**:
+  - Configurable duration (1-72+ hours)
+  - Periodic health checks at configurable intervals
+  - Discord notifications for milestones (25%, 50%, 75%, complete)
+  - Automatic log collection
+  - Resource usage monitoring
+  - Clean shutdown and final reporting
+- **⚠️ Requirements**:
+  - **Self-hosted runner recommended** for tests > 5 hours
+  - GitHub-hosted runners have a 6-hour job timeout limit
+
+### 📈 48-Hour Paper Trading Test (`48hr-paper-trading-test.yml`)
+
+- **Stages**: Setup → Build → Deploy → Health Checks (1h, 6h, 24h) → Final Report
+- **Features**:
+  - Paper trading / simulation mode
+  - Optimizer hot-reload testing
+  - Multiple health check checkpoints
+  - Detailed signal and error tracking
+  - Test metadata persistence
+- **⚠️ Requirements**:
+  - **Self-hosted runner required** for full 48-hour tests
+  - FKS-specific (customize for your trading system)
+
+---
+
+## Soak Test Requirements
+
+⚠️ **Important: GitHub-hosted runners have a 6-hour job timeout limit.**
+
+For long-running soak tests (> 5 hours), you have several options:
+
+### Option 1: Self-Hosted Runner (Recommended)
+
+Set up a self-hosted runner with no timeout limits:
+
+```yaml
+jobs:
+  run-test:
+    runs-on: self-hosted  # Instead of ubuntu-latest
+```
+
+### Option 2: Shorter Test Durations
+
+For GitHub-hosted runners, limit tests to ≤ 5 hours to stay within timeout limits.
+
+### Option 3: Scheduled Checkpoints
+
+Split long tests into multiple workflow runs triggered by cron schedules:
+
+```yaml
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+```
+
+Store test state on the server and check/continue from where you left off.
 
 ---
 

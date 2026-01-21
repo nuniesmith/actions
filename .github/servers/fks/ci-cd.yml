@@ -595,12 +595,14 @@ jobs:
               with:
                   endpoints: |
                       [
-                        {"url": "https://${{ steps.health-config.outputs.domain }}/health", "expected_status": 200},
-                        {"url": "https://${{ steps.health-config.outputs.domain }}/health/grafana", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}:9090/-/healthy", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}:9000/ping", "expected_status": 200}
+                        {"url": "http://${{ steps.health-config.outputs.host }}/health", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}/health/web", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}/health/janus", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}/health/grafana", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}/prometheus/-/healthy", "expected_status": 200},
+                        {"url": "http://${{ steps.health-config.outputs.host }}/questdb/", "expected_status": 200}
                       ]
-                  containers: "fks_janus fks_execution fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana fks_nginx"
+                  containers: "fks_janus fks_execution fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana fks_nginx fks_web"
                   ssh-host: ${{ steps.health-config.outputs.host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}

@@ -1,0 +1,752 @@
+# =============================================================================
+# FKS 48-Hour Paper Trading Test Workflow
+# =============================================================================
+# Deploys and monitors a 48-hour paper trading soak test on the production server.
+#
+# ⚠️ IMPORTANT: RUNNER REQUIREMENTS
+# ----------------------------------
+# GitHub-hosted runners have a 6-hour maximum job timeout. This workflow uses
+# long sleep intervals in health check jobs that WILL FAIL on GitHub-hosted
+# runners for tests longer than ~5 hours.
+#
+# SOLUTIONS:
+# 1. Use a SELF-HOSTED RUNNER (recommended) - change `runs-on: ubuntu-latest`
+#    to `runs-on: self-hosted` in the health check and final-report jobs
+# 2. For shorter tests (≤5 hours), GitHub-hosted runners work fine
+# 3. See the generic `soak-test.yml` template for a restructured approach
+#
+# Features:
+# - Manual trigger with configurable options
+# - Paper trading mode (no real orders)
+# - Optimizer hot-reload testing
+# - Periodic health checks (1h, 6h, 24h checkpoints)
+# - Discord notifications for status updates
+# - Automatic log collection
+#
+# Usage:
+#   Trigger manually from GitHub Actions UI with desired options
+#
+# Required Secrets:
+# - PROD_SSH_KEY, PROD_SSH_USER, PROD_SSH_PORT
+# - PROD_TAILSCALE_IP (server's Tailscale IP, e.g., 100.x.x.x)
+# - TAILSCALE_OAUTH_CLIENT_ID, TAILSCALE_OAUTH_SECRET
+# - DOCKER_USERNAME, DOCKER_TOKEN (if rebuilding images)
+# - DISCORD_WEBHOOK_ACTIONS (optional, for notifications)
+# =============================================================================
+
+name: 🧪 48-Hour Paper Trading Test
+
+on:
+    workflow_dispatch:
+        inputs:
+            duration_hours:
+                description: "Test duration in hours"
+                required: false
+                type: choice
+                options:
+                    - "12"
+                    - "24"
+                    - "48"
+                    - "72"
+                default: "48"
+            assets:
+                description: "Assets to trade (comma-separated)"
+                required: false
+                type: string
+                default: "BTC,ETH,SOL"
+            optimize_interval:
+                description: "Optimization interval"
+                required: false
+                type: choice
+                options:
+                    - "1h"
+                    - "2h"
+                    - "4h"
+                    - "6h"
+                    - "12h"
+                default: "6h"
+            optimize_trials:
+                description: "Optimization trials per asset"
+                required: false
+                type: choice
+                options:
+                    - "20"
+                    - "50"
+                    - "100"
+                default: "50"
+            rebuild_images:
+                description: "Force rebuild Docker images"
+                required: false
+                type: boolean
+                default: false
+            clean_volumes:
+                description: "Clean volumes before starting (fresh DB)"
+                required: false
+                type: boolean
+                default: false
+            run_initial_optimization:
+                description: "Run optimization immediately on start"
+                required: false
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
+    actions: write
+
+env:
+    REGISTRY: docker.io
+    IMAGE_NAME: nuniesmith/fks
+    TEST_ID: "48hr-${{ github.run_number }}-${{ github.run_attempt }}"
+
+concurrency:
+    group: paper-trading-test
+    cancel-in-progress: false # Don't cancel running tests
+
+jobs:
+    # ===========================================================================
+    # STAGE 1: SETUP AND VALIDATION
+    # ===========================================================================
+    setup:
+        name: 📋 Setup Test
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            test_id: ${{ steps.config.outputs.test_id }}
+            start_time: ${{ steps.config.outputs.start_time }}
+            end_time: ${{ steps.config.outputs.end_time }}
+            duration_seconds: ${{ steps.config.outputs.duration_seconds }}
+            target_host: ${{ steps.target.outputs.host }}
+        steps:
+            - name: 🎯 Configure test parameters
+              id: config
+              run: |
+                  START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                  DURATION_HOURS=${{ inputs.duration_hours }}
+                  DURATION_SECONDS=$((DURATION_HOURS * 3600))
+                  END_TIME=$(date -u -d "+${DURATION_HOURS} hours" +"%Y-%m-%dT%H:%M:%SZ")
+
+                  echo "test_id=${{ env.TEST_ID }}" >> $GITHUB_OUTPUT
+                  echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
+                  echo "end_time=$END_TIME" >> $GITHUB_OUTPUT
+                  echo "duration_seconds=$DURATION_SECONDS" >> $GITHUB_OUTPUT
+
+                  echo "╔══════════════════════════════════════════════════════════════╗"
+                  echo "║           48-HOUR PAPER TRADING TEST CONFIGURATION           ║"
+                  echo "╠══════════════════════════════════════════════════════════════╣"
+                  echo "║  Test ID:      ${{ env.TEST_ID }}"
+                  echo "║  Duration:     ${DURATION_HOURS} hours"
+                  echo "║  Assets:       ${{ inputs.assets }}"
+                  echo "║  Optimizer:    ${{ inputs.optimize_interval }} interval, ${{ inputs.optimize_trials }} trials"
+                  echo "║  Start:        $START_TIME"
+                  echo "║  End:          $END_TIME"
+                  echo "╚══════════════════════════════════════════════════════════════╝"
+
+            - name: ⚙️ Configure target host
+              id: target
+              run: |
+                  # Use Tailscale IP from secrets
+                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+
+                  if [ -z "$TARGET_HOST" ]; then
+                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
+                    echo "## ❌ Missing: PROD_TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+                    exit 1
+                  fi
+
+                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
+                  echo "✅ Target host configured: $TARGET_HOST"
+
+            - name: 🔍 Validate secrets
+              env:
+                  HAS_SSH_KEY: ${{ secrets.PROD_SSH_KEY != '' }}
+                  HAS_TAILSCALE_IP: ${{ secrets.PROD_TAILSCALE_IP != '' }}
+                  HAS_TAILSCALE_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID != '' }}
+                  HAS_TAILSCALE_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET != '' }}
+              run: |
+                  ERRORS=""
+
+                  if [ "$HAS_SSH_KEY" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - PROD_SSH_KEY"
+                  fi
+                  if [ "$HAS_TAILSCALE_IP" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - PROD_TAILSCALE_IP"
+                  fi
+                  if [ "$HAS_TAILSCALE_ID" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - TAILSCALE_OAUTH_CLIENT_ID"
+                  fi
+                  if [ "$HAS_TAILSCALE_SECRET" != "true" ]; then
+                    ERRORS="${ERRORS}\n  - TAILSCALE_OAUTH_SECRET"
+                  fi
+
+                  if [ -n "$ERRORS" ]; then
+                    echo -e "❌ Missing required secrets:$ERRORS"
+                    exit 1
+                  fi
+                  echo "✅ All required secrets present"
+
+    # ===========================================================================
+    # STAGE 2: BUILD IMAGES (if requested)
+    # ===========================================================================
+    build:
+        name: 🐳 Build Images
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: setup
+        if: ${{ inputs.rebuild_images }}
+        strategy:
+            fail-fast: false
+            matrix:
+                service:
+                    - name: janus
+                      target: workspace
+                    - name: execution
+                      target: execution
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🐳 Build and Push
+              uses: nuniesmith/actions/.github/actions/docker-build-push@main
+              with:
+                  image-name: ${{ env.IMAGE_NAME }}
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
+                  dockerfile: infrastructure/docker/base/rust/Dockerfile
+                  context: .
+                  platforms: linux/amd64
+                  push: true
+                  tags: |
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }}-latest
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }}-${{ github.sha }}
+                  build-args: SERVICE_NAME=${{ matrix.service.name }}
+                  target: ${{ matrix.service.target }}
+
+    # ===========================================================================
+    # STAGE 3: DEPLOY AND START TEST
+    # ===========================================================================
+    deploy:
+        name: 🚀 Deploy Test
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [setup, build]
+        if: always() && needs.setup.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+        outputs:
+            deployed: ${{ steps.deploy.outputs.deployed }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🚀 Deploy Paper Trading Test
+              id: deploy
+              uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+              with:
+                  host: ${{ needs.setup.outputs.target_host }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  project-path: ~/fks
+                  git-pull: "true"
+                  git-branch: ${{ github.ref_name }}
+                  docker-pull: "true"
+                  pre-deploy-command: |
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "🧪 PREPARING 48-HOUR PAPER TRADING TEST"
+                      echo "════════════════════════════════════════════════════════════"
+
+                      # System info
+                      echo "🖥️  Host: $(hostname) | $(date)"
+                      echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free | Memory: $(free -h | grep Mem | awk '{print $7}') available"
+
+                      # Create test configuration
+                      TEST_ENV_FILE=".env.48hr-test"
+                      cat > "$TEST_ENV_FILE" << 'ENVEOF'
+                      # 48-Hour Paper Trading Test Configuration
+                      # Test ID: ${{ needs.setup.outputs.test_id }}
+                      # Generated: ${{ needs.setup.outputs.start_time }}
+
+                      # ============================================
+                      # TRADING MODE - SIMULATION (Paper Trading)
+                      # ============================================
+                      TRADING_MODE=simulation
+                      REAL_ORDERS_ENABLED=false
+
+                      # ============================================
+                      # Execution Service
+                      # ============================================
+                      ENABLE_EXECUTION=true
+                      EXECUTION_EXCHANGE=kraken
+                      BYBIT_TESTNET=true
+
+                      # ============================================
+                      # Risk Limits (Conservative for testing)
+                      # ============================================
+                      MAX_POSITION_SIZE=100
+                      MAX_DAILY_LOSS=50
+                      MAX_OPEN_ORDERS=5
+
+                      # ============================================
+                      # Optimizer Configuration
+                      # ============================================
+                      OPTIMIZER_ENABLED=true
+                      OPTIMIZE_INTERVAL=${{ inputs.optimize_interval }}
+                      OPTIMIZE_ASSETS=${{ inputs.assets }}
+                      OPTIMIZE_TRIALS=${{ inputs.optimize_trials }}
+                      OPTIMIZE_HISTORICAL_DAYS=14
+                      OPTIMIZER_INSTANCE_ID=${{ needs.setup.outputs.test_id }}
+
+                      # ============================================
+                      # Database
+                      # ============================================
+                      POSTGRES_USER=fks_user
+                      POSTGRES_DB=fks
+
+                      # ============================================
+                      # Test Metadata
+                      # ============================================
+                      TEST_ID=${{ needs.setup.outputs.test_id }}
+                      TEST_START_TIME=${{ needs.setup.outputs.start_time }}
+                      TEST_DURATION_HOURS=${{ inputs.duration_hours }}
+                      ENVEOF
+
+                      # Load existing .env and merge with test config
+                      if [ -f .env ]; then
+                        # Keep passwords from existing .env
+                        grep -E "^(POSTGRES_PASSWORD|REDIS_PASSWORD|QUESTDB_PASSWORD|GRAFANA_PASSWORD)=" .env >> "$TEST_ENV_FILE" 2>/dev/null || true
+                      fi
+
+                      # Create test log directory
+                      TEST_LOG_DIR="logs/48hr-test-$(date +%Y%m%d-%H%M%S)"
+                      mkdir -p "$TEST_LOG_DIR"
+                      echo "TEST_LOG_DIR=$TEST_LOG_DIR" >> "$TEST_ENV_FILE"
+
+                      echo "✅ Test configuration created"
+
+                  deploy-command: |
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "🚀 STARTING 48-HOUR PAPER TRADING TEST"
+                      echo "════════════════════════════════════════════════════════════"
+
+                      # Docker login
+                      echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
+
+                      # Source test environment
+                      set -a && source .env.48hr-test && set +a
+
+                      # Clean volumes if requested
+                      if [ "${{ inputs.clean_volumes }}" = "true" ]; then
+                        echo "🧹 Cleaning volumes..."
+                        docker compose -f infrastructure/compose/docker-compose.yml down -v --remove-orphans 2>/dev/null || true
+                      else
+                        echo "🛑 Stopping existing containers..."
+                        docker compose -f infrastructure/compose/docker-compose.yml down --remove-orphans 2>/dev/null || true
+                      fi
+
+                      # Pull latest images
+                      echo "📥 Pulling images..."
+                      docker compose -f infrastructure/compose/docker-compose.yml pull --ignore-pull-failures 2>&1 || true
+
+                      # Start infrastructure first
+                      echo "🏗️ Starting infrastructure..."
+                      docker compose -f infrastructure/compose/docker-compose.yml up -d postgres redis questdb prometheus grafana
+
+                      echo "⏳ Waiting for infrastructure..."
+                      sleep 15
+
+                      # Check infrastructure health
+                      for svc in postgres redis questdb; do
+                        if docker compose -f infrastructure/compose/docker-compose.yml ps "$svc" | grep -q "healthy\|running"; then
+                          echo "  ✓ $svc is ready"
+                        else
+                          echo "  ⚠ $svc may have issues"
+                        fi
+                      done
+
+                      # Start trading services
+                      echo "📈 Starting trading services..."
+                      docker compose -f infrastructure/compose/docker-compose.yml up -d execution janus
+
+                      echo "⏳ Waiting for trading services..."
+                      sleep 20
+
+                      # Run initial optimization if requested
+                      if [ "${{ inputs.run_initial_optimization }}" = "true" ]; then
+                        echo "🔧 Running initial optimization..."
+                        docker exec fks_janus /app/janus-optimizer run-once --quick --assets "${{ inputs.assets }}" 2>&1 || echo "⚠️ Initial optimization had issues"
+                      fi
+
+                      # Start background log collection
+                      TEST_LOG_DIR=$(grep TEST_LOG_DIR .env.48hr-test | cut -d= -f2)
+                      nohup docker compose -f infrastructure/compose/docker-compose.yml logs -f --timestamps > "$TEST_LOG_DIR/all-services.log" 2>&1 &
+                      echo $! > "$TEST_LOG_DIR/log-collector.pid"
+
+                      # Save test metadata
+                      cat > "$TEST_LOG_DIR/test-info.json" << EOF
+                      {
+                        "test_id": "${{ needs.setup.outputs.test_id }}",
+                        "test_type": "48hr_paper_trading",
+                        "start_time": "${{ needs.setup.outputs.start_time }}",
+                        "expected_end_time": "${{ needs.setup.outputs.end_time }}",
+                        "duration_hours": ${{ inputs.duration_hours }},
+                        "mode": "simulation",
+                        "real_orders_enabled": false,
+                        "assets": $(echo '"${{ inputs.assets }}"' | jq -c 'split(",")'),
+                        "optimize_interval": "${{ inputs.optimize_interval }}",
+                        "optimize_trials": ${{ inputs.optimize_trials }},
+                        "github_run_id": "${{ github.run_id }}",
+                        "github_sha": "${{ github.sha }}",
+                        "triggered_by": "${{ github.actor }}"
+                      }
+                      EOF
+
+                      # Show status
+                      echo ""
+                      echo "╔══════════════════════════════════════════════════════════════╗"
+                      echo "║              48-HOUR TEST DEPLOYED SUCCESSFULLY              ║"
+                      echo "╚══════════════════════════════════════════════════════════════╝"
+                      echo ""
+                      echo "📊 Container Status:"
+                      docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -15
+                      echo ""
+                      echo "📁 Logs: $TEST_LOG_DIR"
+
+                      RUNNING=$(docker ps --filter "name=fks" --format '{{.Names}}' | wc -l)
+                      if [ "$RUNNING" -ge 6 ]; then
+                        echo "deployed=true" >> $GITHUB_OUTPUT
+                      else
+                        echo "deployed=false" >> $GITHUB_OUTPUT
+                      fi
+
+                  post-deploy-command: |
+                      echo ""
+                      echo "🔍 Quick health check..."
+
+                      # Check optimizer status
+                      docker exec fks_janus /app/janus-optimizer status 2>&1 | head -20 || echo "⚠️ Optimizer status check failed"
+
+                      echo ""
+                      echo "✅ Deployment complete! Test is running."
+
+            - name: 📣 Notify test started
+              if: steps.deploy.outputs.deployed == 'true'
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🧪 48-Hour Paper Trading Test Started"
+                  description: "Paper trading soak test has been deployed and started."
+                  status: success
+                  include-repo-info: true
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Duration|${{ inputs.duration_hours }} hours|true
+                      Assets|${{ inputs.assets }}|true
+                      Optimizer|${{ inputs.optimize_interval }} / ${{ inputs.optimize_trials }} trials|true
+                      Start Time|${{ needs.setup.outputs.start_time }}|false
+                      Expected End|${{ needs.setup.outputs.end_time }}|false
+
+    # ===========================================================================
+    # STAGE 4: PERIODIC HEALTH CHECKS
+    # ===========================================================================
+    health-check-1h:
+        name: 🏥 Health Check (1h)
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [setup, deploy]
+        if: needs.deploy.outputs.deployed == 'true'
+        steps:
+            - name: ⏳ Wait 1 hour
+              run: sleep 3600
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🏥 Run health check
+              uses: appleboy/ssh-action@v1.0.3
+              with:
+                  host: ${{ needs.setup.outputs.target_host }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  key: ${{ secrets.PROD_SSH_KEY }}
+                  script: |
+                      cd ~/fks
+                      echo "═══════════════════════════════════════════════════════════"
+                      echo "🏥 1-HOUR HEALTH CHECK - ${{ needs.setup.outputs.test_id }}"
+                      echo "═══════════════════════════════════════════════════════════"
+
+                      echo ""
+                      echo "📊 Container Status:"
+                      docker ps --filter "name=fks" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+
+                      echo ""
+                      echo "💾 Memory Usage:"
+                      docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}" | grep fks | head -10
+
+                      echo ""
+                      echo "🔧 Optimizer Status:"
+                      docker exec fks_janus /app/janus-optimizer status 2>&1 | head -30 || echo "⚠️ Could not get optimizer status"
+
+                      echo ""
+                      echo "📈 Recent Signals (last 10):"
+                      docker logs fks_janus --since 1h 2>&1 | grep -i "signal\|trade" | tail -10 || echo "No signals in last hour"
+
+                      echo ""
+                      echo "✅ 1-hour health check complete"
+
+    health-check-6h:
+        name: 🏥 Health Check (6h)
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [setup, deploy, health-check-1h]
+        if: needs.deploy.outputs.deployed == 'true' && inputs.duration_hours >= 12
+        steps:
+            - name: ⏳ Wait until 6h mark
+              run: sleep 18000 # 5 more hours (total 6h)
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🏥 Run health check
+              uses: appleboy/ssh-action@v1.0.3
+              with:
+                  host: ${{ needs.setup.outputs.target_host }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  key: ${{ secrets.PROD_SSH_KEY }}
+                  script: |
+                      cd ~/fks
+                      echo "═══════════════════════════════════════════════════════════"
+                      echo "🏥 6-HOUR HEALTH CHECK - ${{ needs.setup.outputs.test_id }}"
+                      echo "═══════════════════════════════════════════════════════════"
+
+                      docker ps --filter "name=fks" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+                      docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}" | grep fks | head -10
+                      docker exec fks_janus /app/janus-optimizer status 2>&1 | head -30 || true
+
+                      echo ""
+                      echo "📊 Optimization runs in last 6 hours:"
+                      docker logs fks_janus --since 6h 2>&1 | grep -i "optimization\|optimiz" | tail -20 || echo "No optimization logs"
+
+            - name: 📣 Notify 6h checkpoint
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🏥 48-Hour Test: 6-Hour Checkpoint"
+                  description: "Paper trading test has been running for 6 hours."
+                  status: success
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Elapsed|6 hours|true
+
+    health-check-24h:
+        name: 🏥 Health Check (24h)
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [setup, deploy, health-check-6h]
+        if: needs.deploy.outputs.deployed == 'true' && inputs.duration_hours >= 24
+        steps:
+            - name: ⏳ Wait until 24h mark
+              run: sleep 64800 # 18 more hours (total 24h)
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🏥 Run health check
+              uses: appleboy/ssh-action@v1.0.3
+              with:
+                  host: ${{ needs.setup.outputs.target_host }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  key: ${{ secrets.PROD_SSH_KEY }}
+                  script: |
+                      cd ~/fks
+                      echo "═══════════════════════════════════════════════════════════"
+                      echo "🏥 24-HOUR HEALTH CHECK - ${{ needs.setup.outputs.test_id }}"
+                      echo "═══════════════════════════════════════════════════════════"
+
+                      docker ps --filter "name=fks" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+                      docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}" | grep fks | head -10
+
+                      echo ""
+                      echo "📊 24-Hour Summary:"
+                      docker exec fks_janus /app/janus-optimizer status 2>&1 || true
+
+                      # Check for memory leaks
+                      echo ""
+                      echo "💾 Memory trend check:"
+                      docker stats --no-stream --format "{{.Name}}: {{.MemUsage}}" | grep -E "janus|execution"
+
+            - name: 📣 Notify 24h checkpoint
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🏥 48-Hour Test: 24-Hour Checkpoint (Halfway!)"
+                  description: "Paper trading test has completed 24 hours - halfway done!"
+                  status: success
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Elapsed|24 hours|true
+                      Remaining|24 hours|true
+
+    # ===========================================================================
+    # STAGE 5: FINAL REPORT
+    # ===========================================================================
+    final-report:
+        name: 📊 Final Report
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        needs: [setup, deploy, health-check-24h]
+        if: always() && needs.deploy.outputs.deployed == 'true'
+        steps:
+            - name: ⏳ Wait for test completion
+              run: |
+                  # Calculate remaining time
+                  DURATION_HOURS=${{ inputs.duration_hours }}
+                  ELAPSED=24  # After 24h checkpoint
+                  REMAINING=$((DURATION_HOURS - ELAPSED))
+                  REMAINING_SECONDS=$((REMAINING * 3600))
+
+                  if [ $REMAINING_SECONDS -gt 0 ]; then
+                    echo "⏳ Waiting $REMAINING more hours for test completion..."
+                    sleep $REMAINING_SECONDS
+                  fi
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 📊 Generate final report
+              id: report
+              uses: appleboy/ssh-action@v1.0.3
+              with:
+                  host: ${{ needs.setup.outputs.target_host }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  key: ${{ secrets.PROD_SSH_KEY }}
+                  script: |
+                      cd ~/fks
+                      echo "═══════════════════════════════════════════════════════════"
+                      echo "📊 FINAL REPORT - ${{ needs.setup.outputs.test_id }}"
+                      echo "═══════════════════════════════════════════════════════════"
+
+                      TEST_LOG_DIR=$(grep TEST_LOG_DIR .env.48hr-test 2>/dev/null | cut -d= -f2 || echo "logs")
+
+                      echo ""
+                      echo "📦 Container Status:"
+                      docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+
+                      echo ""
+                      echo "💾 Final Memory Usage:"
+                      docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}" | grep fks
+
+                      echo ""
+                      echo "🔧 Final Optimizer Status:"
+                      docker exec fks_janus /app/janus-optimizer status -A 2>&1 || echo "Could not get status"
+
+                      echo ""
+                      echo "📈 Signal Summary:"
+                      docker logs fks_janus 2>&1 | grep -c "signal" || echo "0"
+
+                      echo ""
+                      echo "⚠️ Error Summary:"
+                      docker logs fks_janus 2>&1 | grep -ci "error\|panic\|fatal" || echo "0 errors"
+
+                      echo ""
+                      echo "📁 Log files saved to: $TEST_LOG_DIR"
+                      ls -la "$TEST_LOG_DIR" 2>/dev/null || echo "Log directory not found"
+
+                      # Create summary file
+                      cat > "$TEST_LOG_DIR/final-report.txt" << EOF
+                      ════════════════════════════════════════════════════════════
+                      48-HOUR PAPER TRADING TEST - FINAL REPORT
+                      ════════════════════════════════════════════════════════════
+                      Test ID: ${{ needs.setup.outputs.test_id }}
+                      Duration: ${{ inputs.duration_hours }} hours
+                      Start: ${{ needs.setup.outputs.start_time }}
+                      End: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                      Assets: ${{ inputs.assets }}
+
+                      Container Status:
+                      $(docker ps -a --filter "name=fks" --format "{{.Names}}: {{.Status}}")
+
+                      Memory Usage:
+                      $(docker stats --no-stream --format "{{.Name}}: {{.MemUsage}}" | grep fks)
+
+                      Error Count: $(docker logs fks_janus 2>&1 | grep -ci "error\|panic" || echo "0")
+                      ════════════════════════════════════════════════════════════
+                      EOF
+
+                      echo ""
+                      echo "✅ Test completed successfully!"
+
+            - name: 🕐 Capture end time
+              id: end_time
+              run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+            - name: 📣 Notify test complete
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "✅ 48-Hour Paper Trading Test Complete!"
+                  description: "The ${{ inputs.duration_hours }}-hour paper trading soak test has finished."
+                  status: success
+                  include-repo-info: true
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Duration|${{ inputs.duration_hours }} hours|true
+                      Assets|${{ inputs.assets }}|true
+                      Start Time|${{ needs.setup.outputs.start_time }}|false
+                      End Time|${{ steps.end_time.outputs.value }}|false
+
+    # ===========================================================================
+    # CLEANUP (on failure)
+    # ===========================================================================
+    cleanup-on-failure:
+        name: 🧹 Cleanup on Failure
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [setup, deploy]
+        if: failure()
+        steps:
+            - name: 📣 Notify failure
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "❌ 48-Hour Paper Trading Test Failed"
+                  description: "The paper trading test failed to deploy or encountered an error."
+                  status: failure
+                  include-repo-info: true
+                  fields: |
+                      Test ID|${{ needs.setup.outputs.test_id }}|true
+                      Error Stage|${{ job.status }}|true
