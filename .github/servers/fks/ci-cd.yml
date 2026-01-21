@@ -160,94 +160,54 @@ jobs:
                   EOF
 
     # =========================================================================
-    # STAGE 2: TESTS (temporarily disabled)
+    # STAGE 2: TESTS
     # =========================================================================
     test-rust:
         name: 🦀 Rust Tests
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs: [setup]
-        if: false # Temporarily disabled until deploy is 100%
-        # if: |
-        #     github.event_name == 'pull_request' ||
-        #     github.event_name == 'push'
+        if: |
+            github.event_name == 'pull_request' ||
+            github.event_name == 'push'
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
-            - name: 🦀 Setup Rust
-              uses: nuniesmith/actions/.github/actions/setup-rust@main
+            - name: 🦀 Run Rust CI
+              uses: nuniesmith/actions/.github/actions/rust-ci@main
               with:
-                  rust-version: ${{ env.RUST_VERSION }}
+                  toolchain: ${{ env.RUST_VERSION }}
                   components: clippy, rustfmt
-                  cache: true
-
-            - name: 📋 Check formatting
-              run: cargo fmt --all -- --check
-
-            - name: 🔍 Run Clippy
-              run: cargo clippy --all-targets --all-features -- -D warnings
-
-            - name: 🧪 Run tests
-              run: cargo test --all-features --workspace
-              env:
-                  RUST_BACKTRACE: 1
-
-            - name: 📊 Generate test report
-              if: always()
-              run: |
-                  echo "## 🦀 Rust Test Results" >> $GITHUB_STEP_SUMMARY
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-                  echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-                  echo "| Format | ✅ |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Clippy | ✅ |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Tests | ✅ |" >> $GITHUB_STEP_SUMMARY
+                  run-fmt: "true"
+                  run-clippy: "true"
+                  run-tests: "true"
+                  run-build: "false"
+                  all-features: "true"
+                  workspace: "true"
 
     test-kmp:
         name: 📱 KMP Tests
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs: [setup]
-        if: false # Temporarily disabled until deploy is 100%
-        # if: |
-        #     github.event_name == 'pull_request' ||
-        #     github.event_name == 'push'
+        if: |
+            github.event_name == 'pull_request' ||
+            github.event_name == 'push'
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
-            - name: ☕ Setup Java
-              uses: actions/setup-java@v4
+            - name: 📱 Run KMP CI
+              uses: nuniesmith/actions/.github/actions/kotlin-ci@main
               with:
-                  distribution: "temurin"
                   java-version: "21"
-                  cache: "gradle"
-
-            - name: 🔧 Setup Gradle
-              uses: gradle/actions/setup-gradle@v4
-
-            - name: 🧪 Run KMP tests
-              run: ./gradlew check --no-daemon
-              working-directory: src/clients
-
-            - name: 📊 Generate test report
-              if: always()
-              run: |
-                  echo "## 📱 KMP Test Results" >> $GITHUB_STEP_SUMMARY
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "| Platform | Status |" >> $GITHUB_STEP_SUMMARY
-                  echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
-                  echo "| Common | ✅ |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Web/JS | ✅ |" >> $GITHUB_STEP_SUMMARY
-
-            - name: 📤 Upload test reports
-              if: always()
-              uses: actions/upload-artifact@v4
-              with:
-                  name: kmp-test-reports
-                  path: src/clients/build/reports/
-                  retention-days: 7
+                  java-distribution: "temurin"
+                  working-directory: src/clients
+                  run-tests: "true"
+                  run-build: "true"
+                  test-task: "check"
+                  upload-test-results: "true"
 
     # =========================================================================
     # STAGE 3: DOCKER BUILD
@@ -256,7 +216,7 @@ jobs:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup]
+        needs: [setup, test-rust, test-kmp]
         if: |
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
@@ -557,7 +517,7 @@ jobs:
         name: 📊 Pipeline Summary
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        needs: [setup, docker-build, deploy]
+        needs: [setup, test-rust, test-kmp, docker-build, deploy]
         if: always()
         steps:
             - name: 📊 Generate summary
@@ -575,6 +535,8 @@ jobs:
                   ## Jobs
                   | Job | Status |
                   |-----|--------|
+                  | 🦀 Rust Tests | ${{ needs.test-rust.result || 'skipped' }} |
+                  | 📱 KMP Tests | ${{ needs.test-kmp.result || 'skipped' }} |
                   | 🐳 Docker Build | ${{ needs.docker-build.result || 'skipped' }} |
                   | 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |
 
@@ -596,7 +558,7 @@ jobs:
                   EOF
 
             - name: ❌ Fail on critical errors
-              if: needs.docker-build.result == 'failure' || needs.deploy.result == 'failure'
+              if: needs.test-rust.result == 'failure' || needs.test-kmp.result == 'failure' || needs.docker-build.result == 'failure' || needs.deploy.result == 'failure'
               run: |
                   echo "❌ Pipeline failed"
                   exit 1
