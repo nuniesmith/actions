@@ -1,0 +1,234 @@
+name: "SSL Certificate Check"
+description: "Check existing SSL certificates on a remote server via SSH"
+author: "nuniesmith"
+
+branding:
+    icon: "shield"
+    color: "green"
+
+inputs:
+    ssh-host:
+        description: "SSH host to check certificates on"
+        required: true
+    ssh-port:
+        description: "SSH port"
+        required: false
+        default: "22"
+    ssh-user:
+        description: "SSH username"
+        required: false
+        default: "actions"
+    ssh-key:
+        description: "SSH private key"
+        required: true
+    domain:
+        description: "Domain name to check certificate for"
+        required: true
+    cert-path:
+        description: "Path to certificate on server (supports Docker volumes)"
+        required: false
+        default: "/var/lib/docker/volumes/fks_certbot_certs/_data/live/{domain}/fullchain.pem"
+    renewal-threshold-days:
+        description: "Days before expiry to consider renewal needed"
+        required: false
+        default: "30"
+
+outputs:
+    cert-exists:
+        description: "Whether a certificate exists"
+        value: ${{ steps.check.outputs.cert_exists }}
+    cert-type:
+        description: "Certificate type (letsencrypt, self-signed, none, unknown)"
+        value: ${{ steps.check.outputs.cert_type }}
+    days-left:
+        description: "Days until certificate expiry"
+        value: ${{ steps.check.outputs.days_left }}
+    expiry-date:
+        description: "Certificate expiry date"
+        value: ${{ steps.check.outputs.expiry }}
+    needs-renewal:
+        description: "Whether the certificate needs renewal"
+        value: ${{ steps.check.outputs.needs_renewal }}
+    skip-generation:
+        description: "Whether SSL generation should be skipped (valid LE cert exists)"
+        value: ${{ steps.check.outputs.skip_generation }}
+    issuer:
+        description: "Certificate issuer"
+        value: ${{ steps.check.outputs.issuer }}
+
+runs:
+    using: "composite"
+    steps:
+        - name: 🔐 Setup SSH
+          id: ssh-setup
+          shell: bash
+          env:
+              SSH_KEY: ${{ inputs.ssh-key }}
+              SSH_HOST: ${{ inputs.ssh-host }}
+              SSH_PORT: ${{ inputs.ssh-port }}
+          run: |
+              mkdir -p ~/.ssh
+              chmod 700 ~/.ssh
+              echo "$SSH_KEY" > ~/.ssh/ssl_check_key
+              chmod 600 ~/.ssh/ssl_check_key
+
+              # Add host key
+              ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+              echo "ssh_ready=true" >> $GITHUB_OUTPUT
+
+        - name: 🔍 Check SSL Certificate
+          id: check
+          shell: bash
+          env:
+              SSH_HOST: ${{ inputs.ssh-host }}
+              SSH_PORT: ${{ inputs.ssh-port }}
+              SSH_USER: ${{ inputs.ssh-user }}
+              DOMAIN: ${{ inputs.domain }}
+              CERT_PATH_TEMPLATE: ${{ inputs.cert-path }}
+              RENEWAL_THRESHOLD: ${{ inputs.renewal-threshold-days }}
+          run: |
+              echo "🔍 Checking SSL certificates on $SSH_HOST for $DOMAIN..."
+
+              # Substitute domain in cert path
+              CERT_PATH=$(echo "$CERT_PATH_TEMPLATE" | sed "s/{domain}/$DOMAIN/g")
+
+              # Test SSH connection first
+              echo "🔌 Testing SSH connection..."
+              if ! ssh -i ~/.ssh/ssl_check_key -p "$SSH_PORT" -o ConnectTimeout=10 -o BatchMode=yes "$SSH_USER@$SSH_HOST" "echo 'SSH OK'" 2>&1; then
+                echo "⚠️ SSH connection failed - cannot check certificates"
+                echo "cert_exists=false" >> $GITHUB_OUTPUT
+                echo "cert_type=unknown" >> $GITHUB_OUTPUT
+                echo "days_left=0" >> $GITHUB_OUTPUT
+                echo "needs_renewal=true" >> $GITHUB_OUTPUT
+                echo "skip_generation=false" >> $GITHUB_OUTPUT
+                echo "expiry=" >> $GITHUB_OUTPUT
+                echo "issuer=unknown" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+
+              # Check certificate status on server
+              echo "🔍 Checking certificate at: $CERT_PATH"
+              CERT_INFO=$(ssh -i ~/.ssh/ssl_check_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+                CERT_PATH=\"$CERT_PATH\"
+
+                if [ ! -f \"\$CERT_PATH\" ]; then
+                  echo 'EXISTS=false'
+                  echo 'TYPE=none'
+                  echo 'DAYS_LEFT=0'
+                  echo 'NEEDS_RENEWAL=true'
+                  echo 'EXPIRY='
+                  echo 'ISSUER=none'
+                  exit 0
+                fi
+
+                echo 'EXISTS=true'
+
+                # Get issuer
+                ISSUER=\$(openssl x509 -in \"\$CERT_PATH\" -noout -issuer 2>/dev/null | sed 's/issuer=//' || echo 'unknown')
+                echo \"ISSUER=\$ISSUER\"
+
+                # Check if Let's Encrypt or self-signed
+                if echo \"\$ISSUER\" | grep -qiE \"Let's Encrypt|R3|R10|R11|E1|E2|ISRG\"; then
+                  echo 'TYPE=letsencrypt'
+                elif echo \"\$ISSUER\" | grep -qi \"self-signed\|localhost\|127.0.0.1\"; then
+                  echo 'TYPE=self-signed'
+                elif [ \"\$(openssl x509 -in \"\$CERT_PATH\" -noout -issuer 2>/dev/null)\" = \"\$(openssl x509 -in \"\$CERT_PATH\" -noout -subject 2>/dev/null | sed 's/subject/issuer/')\" ]; then
+                  echo 'TYPE=self-signed'
+                else
+                  echo 'TYPE=self-signed'
+                fi
+
+                # Check expiration
+                EXPIRY=\$(openssl x509 -in \"\$CERT_PATH\" -noout -enddate 2>/dev/null | cut -d= -f2)
+                EXPIRY_EPOCH=\$(date -d \"\$EXPIRY\" +%s 2>/dev/null || echo '0')
+                NOW_EPOCH=\$(date +%s)
+                DAYS_LEFT=\$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+
+                echo \"DAYS_LEFT=\$DAYS_LEFT\"
+                echo \"EXPIRY=\$EXPIRY\"
+
+                if [ \"\$DAYS_LEFT\" -lt $RENEWAL_THRESHOLD ]; then
+                  echo 'NEEDS_RENEWAL=true'
+                else
+                  echo 'NEEDS_RENEWAL=false'
+                fi
+              " 2>&1) || {
+                echo "⚠️ Certificate check failed"
+                echo "cert_exists=false" >> $GITHUB_OUTPUT
+                echo "cert_type=unknown" >> $GITHUB_OUTPUT
+                echo "days_left=0" >> $GITHUB_OUTPUT
+                echo "needs_renewal=true" >> $GITHUB_OUTPUT
+                echo "skip_generation=false" >> $GITHUB_OUTPUT
+                echo "expiry=" >> $GITHUB_OUTPUT
+                echo "issuer=unknown" >> $GITHUB_OUTPUT
+                exit 0
+              }
+
+              echo "📄 Certificate info:"
+              echo "$CERT_INFO"
+
+              # Parse results
+              CERT_EXISTS=$(echo "$CERT_INFO" | grep "EXISTS=" | cut -d= -f2 | tr -d ' ')
+              CERT_TYPE=$(echo "$CERT_INFO" | grep "TYPE=" | cut -d= -f2 | tr -d ' ')
+              DAYS_LEFT=$(echo "$CERT_INFO" | grep "DAYS_LEFT=" | cut -d= -f2 | tr -d ' ')
+              NEEDS_RENEWAL=$(echo "$CERT_INFO" | grep "NEEDS_RENEWAL=" | cut -d= -f2 | tr -d ' ')
+              EXPIRY=$(echo "$CERT_INFO" | grep "EXPIRY=" | cut -d= -f2-)
+              ISSUER=$(echo "$CERT_INFO" | grep "ISSUER=" | cut -d= -f2-)
+
+              # Set outputs
+              echo "cert_exists=$CERT_EXISTS" >> $GITHUB_OUTPUT
+              echo "cert_type=$CERT_TYPE" >> $GITHUB_OUTPUT
+              echo "days_left=$DAYS_LEFT" >> $GITHUB_OUTPUT
+              echo "needs_renewal=$NEEDS_RENEWAL" >> $GITHUB_OUTPUT
+              echo "expiry=$EXPIRY" >> $GITHUB_OUTPUT
+              echo "issuer=$ISSUER" >> $GITHUB_OUTPUT
+
+              # Determine if we should skip SSL generation
+              # Skip LE if we have valid LE cert with >threshold days remaining
+              if [ "$CERT_TYPE" = "letsencrypt" ] && [ "$NEEDS_RENEWAL" = "false" ]; then
+                echo "skip_generation=true" >> $GITHUB_OUTPUT
+                echo ""
+                echo "✅ Valid Let's Encrypt certificate found with $DAYS_LEFT days remaining"
+                echo "⏭️ SSL generation can be skipped to avoid rate limits"
+              else
+                echo "skip_generation=false" >> $GITHUB_OUTPUT
+                if [ "$CERT_TYPE" = "self-signed" ]; then
+                  echo ""
+                  echo "⚠️ Self-signed certificate found - consider Let's Encrypt upgrade"
+                elif [ "$NEEDS_RENEWAL" = "true" ]; then
+                  echo ""
+                  echo "🔄 Certificate needs renewal ($DAYS_LEFT days remaining)"
+                elif [ "$CERT_EXISTS" = "false" ]; then
+                  echo ""
+                  echo "📜 No certificate found - generation needed"
+                fi
+              fi
+
+        - name: 📊 SSL Check Summary
+          shell: bash
+          run: |
+              echo "## 🔐 SSL Certificate Check" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+              echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| Domain | \`${{ inputs.domain }}\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| Exists | ${{ steps.check.outputs.cert_exists }} |" >> $GITHUB_STEP_SUMMARY
+              echo "| Type | ${{ steps.check.outputs.cert_type }} |" >> $GITHUB_STEP_SUMMARY
+              echo "| Days Remaining | ${{ steps.check.outputs.days_left }} |" >> $GITHUB_STEP_SUMMARY
+              echo "| Needs Renewal | ${{ steps.check.outputs.needs_renewal }} |" >> $GITHUB_STEP_SUMMARY
+              echo "| Skip Generation | ${{ steps.check.outputs.skip_generation }} |" >> $GITHUB_STEP_SUMMARY
+
+              if [ "${{ steps.check.outputs.cert_type }}" = "letsencrypt" ] && [ "${{ steps.check.outputs.skip_generation }}" = "true" ]; then
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "✅ **Valid Let's Encrypt certificate** - no renewal needed" >> $GITHUB_STEP_SUMMARY
+              elif [ "${{ steps.check.outputs.cert_type }}" = "self-signed" ]; then
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "⚠️ **Self-signed certificate** - consider upgrading to Let's Encrypt" >> $GITHUB_STEP_SUMMARY
+              fi
+
+        - name: 🧹 Cleanup
+          if: always()
+          shell: bash
+          run: |
+              rm -f ~/.ssh/ssl_check_key 2>/dev/null || true

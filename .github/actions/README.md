@@ -31,6 +31,7 @@ Looking for ready-to-use workflows? Check out our **[Workflow Templates](../temp
 | [llm-audit](#llm-audit) | LLM-powered code audits (xAI, Anthropic, Google) |
 | [cloudflare-dns-update](#cloudflare-dns-update) | Create or update Cloudflare DNS records |
 | [ssl-certbot-cloudflare](#ssl-certbot-cloudflare) | Generate SSL certificates with Let's Encrypt via Cloudflare DNS-01 |
+| [ssl-check](#ssl-check) | Check existing SSL certificates on a remote server |
 
 ---
 
@@ -626,6 +627,71 @@ jobs:
           webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
           title: "🚀 Deployment Successful"
           status: success
+```
+
+---
+
+## ssl-check
+
+Check existing SSL certificates on a remote server via SSH. Useful for avoiding Let's Encrypt rate limits by checking if valid certificates already exist.
+
+### Usage
+
+```yaml
+- name: 🔍 Check SSL Certificates
+  uses: nuniesmith/actions/.github/actions/ssl-check@main
+  with:
+    ssh-host: ${{ secrets.PROD_TAILSCALE_IP }}
+    ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+    ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
+    ssh-key: ${{ secrets.PROD_SSH_KEY }}
+    domain: example.com
+    cert-path: "/var/lib/docker/volumes/certbot_certs/_data/live/{domain}/fullchain.pem"
+    renewal-threshold-days: "30"
+```
+
+### Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `ssh-host` | Yes | - | SSH host to check certificates on |
+| `ssh-port` | No | `22` | SSH port |
+| `ssh-user` | No | `actions` | SSH username |
+| `ssh-key` | Yes | - | SSH private key |
+| `domain` | Yes | - | Domain name to check certificate for |
+| `cert-path` | No | `/var/lib/docker/volumes/fks_certbot_certs/_data/live/{domain}/fullchain.pem` | Path to certificate (supports `{domain}` placeholder) |
+| `renewal-threshold-days` | No | `30` | Days before expiry to consider renewal needed |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `cert-exists` | Whether a certificate exists |
+| `cert-type` | Certificate type: `letsencrypt`, `self-signed`, `none`, `unknown` |
+| `days-left` | Days until certificate expiry |
+| `expiry-date` | Certificate expiry date |
+| `needs-renewal` | Whether the certificate needs renewal |
+| `skip-generation` | Whether SSL generation should be skipped (valid LE cert exists) |
+| `issuer` | Certificate issuer |
+
+### Example: Skip SSL generation if valid cert exists
+
+```yaml
+- name: 🔍 Check Existing SSL
+  id: ssl-check
+  uses: nuniesmith/actions/.github/actions/ssl-check@main
+  with:
+    ssh-host: ${{ secrets.PROD_IP }}
+    ssh-key: ${{ secrets.PROD_SSH_KEY }}
+    domain: myapp.example.com
+
+- name: 🔐 Generate SSL (if needed)
+  if: steps.ssl-check.outputs.skip-generation != 'true'
+  uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+  with:
+    domain: myapp.example.com
+    cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+    email: admin@example.com
 ```
 
 ---

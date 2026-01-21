@@ -4,13 +4,18 @@
 # Streamlined pipeline using reusable composite actions from nuniesmith/actions.
 #
 # Pipeline Flow:
-# 1. Docker Build & Push - Multi-service matrix build
-# 2. Infrastructure Setup - Tailscale, DNS
-# 3. Deployment - SSL Certificates + Staging (develop) or Production (main)
-# 4. Health Checks - Verify deployment success
-# 5. Post-CI - LLM audit, notifications
+# 1. Setup - Determine environment
+# 2. Docker Build & Push - Multi-service matrix build
+# 3. Deploy - Tailscale, DNS, SSL, Deploy, Health Checks
+# 4. Summary - Pipeline results
 #
-# NOTE: Tests are currently disabled to focus on deployment process
+# Required Secrets:
+# - PROD_TAILSCALE_IP, PROD_SSH_KEY, PROD_SSH_USER, PROD_SSH_PORT
+# - TAILSCALE_OAUTH_CLIENT_ID, TAILSCALE_OAUTH_SECRET
+# - DOCKER_USERNAME, DOCKER_TOKEN
+# - CLOUDFLARE_API_KEY, CLOUDFLARE_ZONE_ID
+# - SSL_EMAIL
+# - DISCORD_WEBHOOK_ACTIONS (optional)
 # =============================================================================
 
 name: 🚀 CI/CD Pipeline
@@ -55,7 +60,6 @@ permissions:
 env:
     RUST_VERSION: "1.92.0"
     CARGO_TERM_COLOR: always
-    REDIS_URL: redis://localhost:6379/0
     REGISTRY: docker.io
     IMAGE_NAME: nuniesmith/fks
     DOMAIN: fkstrading.xyz
@@ -69,59 +73,83 @@ defaults:
     run:
         shell: bash
 
-# =============================================================================
-# JOBS
-# =============================================================================
 jobs:
     # =========================================================================
-    # STAGE 1: ENVIRONMENT SETUP
+    # STAGE 1: SETUP
     # =========================================================================
-
     setup:
         name: 📋 Setup
         runs-on: ubuntu-latest
         timeout-minutes: 5
         outputs:
             deploy_env: ${{ steps.determine-env.outputs.environment }}
+            target_host: ${{ steps.determine-env.outputs.host }}
+            target_domain: ${{ steps.determine-env.outputs.domain }}
         steps:
             - name: 🎯 Determine deployment environment
               id: determine-env
+              env:
+                  HAS_PROD_IP: ${{ secrets.PROD_TAILSCALE_IP != '' }}
+                  HAS_SSH_KEY: ${{ secrets.PROD_SSH_KEY != '' }}
+                  HAS_TAILSCALE: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID != '' }}
               run: |
-                  # Check workflow dispatch input first
+                  # Determine environment
                   if [ "${{ inputs.environment }}" != "" ] && [ "${{ inputs.environment }}" != "auto" ]; then
                     ENV="${{ inputs.environment }}"
-                  elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+                  elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
                     ENV="production"
-                  elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-                    ENV="staging"
                   else
-                    ENV="none"
+                    ENV="staging"
+                  fi
+
+                  # Set host and domain based on environment
+                  if [ "$ENV" = "production" ]; then
+                    HOST="${{ secrets.PROD_TAILSCALE_IP }}"
+                    DOMAIN="${{ env.DOMAIN }}"
+                  else
+                    HOST="${{ secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}"
+                    DOMAIN="${{ env.STAGING_DOMAIN }}"
                   fi
 
                   echo "environment=$ENV" >> $GITHUB_OUTPUT
-                  echo "📍 Target environment: $ENV"
+                  echo "host=$HOST" >> $GITHUB_OUTPUT
+                  echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
 
-                  echo "## 📋 Pipeline Configuration" >> $GITHUB_STEP_SUMMARY
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-                  echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-                  echo "| Environment | \`$ENV\` |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Branch | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Tests | \`disabled\` |" >> $GITHUB_STEP_SUMMARY
+                  # Validate required secrets
+                  MISSING=""
+                  [ "$HAS_PROD_IP" != "true" ] && MISSING="$MISSING PROD_TAILSCALE_IP"
+                  [ "$HAS_SSH_KEY" != "true" ] && MISSING="$MISSING PROD_SSH_KEY"
+                  [ "$HAS_TAILSCALE" != "true" ] && MISSING="$MISSING TAILSCALE_OAUTH_CLIENT_ID"
+
+                  if [ -n "$MISSING" ]; then
+                    echo "⚠️ Missing secrets:$MISSING"
+                    echo "## ⚠️ Missing Secrets" >> $GITHUB_STEP_SUMMARY
+                    echo "Configure these secrets:$MISSING" >> $GITHUB_STEP_SUMMARY
+                  fi
+
+                  # Summary
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  ## 🎯 Environment Configuration
+                  | Property | Value |
+                  |----------|-------|
+                  | Target | \`$ENV\` |
+                  | Domain | \`$DOMAIN\` |
+                  | Branch | \`${{ github.ref_name }}\` |
+                  | Trigger | \`${{ github.event_name }}\` |
+                  EOF
 
     # =========================================================================
-    # STAGE 2: DOCKER BUILD & PUSH
+    # STAGE 2: DOCKER BUILD
     # =========================================================================
-
     docker-build:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
-        timeout-minutes: 60
-        needs: setup
+        timeout-minutes: 45
+        needs: [setup]
         if: |
             github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
+            !inputs.skip_deploy
         strategy:
             fail-fast: false
             matrix:
@@ -145,8 +173,8 @@ jobs:
                   username: ${{ secrets.DOCKER_USERNAME }}
                   password: ${{ secrets.DOCKER_TOKEN }}
                   dockerfile: ${{ matrix.service.dockerfile }}
-                  context: "."
-                  platforms: "linux/amd64"
+                  context: .
+                  platforms: linux/amd64
                   push: "true"
                   tags: |
                       type=raw,value=${{ matrix.service.name }}-latest
@@ -155,239 +183,99 @@ jobs:
                   build-args: ${{ matrix.service.build_args }}
                   target: ${{ matrix.service.target }}
 
-            - name: 🔍 Verify Image Contents
-              run: |
-                  echo "🔍 Verifying ${{ matrix.service.name }} image contents..."
-                  IMAGE="${{ env.IMAGE_NAME }}:${{ matrix.service.name }}-latest"
-
-                  # Pull the image we just pushed
-                  docker pull "$IMAGE"
-
-                  # List contents of /app directory
-                  echo "📁 Contents of /app:"
-                  docker run --rm --entrypoint ls "$IMAGE" -la /app
-
-                  # Verify the service binary exists and is executable
-                  echo "🔎 Checking /app/service binary:"
-                  docker run --rm --entrypoint file "$IMAGE" /app/service || true
-
-                  # Try to get version/help from the binary (if supported)
-                  echo "📋 Binary info:"
-                  docker run --rm "$IMAGE" --version 2>/dev/null || \
-                  docker run --rm "$IMAGE" --help 2>/dev/null | head -5 || \
-                  echo "Note: Binary does not support --version or --help flags"
-
-                  echo "✅ Image verification complete for ${{ matrix.service.name }}"
-
     # =========================================================================
-    # STAGE 3: INFRASTRUCTURE SETUP
+    # STAGE 3: DEPLOY
     # =========================================================================
-
-    infrastructure-setup:
-        name: 🔐 Infrastructure (${{ needs.setup.outputs.deploy_env }})
+    deploy:
+        name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
-        timeout-minutes: 15
+        timeout-minutes: 30
         needs: [setup, docker-build]
         if: |
+            always() &&
             needs.docker-build.result == 'success' &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
+        environment:
+            name: ${{ needs.setup.outputs.deploy_env }}
+            url: https://${{ needs.setup.outputs.target_domain }}
         outputs:
-            tailscale_connected: ${{ steps.tailscale.outputs.connected }}
-            target_host: ${{ steps.config.outputs.host }}
-            target_domain: ${{ steps.config.outputs.domain }}
-            target_hostname: ${{ steps.config.outputs.hostname }}
+            deployed: ${{ steps.deploy.outputs.deployed }}
+            ssl_cert_type: ${{ steps.ssl.outputs.cert-type }}
+            ssl_deployed: ${{ steps.ssl.outputs.deployed }}
+            http_health: ${{ steps.health-checks.outputs.healthy }}
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
-            - name: 🔍 Validate required secrets
-              run: |
-                  ENV="${{ needs.setup.outputs.deploy_env }}"
-                  MISSING_SECRETS=""
-
-                  # Check PROD_TAILSCALE_IP (always required)
-                  if [ -z "${{ secrets.PROD_TAILSCALE_IP }}" ]; then
-                    MISSING_SECRETS="${MISSING_SECRETS}\n  - PROD_TAILSCALE_IP (required for all deployments)"
-                  fi
-
-                  # Check PROD_SSH_KEY (always required)
-                  if [ -z "${{ secrets.PROD_SSH_KEY }}" ]; then
-                    MISSING_SECRETS="${MISSING_SECRETS}\n  - PROD_SSH_KEY (required for SSH deployment)"
-                  fi
-
-                  # Check Tailscale OAuth (required for VPN connection)
-                  if [ -z "${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}" ]; then
-                    MISSING_SECRETS="${MISSING_SECRETS}\n  - TAILSCALE_OAUTH_CLIENT_ID (required for Tailscale connection)"
-                  fi
-                  if [ -z "${{ secrets.TAILSCALE_OAUTH_SECRET }}" ]; then
-                    MISSING_SECRETS="${MISSING_SECRETS}\n  - TAILSCALE_OAUTH_SECRET (required for Tailscale connection)"
-                  fi
-
-                  if [ -n "$MISSING_SECRETS" ]; then
-                    echo "❌ Missing required secrets for $ENV deployment:"
-                    echo -e "$MISSING_SECRETS"
-                    echo ""
-                    echo "📝 Please add these secrets in: Settings → Secrets and variables → Actions"
-                    echo ""
-                    echo "## ❌ Missing Secrets" >> $GITHUB_STEP_SUMMARY
-                    echo "The following secrets are required but not configured:" >> $GITHUB_STEP_SUMMARY
-                    echo -e "$MISSING_SECRETS" >> $GITHUB_STEP_SUMMARY
-                    exit 1
-                  fi
-
-                  echo "✅ All required secrets are configured"
-
-            - name: ⚙️ Configure environment
-              id: config
-              run: |
-                  ENV="${{ needs.setup.outputs.deploy_env }}"
-                  if [ "$ENV" = "production" ]; then
-                    HOST="${{ secrets.PROD_TAILSCALE_IP }}"
-                    HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
-                    echo "host=$HOST" >> $GITHUB_OUTPUT
-                    echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
-                    echo "domain=${{ env.DOMAIN }}" >> $GITHUB_OUTPUT
-                    echo "ssh_port=${{ secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
-                  else
-                    HOST="${{ secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}"
-                    HOSTNAME="${{ secrets.STAGING_HOSTNAME || secrets.PROD_HOSTNAME }}"
-                    echo "host=$HOST" >> $GITHUB_OUTPUT
-                    echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
-                    echo "domain=${{ env.STAGING_DOMAIN }}" >> $GITHUB_OUTPUT
-                    echo "ssh_port=${{ secrets.STAGING_SSH_PORT || secrets.PROD_SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
-                  fi
-
-                  # Double-check host is not empty
-                  if [ -z "$HOST" ]; then
-                    echo "❌ Host IP is empty after configuration!"
-                    echo "Environment: $ENV"
-                    echo "This should not happen if secrets validation passed."
-                    exit 1
-                  fi
-
-                  echo "✅ Configured for $ENV: host=$HOST, hostname=${HOSTNAME:-not set}"
-
-            - name: ✅ Validate Tailscale ACL
-              run: |
-                  jq empty infrastructure/configs/tailscale/tailscale-acl.json || echo "⚠️ ACL file not found"
-
+            # -----------------------------------------------------------------
+            # TAILSCALE CONNECTION
+            # -----------------------------------------------------------------
             - name: 🔌 Connect to Tailscale
               id: tailscale
               uses: nuniesmith/actions/.github/actions/tailscale-connect@main
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ steps.config.outputs.host }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
 
+            # -----------------------------------------------------------------
+            # DNS UPDATE
+            # -----------------------------------------------------------------
             - name: 🌐 Update Cloudflare DNS
               if: steps.tailscale.outputs.connected == 'true'
               uses: nuniesmith/actions/.github/actions/cloudflare-dns-update@main
               with:
                   api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
                   zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-                  record-name: ${{ steps.config.outputs.domain }}
-                  record-content: ${{ steps.config.outputs.host }}
-                  additional-records: '[{"name": "www.${{ steps.config.outputs.domain }}"}]'
-
-    # =========================================================================
-    # STAGE 4: DEPLOYMENT (includes SSL certificates)
-    # =========================================================================
-
-    deploy:
-        name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
-        runs-on: ubuntu-latest
-        timeout-minutes: 30
-        needs: [setup, docker-build, infrastructure-setup]
-        if: |
-            always() &&
-            needs.docker-build.result == 'success' &&
-            needs.infrastructure-setup.result == 'success' &&
-            github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
-            !inputs.skip_deploy
-        environment:
-            name: ${{ needs.setup.outputs.deploy_env }}
-            url: https://${{ needs.infrastructure-setup.outputs.target_domain }}
-        outputs:
-            deployed: ${{ steps.deploy.outputs.deployed }}
-            ssl_cert_type: ${{ steps.ssl.outputs.cert-type }}
-            ssl_cert_ready: ${{ steps.ssl.outputs.cert-ready }}
-            ssl_deployed: ${{ steps.ssl.outputs.deployed }}
-        steps:
-            - name: 📥 Checkout code
-              uses: actions/checkout@v4
-
-            - name: ⚙️ Configure deploy target
-              id: deploy-config
-              run: |
-                  # Use secrets directly for reliability
-                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
-                  TARGET_DOMAIN="${{ env.DOMAIN }}"
-                  TARGET_HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
-
-                  # Final validation
-                  if [ -z "$TARGET_HOST" ]; then
-                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
-                    echo "## ❌ Missing: PROD_TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
-                    exit 1
-                  fi
-
-                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
-                  echo "domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
-                  echo "hostname=$TARGET_HOSTNAME" >> $GITHUB_OUTPUT
-
-                  echo "✅ Deploy target configured:"
-                  echo "   Host: $TARGET_HOST"
-                  echo "   Hostname: ${TARGET_HOSTNAME:-not set}"
-                  echo "   Domain: $TARGET_DOMAIN"
-
-            - name: 🔌 Connect to Tailscale
-              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
-              with:
-                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ steps.deploy-config.outputs.host }}
-                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  record-name: ${{ needs.setup.outputs.target_domain }}
+                  record-content: ${{ needs.setup.outputs.target_host }}
+                  additional-records: '[{"name": "www.${{ needs.setup.outputs.target_domain }}"}]'
 
             # -----------------------------------------------------------------
-            # SSL CERTIFICATES (run before deployment if not skipped)
+            # SSL CERTIFICATE CHECK
+            # -----------------------------------------------------------------
+            - name: 🔍 Check Existing SSL Certificates
+              id: ssl-check
+              if: github.ref == 'refs/heads/main' && !inputs.skip_ssl
+              uses: nuniesmith/actions/.github/actions/ssl-check@main
+              continue-on-error: true
+              with:
+                  ssh-host: ${{ needs.setup.outputs.target_host }}
+                  ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  domain: ${{ needs.setup.outputs.target_domain }}
+                  cert-path: "/var/lib/docker/volumes/fks_certbot_certs/_data/live/{domain}/fullchain.pem"
+                  renewal-threshold-days: "30"
+
+            # -----------------------------------------------------------------
+            # SSL CERTIFICATE GENERATION
             # -----------------------------------------------------------------
             - name: 🔐 Generate & Deploy SSL Certificates
               id: ssl
               if: |
                   github.ref == 'refs/heads/main' &&
-                  !inputs.skip_ssl
+                  !inputs.skip_ssl &&
+                  steps.ssl-check.outputs.skip-generation != 'true'
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
               with:
-                  domain: ${{ steps.deploy-config.outputs.domain }}
-                  additional-domains: "www.${{ steps.deploy-config.outputs.domain }}"
+                  domain: ${{ needs.setup.outputs.target_domain }}
+                  additional-domains: "www.${{ needs.setup.outputs.target_domain }}"
                   cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
                   email: ${{ secrets.SSL_EMAIL }}
                   fallback-to-self-signed: "true"
                   self-signed-days: "365"
                   deploy-to-server: "true"
-                  ssh-host: ${{ steps.deploy-config.outputs.host }}
+                  ssh-host: ${{ needs.setup.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   docker-volume-name: "fks_certbot_certs"
                   docker-username: ${{ secrets.DOCKER_USERNAME }}
                   docker-token: ${{ secrets.DOCKER_TOKEN }}
-
-            - name: 📋 SSL Certificate Summary
-              if: steps.ssl.outcome == 'success' || steps.ssl.outcome == 'skipped'
-              run: |
-                  if [ "${{ steps.ssl.outcome }}" = "skipped" ]; then
-                    echo "⏭️ SSL certificate generation was skipped"
-                    echo "ssl_status=skipped" >> $GITHUB_OUTPUT
-                  else
-                    echo "✅ SSL certificates processed"
-                    echo "   Type: ${{ steps.ssl.outputs.cert-type || 'unknown' }}"
-                    echo "   Ready: ${{ steps.ssl.outputs.cert-ready || 'unknown' }}"
-                    echo "   Deployed: ${{ steps.ssl.outputs.deployed || 'unknown' }}"
-                  fi
 
             # -----------------------------------------------------------------
             # DEPLOYMENT
@@ -396,7 +284,7 @@ jobs:
               id: deploy
               uses: nuniesmith/actions/.github/actions/ssh-deploy@main
               with:
-                  host: ${{ steps.deploy-config.outputs.host }}
+                  host: ${{ needs.setup.outputs.target_host }}
                   port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   username: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -409,24 +297,16 @@ jobs:
                       echo "════════════════════════════════════════════════════════════"
                       echo "📋 PRE-DEPLOY: ${{ needs.setup.outputs.deploy_env }}"
                       echo "════════════════════════════════════════════════════════════"
-
-                      # System info
                       echo "🖥️  Host: $(hostname) | $(date)"
-                      echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free | Memory: $(free -h | grep Mem | awk '{print $7}') available"
+                      echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free"
 
                       # First-time setup
-                      if [ ! -d ~/fks/.git ]; then
-                        echo "📦 First-time setup - cloning repository..."
-                        rm -rf ~/fks
-                        git clone https://github.com/nuniesmith/fks.git ~/fks
-                      fi
+                      [ ! -d ~/fks/.git ] && git clone https://github.com/nuniesmith/fks.git ~/fks
 
-                      # Ensure Docker volumes (must match docker-compose.yml external volumes)
-                      echo "📦 Ensuring Docker volumes..."
+                      # Ensure Docker volumes
                       for vol in fks_certbot_certs fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions; do
                         docker volume create $vol 2>/dev/null || true
                       done
-                      echo "✅ Volumes ready"
 
                   deploy-command: |
                       echo "════════════════════════════════════════════════════════════"
@@ -436,15 +316,9 @@ jobs:
                       # Docker login
                       echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
 
-                      # Environment setup - create .env if missing
+                      # Environment setup
                       [ ! -f .env ] && touch .env
-
-                      # Ensure required env vars
-                      ensure_env() {
-                        local VAR="$1" DEFAULT="$2"
-                        grep -q "^${VAR}=" .env || echo "${VAR}=${DEFAULT}" >> .env
-                      }
-
+                      ensure_env() { grep -q "^${1}=" .env || echo "${1}=${2}" >> .env; }
                       ensure_env "POSTGRES_PASSWORD" "$(openssl rand -hex 16)"
                       ensure_env "POSTGRES_USER" "fks_user"
                       ensure_env "POSTGRES_DB" "fks"
@@ -458,307 +332,121 @@ jobs:
                       ensure_env "REGISTRY" "docker.io"
                       ensure_env "IMAGE_NAME" "nuniesmith/fks"
                       ensure_env "ENVIRONMENT" "${{ needs.setup.outputs.deploy_env }}"
-
                       set -a && source .env && set +a
 
-                      # Make run.sh executable
+                      # Deploy with run.sh or fallback to docker compose
                       chmod +x ./run.sh 2>/dev/null || true
-
-                      # Use run.sh prod start for deployment (syntax: ./run.sh prod <command>)
-                      echo "🚀 Starting services with run.sh prod start..."
                       if [ -x "./run.sh" ]; then
-                        # Stop existing containers first
                         ./run.sh prod down 2>/dev/null || true
-
-                        # Pull production images
-                        echo "📥 Pulling production images..."
                         docker compose --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml pull --ignore-pull-failures 2>&1 || true
-
-                        # Start with run.sh (handles volumes, env, dependencies)
                         ./run.sh prod start 2>&1
                       else
-                        # Fallback to direct docker compose if run.sh not available
-                        echo "⚠️ run.sh not found, using direct docker compose..."
                         COMPOSE_CMD="docker compose --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
-
-                        # Stop existing
-                        echo "🛑 Stopping containers..."
                         $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
-
-                        # Pull all images (including infrastructure)
-                        echo "📥 Pulling images..."
                         $COMPOSE_CMD pull --ignore-pull-failures 2>&1 || true
-
-                        # Start services
-                        echo "🚀 Starting containers..."
                         $COMPOSE_CMD up -d 2>&1
                       fi
 
-                      # Wait for services to start
-                      echo "⏳ Waiting for services to initialize..."
                       sleep 30
-
-                      # Check running containers
-                      RUNNING=$(docker ps --filter "name=fks" --format '{{.Names}}' | wc -l)
-                      echo "✅ Running: $RUNNING containers"
-
-                      # Show container status
-                      echo ""
                       echo "📊 Container Status:"
-                      docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -20
-
-                      # Check for critical services
-                      CRITICAL_SERVICES="fks_postgres fks_redis fks_questdb fks_prometheus"
-                      MISSING=""
-                      for svc in $CRITICAL_SERVICES; do
-                        if ! docker ps --format '{{.Names}}' | grep -q "^${svc}$"; then
-                          MISSING="$MISSING $svc"
-                        fi
-                      done
-
-                      if [ -n "$MISSING" ]; then
-                        echo ""
-                        echo "⚠️ Warning: Some critical services may not be running:$MISSING"
-                        echo "Check logs with: docker logs <container_name>"
-                      fi
-
-                      if [ "$RUNNING" -lt 6 ]; then
-                        echo ""
-                        echo "⚠️ Warning: Only $RUNNING containers running (expected 10+)"
-                        echo "Checking failed containers..."
-                        docker ps -a --filter "name=fks" --filter "status=exited" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
-                      fi
+                      docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -15
 
                   post-deploy-command: |
-                      echo "════════════════════════════════════════════════════════════"
-                      echo "🧹 POST-DEPLOY CLEANUP"
-                      echo "════════════════════════════════════════════════════════════"
-
-                      # Cleanup old images (keep 24h)
                       docker image prune -f --filter "until=24h" 2>/dev/null || true
-
-                      echo ""
-                      echo "🌐 Access URLs:"
-                      echo "   Grafana:    http://$(hostname -I | awk '{print $1}'):3000"
-                      echo "   Prometheus: http://$(hostname -I | awk '{print $1}'):9090"
-                      echo "   QuestDB:    http://$(hostname -I | awk '{print $1}'):9000"
-                      echo ""
                       echo "✅ Deployment complete!"
 
-    # =========================================================================
-    # STAGE 5: HEALTH CHECKS
-    # =========================================================================
-
-    health-check:
-        name: 🏥 Health Check
-        runs-on: ubuntu-latest
-        timeout-minutes: 10
-        needs: [setup, infrastructure-setup, deploy]
-        if: |
-            needs.deploy.result == 'success'
-        steps:
-            - name: 📥 Checkout code
-              uses: actions/checkout@v4
-
-            - name: ⚙️ Configure health-check target
-              id: health-config
-              run: |
-                  # Use secrets directly for reliability
-                  TARGET_HOST="${{ secrets.PROD_TAILSCALE_IP }}"
-                  TARGET_DOMAIN="${{ env.DOMAIN }}"
-                  TARGET_HOSTNAME="${{ secrets.PROD_HOSTNAME }}"
-
-                  # Final validation
-                  if [ -z "$TARGET_HOST" ]; then
-                    echo "❌ ERROR: PROD_TAILSCALE_IP secret is not configured!"
-                    exit 1
-                  fi
-
-                  echo "host=$TARGET_HOST" >> $GITHUB_OUTPUT
-                  echo "domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
-                  echo "hostname=$TARGET_HOSTNAME" >> $GITHUB_OUTPUT
-
-                  echo "✅ Health-check target configured:"
-                  echo "   Host: $TARGET_HOST"
-                  echo "   Hostname: ${TARGET_HOSTNAME:-not set}"
-                  echo "   Domain: $TARGET_DOMAIN"
-
-            - name: 🔌 Connect to Tailscale
-              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
-              with:
-                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
-                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ steps.health-config.outputs.host }}
-
+            # -----------------------------------------------------------------
+            # HEALTH CHECKS
+            # -----------------------------------------------------------------
             - name: 🏥 Run Health Checks
+              id: health-checks
+              if: always() && steps.deploy.outcome == 'success'
               uses: nuniesmith/actions/.github/actions/health-check@main
               with:
                   endpoints: |
                       [
-                        {"url": "http://${{ steps.health-config.outputs.host }}/health", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}/health/web", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}/health/janus", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}/health/grafana", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}/prometheus/-/healthy", "expected_status": 200},
-                        {"url": "http://${{ steps.health-config.outputs.host }}/questdb/", "expected_status": 200}
+                        {"url": "http://${{ needs.setup.outputs.target_host }}/health", "expected_status": 200},
+                        {"url": "http://${{ needs.setup.outputs.target_host }}/health/web", "expected_status": 200},
+                        {"url": "http://${{ needs.setup.outputs.target_host }}/health/janus", "expected_status": 200},
+                        {"url": "http://${{ needs.setup.outputs.target_host }}/health/execution", "expected_status": 200},
+                        {"url": "http://${{ needs.setup.outputs.target_host }}/health/grafana", "expected_status": 200}
                       ]
-                  containers: "fks_janus fks_execution fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana fks_nginx fks_web"
-                  ssh-host: ${{ steps.health-config.outputs.host }}
+                  containers: "fks_janus fks_execution fks_postgres fks_redis fks_questdb fks_prometheus fks_grafana fks_nginx"
+                  ssh-host: ${{ needs.setup.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  custom-command: |
+                      echo "🔍 Database connectivity check..."
+                      docker exec fks_redis redis-cli ping 2>/dev/null | grep -q "PONG" && echo "✅ Redis OK" || echo "❌ Redis failed"
+                      docker exec fks_postgres pg_isready -U postgres 2>/dev/null | grep -q "accepting" && echo "✅ PostgreSQL OK" || echo "❌ PostgreSQL failed"
+                      curl -s "http://localhost:9000/exec?query=SELECT%201" 2>/dev/null | grep -q "dataset" && echo "✅ QuestDB OK" || echo "❌ QuestDB failed"
                   initial-delay: "30"
                   retry-count: "3"
                   retry-delay: "10"
                   fail-on-unhealthy: "false"
 
+            # -----------------------------------------------------------------
+            # NOTIFICATION
+            # -----------------------------------------------------------------
             - name: 📣 Notify deployment
               if: always()
               uses: nuniesmith/actions/.github/actions/discord-notify@main
               continue-on-error: true
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
-                  title: "${{ needs.deploy.result == 'success' && '🚀 FKS Deployed' || '❌ FKS Deploy Failed' }}"
+                  title: "${{ steps.deploy.outcome == 'success' && '🚀 FKS Deployed' || '❌ FKS Deploy Failed' }}"
                   description: "Deployed to ${{ needs.setup.outputs.deploy_env }}"
-                  status: ${{ needs.deploy.result == 'success' && 'success' || 'failure' }}
+                  status: ${{ steps.deploy.outcome == 'success' && 'success' || 'failure' }}
                   include-repo-info: "true"
                   fields: |
                       [
                         {"name": "Environment", "value": "${{ needs.setup.outputs.deploy_env }}", "inline": true},
-                        {"name": "Domain", "value": "${{ steps.health-config.outputs.domain || env.DOMAIN }}", "inline": true},
-                        {"name": "SSL", "value": "${{ needs.deploy.outputs.ssl_cert_type || 'skipped' }}", "inline": true}
+                        {"name": "Domain", "value": "${{ needs.setup.outputs.target_domain }}", "inline": true},
+                        {"name": "SSL", "value": "${{ steps.ssl.outputs.cert-type || steps.ssl-check.outputs.cert-type || 'skipped' }}", "inline": true},
+                        {"name": "Health", "value": "${{ steps.health-checks.outputs.healthy == 'true' && '✅ healthy' || '⚠️ degraded' }}", "inline": true}
                       ]
-
-    # =========================================================================
-    # STAGE 6: POST-CI ANALYSIS
-    # =========================================================================
-
-    llm-audit:
-        name: 🧠 LLM Audit
-        runs-on: ubuntu-latest
-        timeout-minutes: 45
-        needs: [deploy]
-        if: |
-            always() &&
-            needs.deploy.result == 'success' &&
-            github.event_name != 'workflow_dispatch'
-        steps:
-            - name: 📥 Checkout code
-              uses: actions/checkout@v4
-              with:
-                  fetch-depth: 50
-
-            - name: 📊 Collect changed files
-              id: changes
-              run: |
-                  if [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
-                    CHANGED=$(git diff --name-only ${{ github.event.before }}..${{ github.sha }} 2>/dev/null | wc -l || echo "0")
-                  else
-                    CHANGED=$(git diff --name-only HEAD~1 2>/dev/null | wc -l || echo "0")
-                  fi
-                  echo "count=$CHANGED" >> $GITHUB_OUTPUT
-
-            - name: 🤖 Run LLM Audit
-              if: steps.changes.outputs.count != '0'
-              uses: nuniesmith/actions/.github/actions/llm-audit@main
-              with:
-                  provider: "xai"
-                  audit-mode: "regular"
-                  source-path: "src"
-                  file-patterns: "*.rs,*.kt"
-                  exclude-patterns: "target/*,build/*,.git/*"
-                  output-dir: "./audit-results"
-                  max-files: "30"
-                  xai-api-key: ${{ secrets.XAI_API_KEY }}
-                  upload-artifacts: "true"
-                  commit-results: "false"
-
-            - name: 💬 PR Comment with Results
-              if: github.event_name == 'pull_request'
-              uses: actions/github-script@v7
-              continue-on-error: true
-              with:
-                  script: |
-                      const fs = require('fs');
-                      let body = '## 🧠 LLM Code Audit\n\n';
-                      try {
-                        if (fs.existsSync('./audit-results/audit-report.json')) {
-                          const data = JSON.parse(fs.readFileSync('./audit-results/audit-report.json', 'utf8'));
-                          body += `**Files Analyzed:** ${data.files_analyzed || 0}\n`;
-                        } else {
-                          body += 'No audit results available.\n';
-                        }
-                      } catch (e) {
-                        body += `Error: ${e.message}\n`;
-                      }
-                      await github.rest.issues.createComment({
-                        issue_number: context.issue.number,
-                        owner: context.repo.owner,
-                        repo: context.repo.repo,
-                        body: body
-                      });
 
     # =========================================================================
     # PIPELINE SUMMARY
     # =========================================================================
-
     pipeline-summary:
         name: 📊 Pipeline Summary
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        needs:
-            - setup
-            - docker-build
-            - infrastructure-setup
-            - deploy
-            - health-check
-            - llm-audit
+        needs: [setup, docker-build, deploy]
         if: always()
         steps:
             - name: 📊 Generate summary
               run: |
-                  ENV="${{ needs.setup.outputs.deploy_env || 'N/A' }}"
-                  DOMAIN="${{ needs.infrastructure-setup.outputs.target_domain || 'N/A' }}"
-
                   cat >> $GITHUB_STEP_SUMMARY << EOF
                   # 🚀 FKS CI/CD Pipeline Summary
 
                   ## Environment
                   | Property | Value |
                   |----------|-------|
-                  | Target | \`$ENV\` |
-                  | Domain | \`$DOMAIN\` |
+                  | Target | \`${{ needs.setup.outputs.deploy_env }}\` |
+                  | Domain | \`${{ needs.setup.outputs.target_domain }}\` |
                   | Branch | \`${{ github.ref_name }}\` |
-                  | Commit | \`${{ github.sha }}\` |
 
-                  ## Build & Deploy Stage
+                  ## Jobs
                   | Job | Status |
                   |-----|--------|
                   | 🐳 Docker Build | ${{ needs.docker-build.result || 'skipped' }} |
-                  | 🔐 Infrastructure | ${{ needs.infrastructure-setup.result || 'skipped' }} |
                   | 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |
-                  | 🏥 Health Check | ${{ needs.health-check.result || 'skipped' }} |
 
-                  ## SSL Details
+                  ## Details
                   | Property | Value |
                   |----------|-------|
-                  | Certificate Type | ${{ needs.deploy.outputs.ssl_cert_type || 'N/A' }} |
-                  | Certificate Ready | ${{ needs.deploy.outputs.ssl_cert_ready || 'N/A' }} |
-                  | Deployed | ${{ needs.deploy.outputs.ssl_deployed || 'N/A' }} |
-
-                  ## Post-CI
-                  | Job | Status |
-                  |-----|--------|
-                  | 🧠 LLM Audit | ${{ needs.llm-audit.result || 'skipped' }} |
+                  | SSL Certificate | ${{ needs.deploy.outputs.ssl_cert_type || 'N/A' }} |
+                  | Health Check | ${{ needs.deploy.outputs.http_health == 'true' && '✅ Healthy' || '⚠️ Check logs' }} |
 
                   ---
-                  **Actor:** \`${{ github.actor }}\` | **Workflow:** \`${{ github.run_number }}\`
+                  **Actor:** \`${{ github.actor }}\` | **Run:** \`#${{ github.run_number }}\`
                   EOF
 
             - name: ❌ Fail on critical errors
-              if: |
-                  needs.docker-build.result == 'failure' ||
-                  needs.deploy.result == 'failure'
+              if: needs.docker-build.result == 'failure' || needs.deploy.result == 'failure'
               run: |
-                  echo "❌ Pipeline failed due to critical job failure"
+                  echo "❌ Pipeline failed"
                   exit 1
