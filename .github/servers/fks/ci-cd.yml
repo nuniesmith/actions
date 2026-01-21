@@ -514,7 +514,7 @@ jobs:
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/execution", "expected_status": 200},
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/grafana", "expected_status": 200}
                       ]
-                  containers: janus,nginx,web
+                  containers: fks_janus,fks_nginx,fks_web
                   ssh-host: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
