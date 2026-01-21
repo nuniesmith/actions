@@ -229,7 +229,7 @@ jobs:
 
             - name: 🧪 Run KMP tests
               run: ./gradlew check --no-daemon
-              working-directory: mobile # Adjust path as needed
+              working-directory: src/clients
 
             - name: 📊 Generate test report
               if: always()
@@ -239,30 +239,104 @@ jobs:
                   echo "| Platform | Status |" >> $GITHUB_STEP_SUMMARY
                   echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
                   echo "| Common | ✅ |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Android | ✅ |" >> $GITHUB_STEP_SUMMARY
-                  echo "| iOS | ✅ |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Web/JS | ✅ |" >> $GITHUB_STEP_SUMMARY
 
             - name: 📤 Upload test reports
               if: always()
               uses: actions/upload-artifact@v4
               with:
                   name: kmp-test-reports
-                  path: mobile/build/reports/
+                  path: src/clients/build/reports/
                   retention-days: 7
 
     # =========================================================================
-    # STAGE 3: DOCKER BUILD (temporarily disabled)
+    # STAGE 2b: BUILD KMP WEB
+    # =========================================================================
+    build-kmp-web:
+        name: 🌐 Build KMP Web
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: [setup]
+        if: |
+            github.event_name == 'push' &&
+            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        outputs:
+            artifact-name: ${{ steps.build.outputs.artifact-name }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: ☕ Setup Java
+              uses: actions/setup-java@v4
+              with:
+                  distribution: "temurin"
+                  java-version: "21"
+                  cache: "gradle"
+
+            - name: 📦 Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: "20"
+
+            - name: 🔧 Setup Gradle
+              uses: gradle/actions/setup-gradle@v4
+
+            - name: 🔨 Build KMP Web Distribution
+              id: build
+              working-directory: src/clients
+              run: |
+                  echo "🔨 Building KMP Web App..."
+                  chmod +x gradlew
+                  ./gradlew :web:jsBrowserDistribution --no-daemon
+
+                  # Verify build output
+                  if [ -d "web/dist" ] && [ -f "web/dist/index.html" ]; then
+                      echo "✅ KMP Web build successful!"
+                      echo "artifact-name=kmp-web-dist-${{ github.sha }}" >> $GITHUB_OUTPUT
+                  else
+                      echo "❌ Build failed - dist directory or index.html not found"
+                      ls -la web/ || true
+                      ls -la web/dist/ || true
+                      exit 1
+                  fi
+
+            - name: 📤 Upload Web Distribution
+              uses: actions/upload-artifact@v4
+              with:
+                  name: kmp-web-dist-${{ github.sha }}
+                  path: src/clients/web/dist/
+                  retention-days: 1
+                  if-no-files-found: error
+
+            - name: 📊 Build Summary
+              run: |
+                  echo "## 🌐 KMP Web Build Results" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+                  echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Artifact | \`kmp-web-dist-${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+                  if [ -d "src/clients/web/dist" ]; then
+                      SIZE=$(du -sh src/clients/web/dist | cut -f1)
+                      FILES=$(find src/clients/web/dist -type f | wc -l)
+                      echo "| Size | $SIZE |" >> $GITHUB_STEP_SUMMARY
+                      echo "| Files | $FILES |" >> $GITHUB_STEP_SUMMARY
+                  fi
+
+    # =========================================================================
+    # STAGE 3: DOCKER BUILD
     # =========================================================================
     docker-build:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup]
-        if: false # Temporarily disabled until deploy is 100%
-        # if: |
-        #     github.event_name == 'push' &&
-        #     (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
-        #     !inputs.skip_deploy
+        needs: [setup, build-kmp-web]
+        if: |
+            always() &&
+            github.event_name == 'push' &&
+            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
+            !inputs.skip_deploy &&
+            (needs.build-kmp-web.result == 'success' || matrix.service.name != 'web')
         strategy:
             fail-fast: false
             matrix:
@@ -271,13 +345,38 @@ jobs:
                       dockerfile: infrastructure/docker/base/rust/Dockerfile
                       target: workspace
                       build_args: SERVICE_NAME=janus
+                      needs_kmp: false
                     - name: execution
                       dockerfile: infrastructure/docker/base/rust/Dockerfile
                       target: execution
                       build_args: SERVICE_NAME=execution
+                      needs_kmp: false
+                    - name: web
+                      dockerfile: infrastructure/docker/services/web/Dockerfile
+                      target: production
+                      build_args: SKIP_KMP_BUILD=true
+                      needs_kmp: true
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
+
+            - name: 📥 Download KMP Web Dist
+              if: matrix.service.needs_kmp
+              uses: actions/download-artifact@v4
+              with:
+                  name: kmp-web-dist-${{ github.sha }}
+                  path: src/clients/web/dist/
+
+            - name: 🔍 Verify KMP Web Dist
+              if: matrix.service.needs_kmp
+              run: |
+                  echo "📦 Checking downloaded KMP web distribution..."
+                  ls -la src/clients/web/dist/
+                  if [ ! -f "src/clients/web/dist/index.html" ]; then
+                      echo "❌ index.html not found in dist!"
+                      exit 1
+                  fi
+                  echo "✅ KMP web distribution ready"
 
             - name: 🐳 Build and Push
               uses: nuniesmith/actions/.github/actions/docker-build-push@main
@@ -364,7 +463,7 @@ jobs:
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   domain: ${{ needs.setup.outputs.target_domain }}
-                  cert-path: "/var/lib/docker/volumes/fks_certbot_certs/_data/live/{domain}/fullchain.pem"
+                  cert-path: "/var/lib/docker/volumes/fks_ssl_certs/_data/live/{domain}/fullchain.pem"
                   renewal-threshold-days: "30"
 
             # -----------------------------------------------------------------
@@ -389,7 +488,7 @@ jobs:
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
-                  docker-volume-name: "fks_certbot_certs"
+                  docker-volume-name: "fks_ssl_certs"
                   docker-username: ${{ secrets.DOCKER_USERNAME }}
                   docker-token: ${{ secrets.DOCKER_TOKEN }}
 
@@ -420,9 +519,18 @@ jobs:
                       [ ! -d ~/fks/.git ] && git clone https://github.com/nuniesmith/fks.git ~/fks
 
                       # Ensure Docker volumes
-                      for vol in fks_certbot_certs fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions; do
+                      for vol in fks_ssl_certs fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions; do
                         docker volume create $vol 2>/dev/null || true
                       done
+
+                      # Copy SSL certs from Docker volume to nginx bind mount path
+                      echo "🔐 Syncing SSL certificates to nginx bind mount..."
+                      SSL_BIND_PATH="$HOME/fks/infrastructure/configs/nginx/ssl/live/${{ needs.setup.outputs.target_domain }}"
+                      mkdir -p "$SSL_BIND_PATH"
+                      docker run --rm \
+                        -v fks_ssl_certs:/src:ro \
+                        -v "$SSL_BIND_PATH":/dst \
+                        busybox sh -c 'cp -v /src/live/${{ needs.setup.outputs.target_domain }}/* /dst/ 2>/dev/null || echo "No certs in volume yet"'
 
                   deploy-command: |
                       echo "════════════════════════════════════════════════════════════"
@@ -468,6 +576,22 @@ jobs:
                       docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -15
 
                   post-deploy-command: |
+                      # Sync SSL certs from Docker volume to nginx bind mount and restart nginx
+                      echo "🔐 Final SSL cert sync to nginx bind mount..."
+                      SSL_BIND_PATH="$HOME/fks/infrastructure/configs/nginx/ssl/live/${{ needs.setup.outputs.target_domain }}"
+                      mkdir -p "$SSL_BIND_PATH"
+                      docker run --rm \
+                        -v fks_ssl_certs:/src:ro \
+                        -v "$SSL_BIND_PATH":/dst \
+                        busybox sh -c 'cp -v /src/live/${{ needs.setup.outputs.target_domain }}/* /dst/ 2>/dev/null || echo "No certs to copy"'
+
+                      # Restart nginx to pick up any cert changes
+                      if docker ps -q -f name=fks_nginx | grep -q .; then
+                        echo "🔄 Restarting nginx to apply SSL certs..."
+                        docker restart fks_nginx
+                        sleep 5
+                      fi
+
                       docker image prune -f --filter "until=24h" 2>/dev/null || true
                       echo "✅ Deployment complete!"
 
@@ -487,7 +611,7 @@ jobs:
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/execution", "expected_status": 200},
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/grafana", "expected_status": 200}
                       ]
-                  containers: janus,nginx
+                  containers: janus,nginx,web
                   ssh-host: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
@@ -530,7 +654,7 @@ jobs:
         name: 📊 Pipeline Summary
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        needs: [setup, docker-build, deploy]
+        needs: [setup, build-kmp-web, docker-build, deploy]
         if: always()
         steps:
             - name: 📊 Generate summary
@@ -548,8 +672,16 @@ jobs:
                   ## Jobs
                   | Job | Status |
                   |-----|--------|
+                  | 🌐 KMP Web Build | ${{ needs.build-kmp-web.result || 'skipped' }} |
                   | 🐳 Docker Build | ${{ needs.docker-build.result || 'skipped' }} |
                   | 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |
+
+                  ## Docker Images
+                  | Image | Tag |
+                  |-------|-----|
+                  | janus | \`janus-${{ github.sha }}\` |
+                  | execution | \`execution-${{ github.sha }}\` |
+                  | web | \`web-${{ github.sha }}\` |
 
                   ## Details
                   | Property | Value |
