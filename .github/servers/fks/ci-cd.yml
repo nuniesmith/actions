@@ -250,93 +250,17 @@ jobs:
                   retention-days: 7
 
     # =========================================================================
-    # STAGE 2b: BUILD KMP WEB
-    # =========================================================================
-    build-kmp-web:
-        name: 🌐 Build KMP Web
-        runs-on: ubuntu-latest
-        timeout-minutes: 30
-        needs: [setup]
-        if: |
-            github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-        outputs:
-            artifact-name: ${{ steps.build.outputs.artifact-name }}
-        steps:
-            - name: 📥 Checkout code
-              uses: actions/checkout@v4
-
-            - name: ☕ Setup Java
-              uses: actions/setup-java@v4
-              with:
-                  distribution: "temurin"
-                  java-version: "21"
-                  cache: "gradle"
-
-            - name: 📦 Setup Node.js
-              uses: actions/setup-node@v4
-              with:
-                  node-version: "20"
-
-            - name: 🔧 Setup Gradle
-              uses: gradle/actions/setup-gradle@v4
-
-            - name: 🔨 Build KMP Web Distribution
-              id: build
-              working-directory: src/clients
-              run: |
-                  echo "🔨 Building KMP Web App..."
-                  chmod +x gradlew
-                  ./gradlew :web:jsBrowserDistribution --no-daemon
-
-                  # Verify build output
-                  if [ -d "web/dist" ] && [ -f "web/dist/index.html" ]; then
-                      echo "✅ KMP Web build successful!"
-                      echo "artifact-name=kmp-web-dist-${{ github.sha }}" >> $GITHUB_OUTPUT
-                  else
-                      echo "❌ Build failed - dist directory or index.html not found"
-                      ls -la web/ || true
-                      ls -la web/dist/ || true
-                      exit 1
-                  fi
-
-            - name: 📤 Upload Web Distribution
-              uses: actions/upload-artifact@v4
-              with:
-                  name: kmp-web-dist-${{ github.sha }}
-                  path: src/clients/web/dist/
-                  retention-days: 1
-                  if-no-files-found: error
-
-            - name: 📊 Build Summary
-              run: |
-                  echo "## 🌐 KMP Web Build Results" >> $GITHUB_STEP_SUMMARY
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-                  echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-                  echo "| Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Artifact | \`kmp-web-dist-${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-                  if [ -d "src/clients/web/dist" ]; then
-                      SIZE=$(du -sh src/clients/web/dist | cut -f1)
-                      FILES=$(find src/clients/web/dist -type f | wc -l)
-                      echo "| Size | $SIZE |" >> $GITHUB_STEP_SUMMARY
-                      echo "| Files | $FILES |" >> $GITHUB_STEP_SUMMARY
-                  fi
-
-    # =========================================================================
     # STAGE 3: DOCKER BUILD
     # =========================================================================
     docker-build:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup, build-kmp-web]
+        needs: [setup]
         if: |
-            always() &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
-            !inputs.skip_deploy &&
-            (needs.build-kmp-web.result == 'success' || matrix.service.name != 'web')
+            !inputs.skip_deploy
         strategy:
             fail-fast: false
             matrix:
@@ -345,38 +269,17 @@ jobs:
                       dockerfile: infrastructure/docker/base/rust/Dockerfile
                       target: workspace
                       build_args: SERVICE_NAME=janus
-                      needs_kmp: false
                     - name: execution
                       dockerfile: infrastructure/docker/base/rust/Dockerfile
                       target: execution
                       build_args: SERVICE_NAME=execution
-                      needs_kmp: false
                     - name: web
                       dockerfile: infrastructure/docker/services/web/Dockerfile
                       target: production
-                      build_args: SKIP_KMP_BUILD=true
-                      needs_kmp: true
+                      build_args: ""
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
-
-            - name: 📥 Download KMP Web Dist
-              if: matrix.service.needs_kmp
-              uses: actions/download-artifact@v4
-              with:
-                  name: kmp-web-dist-${{ github.sha }}
-                  path: src/clients/web/dist/
-
-            - name: 🔍 Verify KMP Web Dist
-              if: matrix.service.needs_kmp
-              run: |
-                  echo "📦 Checking downloaded KMP web distribution..."
-                  ls -la src/clients/web/dist/
-                  if [ ! -f "src/clients/web/dist/index.html" ]; then
-                      echo "❌ index.html not found in dist!"
-                      exit 1
-                  fi
-                  echo "✅ KMP web distribution ready"
 
             - name: 🐳 Build and Push
               uses: nuniesmith/actions/.github/actions/docker-build-push@main
@@ -402,7 +305,7 @@ jobs:
         name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
         timeout-minutes: 30
-        needs: [setup] # Removed docker-build dependency temporarily
+        needs: [setup, docker-build]
         if: |
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
@@ -654,7 +557,7 @@ jobs:
         name: 📊 Pipeline Summary
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        needs: [setup, build-kmp-web, docker-build, deploy]
+        needs: [setup, docker-build, deploy]
         if: always()
         steps:
             - name: 📊 Generate summary
@@ -672,7 +575,6 @@ jobs:
                   ## Jobs
                   | Job | Status |
                   |-----|--------|
-                  | 🌐 KMP Web Build | ${{ needs.build-kmp-web.result || 'skipped' }} |
                   | 🐳 Docker Build | ${{ needs.docker-build.result || 'skipped' }} |
                   | 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |
 
