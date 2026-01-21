@@ -1,5 +1,5 @@
 # =============================================================================
-# FKS 48-Hour Paper Trading Test Workflow
+# FKS Paper Trading Test Workflow
 # =============================================================================
 # Deploys and monitors a 48-hour paper trading soak test on the production server.
 #
@@ -34,7 +34,7 @@
 # - DISCORD_WEBHOOK_ACTIONS (optional, for notifications)
 # =============================================================================
 
-name: 🧪 48-Hour Paper Trading Test
+name: 🧪 Paper Trading Test
 
 on:
     workflow_dispatch:
