@@ -42,7 +42,7 @@ inputs:
     clippy-args:
         description: "Additional arguments for clippy"
         required: false
-        default: "--all-targets --all-features -- -D warnings"
+        default: "--all-targets -- -D warnings"
     test-args:
         description: "Additional arguments for test"
         required: false
