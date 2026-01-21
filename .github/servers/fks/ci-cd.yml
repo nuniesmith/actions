@@ -165,7 +165,7 @@ jobs:
     test-rust:
         name: 🦀 Rust Tests
         runs-on: ubuntu-latest
-        timeout-minutes: 30
+        timeout-minutes: 60
         needs: [setup]
         if: |
             github.event_name == 'pull_request' ||
@@ -240,6 +240,10 @@ jobs:
                     - name: web
                       dockerfile: infrastructure/docker/services/web/Dockerfile
                       target: production
+                      build_args: ""
+                    - name: authelia
+                      dockerfile: infrastructure/docker/services/authelia/Dockerfile
+                      target: runtime
                       build_args: ""
         steps:
             - name: 📥 Checkout code
