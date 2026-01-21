@@ -142,11 +142,11 @@ runs:
                   -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN" \
                   -addext "subjectAltName=$SAN_LIST"
 
-                # Create symlinks like Let's Encrypt does
-                sudo ln -sf ../../archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/fullchain.pem
-                sudo ln -sf ../../archive/$DOMAIN/privkey1.pem /tmp/letsencrypt/live/$DOMAIN/privkey.pem
-                sudo ln -sf ../../archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/cert.pem
-                sudo ln -sf ../../archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/chain.pem
+                # Copy files to live directory (symlinks break during tar/transfer to Docker volumes)
+                sudo cp /tmp/letsencrypt/archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/fullchain.pem
+                sudo cp /tmp/letsencrypt/archive/$DOMAIN/privkey1.pem /tmp/letsencrypt/live/$DOMAIN/privkey.pem
+                sudo cp /tmp/letsencrypt/archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/cert.pem
+                sudo cp /tmp/letsencrypt/archive/$DOMAIN/fullchain1.pem /tmp/letsencrypt/live/$DOMAIN/chain.pem
 
                 # Verify self-signed cert was created
                 if sudo test -f "/tmp/letsencrypt/live/$DOMAIN/fullchain.pem"; then
@@ -365,8 +365,11 @@ runs:
                 rm -f /tmp/ssl-certs.tar.gz
 
                 # Verify
-                echo '✅ Certificates deployed to Docker volume: $DOCKER_VOLUME'
+                echo \"✅ Certificates deployed to Docker volume: $DOCKER_VOLUME\"
                 docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest ls -la /etc/letsencrypt/live/
+                echo '📄 Verifying certificate files exist:'
+                docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest ls -la /etc/letsencrypt/live/$DOMAIN/ || echo '⚠️ Could not list domain directory'
+                docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest cat /etc/letsencrypt/live/$DOMAIN/fullchain.pem | head -5 || echo '⚠️ Could not read fullchain.pem'
               "
 
               # Cleanup local SSH key

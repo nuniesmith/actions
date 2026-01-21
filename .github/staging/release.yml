@@ -1,0 +1,223 @@
+# =============================================================================
+# Automated Release Workflow
+# =============================================================================
+# Creates versioned releases of composite actions using Git tags.
+#
+# Trigger Methods:
+# 1. Manual dispatch with version input
+# 2. Push a tag matching v*.*.* pattern
+#
+# This workflow:
+# - Validates semantic versioning
+# - Creates/updates major version tags (v1, v2, etc.)
+# - Generates release notes
+# - Creates GitHub Release
+# =============================================================================
+
+name: 🏷️ Release
+
+on:
+    push:
+        tags:
+            - "v[0-9]+.[0-9]+.[0-9]+*"
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Version to release (e.g., 1.0.0, 1.2.3)"
+                required: true
+                type: string
+            dry_run:
+                description: "Dry run (no changes)"
+                required: false
+                type: boolean
+                default: false
+
+permissions:
+    contents: write
+
+env:
+    GH_TOKEN: ${{ github.token }}
+
+jobs:
+    release:
+        name: 🚀 Create Release
+        runs-on: ubuntu-latest
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: 🔍 Determine version
+              id: version
+              run: |
+                  if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+                      VERSION="${{ inputs.version }}"
+                      # Remove 'v' prefix if provided
+                      VERSION="${VERSION#v}"
+                  else
+                      # Extract from tag
+                      VERSION="${GITHUB_REF#refs/tags/v}"
+                  fi
+
+                  # Validate semantic versioning
+                  if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+                      echo "❌ Invalid version format: $VERSION"
+                      echo "   Use semantic versioning (e.g., 1.0.0, 2.1.0-beta.1)"
+                      exit 1
+                  fi
+
+                  # Extract major version
+                  MAJOR="${VERSION%%.*}"
+
+                  echo "version=$VERSION" >> $GITHUB_OUTPUT
+                  echo "full_tag=v$VERSION" >> $GITHUB_OUTPUT
+                  echo "major_tag=v$MAJOR" >> $GITHUB_OUTPUT
+                  echo "major=$MAJOR" >> $GITHUB_OUTPUT
+
+                  echo "📦 Version: $VERSION"
+                  echo "🏷️ Full tag: v$VERSION"
+                  echo "🏷️ Major tag: v$MAJOR"
+
+            - name: 🔍 Check if release exists
+              id: check
+              run: |
+                  FULL_TAG="${{ steps.version.outputs.full_tag }}"
+
+                  if git rev-parse "refs/tags/$FULL_TAG" > /dev/null 2>&1; then
+                      if [[ "${{ github.event_name }}" == "push" ]]; then
+                          echo "exists=false" >> $GITHUB_OUTPUT
+                          echo "✅ Tag $FULL_TAG pushed, proceeding with release"
+                      else
+                          echo "exists=true" >> $GITHUB_OUTPUT
+                          echo "⚠️ Tag $FULL_TAG already exists"
+                      fi
+                  else
+                      echo "exists=false" >> $GITHUB_OUTPUT
+                      echo "✅ Tag $FULL_TAG does not exist"
+                  fi
+
+            - name: 🏷️ Create version tag
+              if: steps.check.outputs.exists != 'true' && github.event_name == 'workflow_dispatch' && inputs.dry_run != true
+              run: |
+                  FULL_TAG="${{ steps.version.outputs.full_tag }}"
+
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+
+                  git tag -a "$FULL_TAG" -m "Release $FULL_TAG"
+                  git push origin "$FULL_TAG"
+
+                  echo "✅ Created and pushed tag $FULL_TAG"
+
+            - name: 🏷️ Update major version tag
+              if: inputs.dry_run != true
+              run: |
+                  FULL_TAG="${{ steps.version.outputs.full_tag }}"
+                  MAJOR_TAG="${{ steps.version.outputs.major_tag }}"
+
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+
+                  # Delete existing major tag if it exists
+                  git tag -d "$MAJOR_TAG" 2>/dev/null || true
+                  git push origin ":refs/tags/$MAJOR_TAG" 2>/dev/null || true
+
+                  # Create new major tag pointing to same commit as full tag
+                  git tag -a "$MAJOR_TAG" -m "Update $MAJOR_TAG to $FULL_TAG" "$FULL_TAG"
+                  git push origin "$MAJOR_TAG"
+
+                  echo "✅ Updated $MAJOR_TAG to point to $FULL_TAG"
+
+            - name: 📝 Generate release notes
+              id: notes
+              run: |
+                  FULL_TAG="${{ steps.version.outputs.full_tag }}"
+                  MAJOR_TAG="${{ steps.version.outputs.major_tag }}"
+
+                  # Get list of actions
+                  ACTIONS=$(find .github/actions -name "action.yml" -exec dirname {} \; | sed 's|.github/actions/||' | sort)
+
+                  # Generate release notes
+                  cat > release_notes.md << EOF
+                  ## 🎉 Release $FULL_TAG
+
+                  ### 📦 Available Actions
+
+                  | Action | Reference |
+                  |--------|-----------|
+                  EOF
+
+                  for action in $ACTIONS; do
+                      echo "| \`$action\` | \`nuniesmith/actions/.github/actions/$action@$MAJOR_TAG\` |" >> release_notes.md
+                  done
+
+                  cat >> release_notes.md << EOF
+
+                  ### 📖 Usage
+
+                  Reference actions using the major version tag for automatic updates:
+
+                  \`\`\`yaml
+                  - uses: nuniesmith/actions/.github/actions/ACTION_NAME@$MAJOR_TAG
+                  \`\`\`
+
+                  Or pin to this exact version:
+
+                  \`\`\`yaml
+                  - uses: nuniesmith/actions/.github/actions/ACTION_NAME@$FULL_TAG
+                  \`\`\`
+
+                  ### 📋 What's Changed
+
+                  See [commit history](https://github.com/${{ github.repository }}/commits/$FULL_TAG) for details.
+                  EOF
+
+                  echo "Generated release notes:"
+                  cat release_notes.md
+
+            - name: 🚀 Create GitHub Release
+              if: inputs.dry_run != true
+              run: |
+                  FULL_TAG="${{ steps.version.outputs.full_tag }}"
+
+                  # Check if release already exists
+                  if gh release view "$FULL_TAG" > /dev/null 2>&1; then
+                      echo "📝 Updating existing release $FULL_TAG"
+                      gh release edit "$FULL_TAG" --notes-file release_notes.md
+                  else
+                      echo "🆕 Creating new release $FULL_TAG"
+                      gh release create "$FULL_TAG" \
+                          --title "Release $FULL_TAG" \
+                          --notes-file release_notes.md \
+                          --latest
+                  fi
+
+                  echo "✅ GitHub Release created/updated"
+
+            - name: 📊 Summary
+              run: |
+                  FULL_TAG="${{ steps.version.outputs.full_tag }}"
+                  MAJOR_TAG="${{ steps.version.outputs.major_tag }}"
+                  DRY_RUN="${{ inputs.dry_run }}"
+
+                  if [[ "$DRY_RUN" == "true" ]]; then
+                      echo "## 🧪 Dry Run Summary" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      echo "No changes were made. Would have created:" >> $GITHUB_STEP_SUMMARY
+                  else
+                      echo "## 🎉 Release Summary" >> $GITHUB_STEP_SUMMARY
+                  fi
+
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+                  echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| Version | \`$FULL_TAG\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Major Tag | \`$MAJOR_TAG\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Repository | \`${{ github.repository }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "### 📖 Usage" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "\`\`\`yaml" >> $GITHUB_STEP_SUMMARY
+                  echo "uses: nuniesmith/actions/.github/actions/ACTION_NAME@$MAJOR_TAG" >> $GITHUB_STEP_SUMMARY
+                  echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
