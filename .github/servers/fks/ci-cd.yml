@@ -92,11 +92,17 @@ jobs:
                   HAS_PROD_IP: ${{ secrets.PROD_TAILSCALE_IP != '' }}
                   HAS_SSH_KEY: ${{ secrets.PROD_SSH_KEY != '' }}
                   HAS_TAILSCALE: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID != '' }}
+                  PROD_TAILSCALE_IP: ${{ secrets.PROD_TAILSCALE_IP }}
+                  STAGING_TAILSCALE_IP: ${{ secrets.STAGING_TAILSCALE_IP }}
+                  INPUT_ENV: ${{ inputs.environment }}
+                  GITHUB_REF: ${{ github.ref }}
+                  PROD_DOMAIN: ${{ env.DOMAIN }}
+                  STAGE_DOMAIN: ${{ env.STAGING_DOMAIN }}
               run: |
                   # Determine environment
-                  if [ "${{ inputs.environment }}" != "" ] && [ "${{ inputs.environment }}" != "auto" ]; then
-                    ENV="${{ inputs.environment }}"
-                  elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+                  if [ -n "$INPUT_ENV" ] && [ "$INPUT_ENV" != "auto" ]; then
+                    ENV="$INPUT_ENV"
+                  elif [ "$GITHUB_REF" == "refs/heads/main" ]; then
                     ENV="production"
                   else
                     ENV="staging"
@@ -104,12 +110,17 @@ jobs:
 
                   # Set host and domain based on environment
                   if [ "$ENV" = "production" ]; then
-                    HOST="${{ secrets.PROD_TAILSCALE_IP }}"
-                    DOMAIN="${{ env.DOMAIN }}"
+                    HOST="$PROD_TAILSCALE_IP"
+                    DOMAIN="$PROD_DOMAIN"
                   else
-                    HOST="${{ secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}"
-                    DOMAIN="${{ env.STAGING_DOMAIN }}"
+                    HOST="${STAGING_TAILSCALE_IP:-$PROD_TAILSCALE_IP}"
+                    DOMAIN="$STAGE_DOMAIN"
                   fi
+
+                  # Debug output
+                  echo "🎯 Environment: $ENV"
+                  echo "📍 Host: $HOST"
+                  echo "🌐 Domain: $DOMAIN"
 
                   echo "environment=$ENV" >> $GITHUB_OUTPUT
                   echo "host=$HOST" >> $GITHUB_OUTPUT
