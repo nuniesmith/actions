@@ -1,0 +1,306 @@
+# ============================================================================
+# Cloudflare DNS Records Management for 7gram.xyz
+# ============================================================================
+# Manages DNS A records for all services across Freddy and Sullivan servers.
+# All records point to Freddy's Tailscale IP - Freddy's nginx reverse proxies
+# Sullivan services over Tailscale network.
+#
+# Architecture:
+#   Internet → Cloudflare DNS → Freddy (Tailscale IP) → nginx reverse proxy
+#                                                      ├── Freddy services (local)
+#                                                      └── Sullivan services (via Tailscale)
+# ============================================================================
+
+name: 🌐 Cloudflare DNS Records
+
+on:
+    workflow_dispatch:
+        inputs:
+            target_ip:
+                description: "Target IP address (leave empty to use FREDDY_TAILSCALE_IP secret)"
+                required: false
+                type: string
+            dry_run:
+                description: "Dry run (show changes without applying)"
+                required: false
+                type: boolean
+                default: false
+    schedule:
+        # Run every 6 hours to keep DNS updated
+        - cron: "0 */6 * * *"
+
+permissions:
+    contents: read
+
+env:
+    # Primary domain
+    DOMAIN: 7gram.xyz
+
+    # ==========================================================================
+    # DNS Records Configuration
+    # ==========================================================================
+    # All records point to Freddy's Tailscale IP
+    # Freddy's nginx handles reverse proxying to Sullivan over Tailscale
+
+    # Core domain records
+    DNS_RECORDS_CORE: >-
+        7gram.xyz
+        *.7gram.xyz
+
+    # Freddy server services (running locally on Freddy)
+    DNS_RECORDS_FREDDY: >-
+        freddy.7gram.xyz
+        auth.7gram.xyz
+        nc.7gram.xyz
+        photo.7gram.xyz
+        home.7gram.xyz
+        audiobook.7gram.xyz
+        sync-freddy.7gram.xyz
+
+    # Sullivan server services (proxied via Freddy's nginx over Tailscale)
+    DNS_RECORDS_SULLIVAN: >-
+        sullivan.7gram.xyz
+        jellyfin.7gram.xyz
+        emby.7gram.xyz
+        plex.7gram.xyz
+        sonarr.7gram.xyz
+        radarr.7gram.xyz
+        lidarr.7gram.xyz
+        jackett.7gram.xyz
+        qbittorrent.7gram.xyz
+        calibre.7gram.xyz
+        yt.7gram.xyz
+        filebot.7gram.xyz
+        grocy.7gram.xyz
+        mealie.7gram.xyz
+        wiki.7gram.xyz
+        duplicati.7gram.xyz
+        sync-sullivan.7gram.xyz
+
+    # Other devices/services
+    DNS_RECORDS_OTHER: >-
+        sync-oryx.7gram.xyz
+        sync-desktop.7gram.xyz
+        obs-demo.7gram.xyz
+        obs-live.7gram.xyz
+        obf-demo.7gram.xyz
+        obf-live.7gram.xyz
+
+concurrency:
+    group: cloudflare-dns
+    cancel-in-progress: false
+
+jobs:
+    update-dns:
+        name: 🌐 Update DNS Records
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 🔧 Set target IP
+              id: ip
+              run: |
+                  if [ -n "${{ inputs.target_ip }}" ]; then
+                    echo "TARGET_IP=${{ inputs.target_ip }}" >> $GITHUB_ENV
+                    echo "📍 Using workflow input IP: ${{ inputs.target_ip }}"
+                  else
+                    echo "TARGET_IP=${{ secrets.FREDDY_TAILSCALE_IP }}" >> $GITHUB_ENV
+                    echo "📍 Using FREDDY_TAILSCALE_IP secret"
+                  fi
+
+            - name: ✅ Validate IP address
+              run: |
+                  if [[ ! "$TARGET_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                    echo "❌ Error: Invalid IP address format: $TARGET_IP"
+                    exit 1
+                  fi
+                  echo "✅ Valid IP address: $TARGET_IP"
+
+            - name: 🌐 Update Cloudflare DNS records
+              env:
+                  CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+                  DRY_RUN: ${{ inputs.dry_run || 'false' }}
+              run: |
+                  echo "🌐 Updating DNS records for ${{ env.DOMAIN }}..."
+                  echo "📍 Target IP: $TARGET_IP"
+                  echo "🔄 Dry run: $DRY_RUN"
+                  echo ""
+
+                  # Combine all DNS records
+                  ALL_RECORDS="${DNS_RECORDS_CORE} ${DNS_RECORDS_FREDDY} ${DNS_RECORDS_SULLIVAN} ${DNS_RECORDS_OTHER}"
+
+                  # Counters
+                  CREATED=0
+                  UPDATED=0
+                  UNCHANGED=0
+                  FAILED=0
+
+                  # Function to get DNS record ID
+                  get_record_id() {
+                    local record_name=$1
+                    curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${record_name}&type=A" \
+                      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                      -H "Content-Type: application/json" | jq -r '.result[0].id // empty'
+                  }
+
+                  # Function to get current record content
+                  get_record_content() {
+                    local record_name=$1
+                    curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${record_name}&type=A" \
+                      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                      -H "Content-Type: application/json" | jq -r '.result[0].content // empty'
+                  }
+
+                  # Function to create or update DNS record
+                  update_dns_record() {
+                    local record_name=$1
+                    local record_type="A"
+                    local record_id=$(get_record_id "$record_name")
+                    local current_content=$(get_record_content "$record_name")
+
+                    if [ -z "$record_id" ]; then
+                      # Create new record
+                      if [ "$DRY_RUN" = "true" ]; then
+                        echo "📝 [DRY RUN] Would CREATE: $record_name → $TARGET_IP"
+                        return 0
+                      fi
+
+                      echo "➕ Creating: $record_name → $TARGET_IP"
+                      response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+                        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                        -H "Content-Type: application/json" \
+                        --data "{\"type\":\"${record_type}\",\"name\":\"${record_name}\",\"content\":\"${TARGET_IP}\",\"ttl\":1,\"proxied\":false}")
+
+                      success=$(echo "$response" | jq -r '.success')
+                      if [ "$success" = "true" ]; then
+                        echo "   ✅ Created successfully"
+                        CREATED=$((CREATED + 1))
+                      else
+                        echo "   ❌ Failed to create"
+                        echo "   Error: $(echo "$response" | jq -r '.errors[0].message // "Unknown error"')"
+                        FAILED=$((FAILED + 1))
+                        return 1
+                      fi
+
+                    elif [ "$current_content" = "$TARGET_IP" ]; then
+                      # No update needed
+                      echo "⏭️  Unchanged: $record_name (already points to $TARGET_IP)"
+                      UNCHANGED=$((UNCHANGED + 1))
+
+                    else
+                      # Update existing record
+                      if [ "$DRY_RUN" = "true" ]; then
+                        echo "📝 [DRY RUN] Would UPDATE: $record_name ($current_content → $TARGET_IP)"
+                        return 0
+                      fi
+
+                      echo "🔄 Updating: $record_name ($current_content → $TARGET_IP)"
+                      response=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
+                        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                        -H "Content-Type: application/json" \
+                        --data "{\"type\":\"${record_type}\",\"name\":\"${record_name}\",\"content\":\"${TARGET_IP}\",\"ttl\":1,\"proxied\":false}")
+
+                      success=$(echo "$response" | jq -r '.success')
+                      if [ "$success" = "true" ]; then
+                        echo "   ✅ Updated successfully"
+                        UPDATED=$((UPDATED + 1))
+                      else
+                        echo "   ❌ Failed to update"
+                        echo "   Error: $(echo "$response" | jq -r '.errors[0].message // "Unknown error"')"
+                        FAILED=$((FAILED + 1))
+                        return 1
+                      fi
+                    fi
+                  }
+
+                  # Update each DNS record
+                  echo "=========================================="
+                  echo "Processing DNS records..."
+                  echo "=========================================="
+                  echo ""
+
+                  for record in $ALL_RECORDS; do
+                    update_dns_record "$record"
+                    sleep 0.5  # Rate limiting
+                  done
+
+                  echo ""
+                  echo "=========================================="
+                  echo "📊 Summary"
+                  echo "=========================================="
+                  echo "✅ Created:   $CREATED"
+                  echo "🔄 Updated:   $UPDATED"
+                  echo "⏭️  Unchanged: $UNCHANGED"
+                  echo "❌ Failed:    $FAILED"
+                  echo ""
+
+                  # Export for summary
+                  echo "CREATED=$CREATED" >> $GITHUB_ENV
+                  echo "UPDATED=$UPDATED" >> $GITHUB_ENV
+                  echo "UNCHANGED=$UNCHANGED" >> $GITHUB_ENV
+                  echo "FAILED=$FAILED" >> $GITHUB_ENV
+
+                  if [ $FAILED -gt 0 ]; then
+                    echo "⚠️ Some records failed to update"
+                    exit 1
+                  fi
+
+                  echo "✅ DNS update complete!"
+
+            - name: 🔍 Verify DNS propagation
+              if: inputs.dry_run != true
+              run: |
+                  echo "🔍 Verifying DNS propagation (using Cloudflare DNS 1.1.1.1)..."
+                  echo ""
+                  sleep 5
+
+                  # Test key records
+                  TEST_RECORDS="7gram.xyz auth.7gram.xyz jellyfin.7gram.xyz"
+
+                  for record in $TEST_RECORDS; do
+                    resolved_ip=$(dig +short "$record" @1.1.1.1 | tail -n1)
+                    if [ "$resolved_ip" = "$TARGET_IP" ]; then
+                      echo "✅ $record → $resolved_ip"
+                    else
+                      echo "⚠️ $record → $resolved_ip (expected $TARGET_IP, may need more propagation time)"
+                    fi
+                  done
+
+            - name: 📋 Create summary
+              if: always()
+              run: |
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  ## 🌐 Cloudflare DNS Update Summary
+
+                  **Domain:** \`${{ env.DOMAIN }}\`
+                  **Target IP:** \`$TARGET_IP\`
+                  **Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+                  **Dry Run:** ${{ inputs.dry_run || 'false' }}
+
+                  ### 📊 Results
+
+                  | Status | Count |
+                  |--------|-------|
+                  | ✅ Created | ${CREATED:-0} |
+                  | 🔄 Updated | ${UPDATED:-0} |
+                  | ⏭️ Unchanged | ${UNCHANGED:-0} |
+                  | ❌ Failed | ${FAILED:-0} |
+
+                  ### 🏠 Freddy Services (Local)
+                  $(for r in $DNS_RECORDS_FREDDY; do echo "- \`$r\`"; done)
+
+                  ### 🎬 Sullivan Services (Proxied via Freddy)
+                  $(for r in $DNS_RECORDS_SULLIVAN; do echo "- \`$r\`"; done)
+
+                  ### 🔧 Architecture
+                  \`\`\`
+                  Internet → Cloudflare DNS → Freddy (${TARGET_IP})
+                                              └── nginx reverse proxy
+                                                  ├── Freddy services (local)
+                                                  └── Sullivan services (Tailscale)
+                  \`\`\`
+                  EOF
