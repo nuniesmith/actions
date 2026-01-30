@@ -304,9 +304,7 @@ jobs:
 
                       # Define compose command with BOTH env files (test file takes precedence)
                       COMPOSE_CMD="docker compose --env-file .env --env-file $TEST_ENV_FILE -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
-</text>
 
-<old_text line=340>
                       # Start background log collection
                       if [ -z "$TEST_LOG_DIR" ]; then
                         TEST_LOG_DIR=$(grep TEST_LOG_DIR .env.48hr-test 2>/dev/null | tail -1 | cut -d= -f2)
@@ -356,25 +354,48 @@ jobs:
                       fi
                       mkdir -p "$TEST_LOG_DIR"
 
-                      # Collect all services combined log (use both env files)
-                      nohup docker compose --env-file .env --env-file "$TEST_ENV_FILE" -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml logs -f --timestamps > "$TEST_LOG_DIR/all-services.log" 2>&1 &
-                      echo $! > "$TEST_LOG_DIR/log-collector.pid"
+                      # Collect all services combined log (capture stderr separately for debugging)
+                      nohup docker compose --env-file .env --env-file "$TEST_ENV_FILE" -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml logs -f --timestamps >> "$TEST_LOG_DIR/all-services.log" 2> "$TEST_LOG_DIR/log-collector.err" &
+                      COLLECTOR_PID=$!
+                      echo $COLLECTOR_PID > "$TEST_LOG_DIR/log-collector.pid"
 
-                      # Collect individual service logs
+                      # Verify log collector started
+                      sleep 2
+                      if ps -p $COLLECTOR_PID > /dev/null 2>&1; then
+                        echo "✅ Combined log collector started (PID: $COLLECTOR_PID)"
+                        sleep 1
+                        if [ -s "$TEST_LOG_DIR/all-services.log" ]; then
+                          echo "✅ all-services.log is receiving data"
+                        else
+                          echo "⚠️ all-services.log is empty - check $TEST_LOG_DIR/log-collector.err"
+                          [ -s "$TEST_LOG_DIR/log-collector.err" ] && cat "$TEST_LOG_DIR/log-collector.err"
+                        fi
+                      else
+                        echo "❌ Log collector failed to start! Check $TEST_LOG_DIR/log-collector.err"
+                        [ -s "$TEST_LOG_DIR/log-collector.err" ] && cat "$TEST_LOG_DIR/log-collector.err"
+                      fi
+
+                      # Collect individual service logs (verify containers exist first)
                       for svc in janus execution redis postgres questdb; do
-                        nohup docker logs -f "fks_${svc}" > "$TEST_LOG_DIR/${svc}.log" 2>&1 &
+                        if docker ps --filter "name=fks_${svc}" --format '{{.Names}}' | grep -q "fks_${svc}"; then
+                          nohup docker logs -f "fks_${svc}" >> "$TEST_LOG_DIR/${svc}.log" 2>&1 &
+                        fi
                       done
 
+                      echo ""
                       echo "📝 Log collection started:"
-                      echo "   - $TEST_LOG_DIR/all-services.log (combined)"
+                      echo "   - $TEST_LOG_DIR/all-services.log (combined, PID: $COLLECTOR_PID)"
                       echo "   - $TEST_LOG_DIR/janus.log"
                       echo "   - $TEST_LOG_DIR/execution.log"
                       echo "   - $TEST_LOG_DIR/redis.log"
                       echo "   - $TEST_LOG_DIR/postgres.log"
                       echo "   - $TEST_LOG_DIR/questdb.log"
+                      echo ""
+                      echo "💡 If all-services.log is empty, check: $TEST_LOG_DIR/log-collector.err"
+                      echo "💡 To restart log collection: cd ~/fks && nohup docker compose -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml logs -f >> $TEST_LOG_DIR/all-services.log 2>&1 &"
 
                       # Create helper script for checking status
-                      cat > "$TEST_LOG_DIR/check-status.sh" << 'STATUSEOF'
+                      cat > "$TEST_LOG_DIR/check-status.sh" << 'EOF'
                       #!/bin/bash
                       echo "════════════════════════════════════════════════════════════"
                       echo "📊 PAPER TRADING TEST STATUS"
@@ -391,11 +412,11 @@ jobs:
                       echo ""
                       echo "🔧 Optimizer Status:"
                       docker exec fks_janus /app/janus-optimizer status 2>&1 || echo "Could not get optimizer status"
-                      STATUSEOF
+                      EOF
                       chmod +x "$TEST_LOG_DIR/check-status.sh"
 
                       # Save test metadata
-                      cat > "$TEST_LOG_DIR/test-info.json" << EOF
+                      cat > "$TEST_LOG_DIR/test-metadata.json" <<'EOFTEST'
                       {
                         "test_id": "${{ needs.setup.outputs.test_id }}",
                         "test_type": "${{ inputs.duration_hours }}hr_paper_trading",
@@ -404,14 +425,14 @@ jobs:
                         "duration_hours": ${{ inputs.duration_hours }},
                         "mode": "simulation",
                         "real_orders_enabled": false,
-                        "assets": $(echo '"${{ inputs.assets }}"' | jq -c 'split(",")'),
+                        "assets": "${{ inputs.assets }}",
                         "optimize_interval": "${{ inputs.optimize_interval }}",
                         "optimize_trials": ${{ inputs.optimize_trials }},
                         "github_run_id": "${{ github.run_id }}",
                         "github_sha": "${{ github.sha }}",
                         "triggered_by": "${{ github.actor }}"
                       }
-                      EOF
+                      EOFTEST
 
                       # Show status
                       echo ""
