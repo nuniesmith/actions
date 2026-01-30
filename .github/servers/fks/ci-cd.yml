@@ -167,9 +167,6 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 60
         needs: [setup]
-        if: |
-            github.event_name == 'pull_request' ||
-            github.event_name == 'push'
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -195,9 +192,6 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs: [setup]
-        if: |
-            github.event_name == 'pull_request' ||
-            github.event_name == 'push'
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -244,6 +238,10 @@ jobs:
                     - name: authelia
                       dockerfile: infrastructure/docker/services/authelia/Dockerfile
                       target: runtime
+                      build_args: ""
+                    - name: nginx
+                      dockerfile: infrastructure/docker/services/nginx/Dockerfile
+                      target: production
                       build_args: ""
         steps:
             - name: 📥 Checkout code
@@ -386,22 +384,19 @@ jobs:
                       echo "🖥️  Host: $(hostname) | $(date)"
                       echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free"
 
-                      # First-time setup
-                      [ ! -d ~/fks/.git ] && git clone https://github.com/nuniesmith/fks.git ~/fks
+                      # First-time setup - clone repo
+                      if [ ! -d ~/fks/.git ]; then
+                        echo "📦 First-time setup - cloning repository..."
+                        rm -rf ~/fks
+                        git clone https://github.com/nuniesmith/fks.git ~/fks
+                      fi
 
-                      # Ensure Docker volumes
-                      for vol in fks_ssl_certs fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions; do
+                      # Ensure all Docker volumes exist
+                      echo "📦 Creating Docker volumes..."
+                      for vol in fks_ssl_certs fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions fks_nginx_logs; do
                         docker volume create $vol 2>/dev/null || true
                       done
-
-                      # Copy SSL certs from Docker volume to nginx bind mount path
-                      echo "🔐 Syncing SSL certificates to nginx bind mount..."
-                      SSL_BIND_PATH="$HOME/fks/infrastructure/configs/nginx/ssl/live/${{ needs.setup.outputs.target_domain }}"
-                      mkdir -p "$SSL_BIND_PATH"
-                      docker run --rm \
-                        -v fks_ssl_certs:/src:ro \
-                        -v "$SSL_BIND_PATH":/dst \
-                        busybox sh -c 'cp -v /src/live/${{ needs.setup.outputs.target_domain }}/* /dst/ 2>/dev/null || echo "No certs in volume yet"'
+                      echo "✅ Docker volumes ready"
 
                   deploy-command: |
                       echo "════════════════════════════════════════════════════════════"
@@ -411,59 +406,119 @@ jobs:
                       # Docker login
                       echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
 
-                      # Environment setup
-                      [ ! -f .env ] && touch .env
-                      ensure_env() { grep -q "^${1}=" .env || echo "${1}=${2}" >> .env; }
-                      ensure_env "POSTGRES_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env "POSTGRES_USER" "fks_user"
-                      ensure_env "POSTGRES_DB" "fks"
-                      ensure_env "REDIS_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env "QUESTDB_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env "GRAFANA_PASSWORD" "$(openssl rand -hex 16)"
-                      ensure_env "GRAFANA_USER" "admin"
-                      ensure_env "TRADING_MODE" "simulation"
-                      ensure_env "REAL_ORDERS_ENABLED" "false"
-                      ensure_env "ENABLE_EXECUTION" "true"
-                      ensure_env "REGISTRY" "docker.io"
-                      ensure_env "IMAGE_NAME" "nuniesmith/fks"
-                      ensure_env "ENVIRONMENT" "${{ needs.setup.outputs.deploy_env }}"
+                      # Generate .env if it doesn't exist or is empty
+                      if [ ! -s .env ]; then
+                        echo "🔐 Generating fresh .env with secure secrets..."
+
+                        # Generate secrets
+                        PG_PASS=$(openssl rand -hex 16)
+                        REDIS_PASS=$(openssl rand -hex 16)
+                        QUEST_PASS=$(openssl rand -hex 16)
+                        GRAF_PASS=$(openssl rand -hex 16)
+                        GF_SECRET=$(openssl rand -hex 16)
+                        AUTH_JWT=$(openssl rand -hex 64)
+                        AUTH_SESS=$(openssl rand -hex 64)
+                        AUTH_ENC=$(openssl rand -hex 64)
+                        AUTH_RESET=$(openssl rand -hex 64)
+                        AUTH_PG=$(openssl rand -hex 16)
+
+                        # Write .env file using printf (more reliable than heredoc in SSH)
+                        {
+                          printf "POSTGRES_PASSWORD=%s\n" "$PG_PASS"
+                          printf "POSTGRES_USER=fks_user\n"
+                          printf "POSTGRES_DB=fks\n"
+                          printf "REDIS_PASSWORD=%s\n" "$REDIS_PASS"
+                          printf "QUESTDB_PASSWORD=%s\n" "$QUEST_PASS"
+                          printf "QUESTDB_USER=admin\n"
+                          printf "GRAFANA_PASSWORD=%s\n" "$GRAF_PASS"
+                          printf "GRAFANA_USER=admin\n"
+                          printf "GF_SECURITY_SECRET_KEY=%s\n" "$GF_SECRET"
+                          printf "AUTHELIA_JWT_SECRET=%s\n" "$AUTH_JWT"
+                          printf "AUTHELIA_SESSION_SECRET=%s\n" "$AUTH_SESS"
+                          printf "AUTHELIA_STORAGE_ENCRYPTION_KEY=%s\n" "$AUTH_ENC"
+                          printf "AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET=%s\n" "$AUTH_RESET"
+                          printf "AUTHELIA_POSTGRES_PASSWORD=%s\n" "$AUTH_PG"
+                          printf "AUTHELIA_POSTGRES_DB=authelia\n"
+                          printf "AUTHELIA_POSTGRES_USER=authelia\n"
+                          printf "TRADING_MODE=simulation\n"
+                          printf "REAL_ORDERS_ENABLED=false\n"
+                          printf "ENABLE_EXECUTION=true\n"
+                          printf "REGISTRY=docker.io\n"
+                          printf "IMAGE_NAME=nuniesmith/fks\n"
+                          printf "TAG=latest\n"
+                          printf "ENVIRONMENT=%s\n" "${{ needs.setup.outputs.deploy_env }}"
+                          printf "SSL_DOMAIN=%s\n" "${{ needs.setup.outputs.target_domain }}"
+                          printf "LOG_LEVEL=info\n"
+                          printf "RUST_LOG=info\n"
+                        } > .env
+
+                        echo "✅ Generated .env with fresh secrets"
+                      else
+                        echo "✓ Using existing .env file"
+                      fi
+
+                      # Source environment
                       set -a && source .env && set +a
 
-                      # Deploy with run.sh or fallback to docker compose
-                      chmod +x ./run.sh 2>/dev/null || true
-                      if [ -x "./run.sh" ]; then
-                        ./run.sh prod down 2>/dev/null || true
-                        docker compose --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml pull --ignore-pull-failures 2>&1 || true
-                        ./run.sh prod start 2>&1
-                      else
-                        COMPOSE_CMD="docker compose --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
-                        $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
-                        $COMPOSE_CMD pull --ignore-pull-failures 2>&1 || true
-                        $COMPOSE_CMD up -d 2>&1
-                      fi
+                      # Define compose command for production (use --no-build to force image pull)
+                      COMPOSE_CMD="docker compose -p fks --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
+
+                      # Stop existing containers
+                      $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
+
+                      # Pull images explicitly (these are built and pushed in CI)
+                      echo "📥 Pulling pre-built images from Docker Hub..."
+                      REGISTRY="${REGISTRY:-docker.io}"
+                      IMAGE="${IMAGE_NAME:-nuniesmith/fks}"
+                      TAG="${TAG:-latest}"
+
+                      for svc in janus execution web authelia nginx; do
+                        echo "  Pulling ${REGISTRY}/${IMAGE}:${svc}-${TAG}..."
+                        docker pull "${REGISTRY}/${IMAGE}:${svc}-${TAG}" 2>&1 || echo "  ⚠️ Could not pull ${svc}-${TAG}, will try ${svc}-latest"
+                        if [ "$TAG" != "latest" ]; then
+                          docker pull "${REGISTRY}/${IMAGE}:${svc}-latest" 2>&1 || true
+                        fi
+                      done
+
+                      # Start services with --no-build to ensure we use pulled images
+                      echo "🚀 Starting services (using pre-built images)..."
+                      $COMPOSE_CMD up -d --no-build 2>&1
 
                       sleep 30
+                      echo ""
                       echo "📊 Container Status:"
-                      docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -15
+                      docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -20
 
                   post-deploy-command: |
-                      # Sync SSL certs from Docker volume to nginx bind mount and restart nginx
-                      echo "🔐 Final SSL cert sync to nginx bind mount..."
-                      SSL_BIND_PATH="$HOME/fks/infrastructure/configs/nginx/ssl/live/${{ needs.setup.outputs.target_domain }}"
-                      mkdir -p "$SSL_BIND_PATH"
-                      docker run --rm \
-                        -v fks_ssl_certs:/src:ro \
-                        -v "$SSL_BIND_PATH":/dst \
-                        busybox sh -c 'cp -v /src/live/${{ needs.setup.outputs.target_domain }}/* /dst/ 2>/dev/null || echo "No certs to copy"'
+                      echo "════════════════════════════════════════════════════════════"
+                      echo "🧹 POST-DEPLOY"
+                      echo "════════════════════════════════════════════════════════════"
 
-                      # Restart nginx to pick up any cert changes
-                      if docker ps -q -f name=fks_nginx | grep -q .; then
-                        echo "🔄 Restarting nginx to apply SSL certs..."
-                        docker restart fks_nginx
-                        sleep 5
+                      # Check if SSL certs exist in volume and nginx is using them
+                      DOMAIN="${{ needs.setup.outputs.target_domain }}"
+                      if docker run --rm -v fks_ssl_certs:/certs:ro busybox test -f "/certs/live/$DOMAIN/fullchain.pem" 2>/dev/null; then
+                        echo "✅ SSL certificates found in Docker volume"
+
+                        # Restart nginx to pick up certs
+                        if docker ps -q -f name=fks_nginx | grep -q .; then
+                          echo "🔄 Restarting nginx to apply SSL certificates..."
+                          docker restart fks_nginx
+                          sleep 5
+                        fi
+                      else
+                        echo "⚠️ No SSL certificates in volume - nginx using self-signed fallback"
+                        echo "   Run './run.sh ssl-init' to get Let's Encrypt certificates"
                       fi
 
+                      # Cleanup old images
                       docker image prune -f --filter "until=24h" 2>/dev/null || true
+
+                      echo ""
+                      echo "🌐 Access URLs:"
+                      echo "   Main:       https://${{ needs.setup.outputs.target_domain }}"
+                      echo "   Grafana:    https://${{ needs.setup.outputs.target_domain }}/grafana"
+                      echo "   Prometheus: https://${{ needs.setup.outputs.target_domain }}/prometheus"
+                      echo ""
                       echo "✅ Deployment complete!"
 
             # -----------------------------------------------------------------
