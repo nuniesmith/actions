@@ -1,450 +1,216 @@
-# 🚀 Freddy Server - Quick Start Guide
+# SSL Certificate Fix - Quick Start Guide
 
-This guide will help you deploy the Freddy server (personal services) with automated SSL certificates and CI/CD.
+## 🚀 What You Need to Do RIGHT NOW
 
-## 📋 Prerequisites
+Your CI/CD is working but nginx is serving **self-signed certificates** instead of **Let's Encrypt certificates** because the `actions` user can't write to Docker volumes.
 
-### 1. Server Requirements (Freddy)
-- ✅ Linux server (Ubuntu/Debian recommended)
-- ✅ Docker & Docker Compose installed
-- ✅ SSH access configured
-- ✅ Tailscale installed and authenticated
-- ✅ Ports 80 and 443 available
-- ✅ User with Docker permissions
+**Fix:** Add a root SSH key so the workflow can deploy certificates properly.
 
-### 2. Domain & DNS
-- ✅ Domain registered (e.g., `7gram.xyz`)
-- ✅ Cloudflare account with domain added
-- ✅ Cloudflare API token with DNS edit permissions
+---
 
-### 3. GitHub Repository
-- ✅ Repository for Freddy project (e.g., `nuniesmith/freddy`)
-- ✅ This actions repository accessible as shared actions
+## ⚡ 3-Step Quick Fix
 
-## 🔧 Initial Setup
+### Step 1: Generate Root SSH Key (2 minutes)
 
-### Step 1: Configure GitHub Secrets
-
-In your GitHub repository settings, add these secrets:
-
-```
-CLOUDFLARE_API_TOKEN       # Cloudflare API token with DNS:Edit permissions
-CLOUDFLARE_ZONE_ID         # Your Cloudflare zone ID for 7gram.xyz
-SSL_EMAIL                  # Email for Let's Encrypt notifications
-FREDDY_TAILSCALE_IP        # Freddy's Tailscale IP address
-SSH_USER                   # SSH username (e.g., actions)
-SSH_KEY                    # SSH private key for authentication
-SSH_PORT                   # SSH port (default: 22)
-TAILSCALE_OAUTH_CLIENT_ID  # Tailscale OAuth client ID
-TAILSCALE_OAUTH_SECRET     # Tailscale OAuth secret
-DOCKER_USERNAME            # Docker Hub username (optional)
-DOCKER_TOKEN               # Docker Hub token (optional)
-DISCORD_WEBHOOK_ACTIONS    # Discord webhook URL for notifications (optional)
-```
-
-### Step 2: Prepare Freddy Server
-
-Connect to your Freddy server and run:
+On your local machine:
 
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
-
-# Install Docker (if not already installed)
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-
-# Install Docker Compose (if not already installed)
-sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-sudo chmod +x /usr/local/bin/docker-compose
-
-# Verify installations
-docker --version
-docker-compose --version
-
-# Install Tailscale (if not already installed)
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-
-# Get Tailscale IP
-tailscale ip -4
+ssh-keygen -t ed25519 -f ~/.ssh/freddy_root -C "root@freddy-ci"
+# Press Enter for all prompts (no passphrase needed for automation)
 ```
 
-### Step 3: Create SSH User for GitHub Actions
+### Step 2: Add Public Key to Freddy (2 minutes)
 
 ```bash
-# Create actions user
-sudo useradd -m -s /bin/bash actions
-sudo usermod -aG docker actions
+# SSH to Freddy as root (or use 'su -' if logged in as actions)
+ssh root@<freddy-tailscale-ip>
 
-# Create SSH directory
-sudo mkdir -p /home/actions/.ssh
-sudo chmod 700 /home/actions/.ssh
+# If that doesn't work, try:
+ssh actions@<freddy-tailscale-ip>
+su -
 
-# Add your SSH public key
-sudo nano /home/actions/.ssh/authorized_keys
-# Paste your public key, save and exit
-
-sudo chmod 600 /home/actions/.ssh/authorized_keys
-sudo chown -R actions:actions /home/actions/.ssh
-
-# Test SSH access
-ssh actions@<FREDDY_TAILSCALE_IP> "echo 'SSH works!'"
+# Then run:
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+cat >> /root/.ssh/authorized_keys
+# NOW: Paste the content of ~/.ssh/freddy_root.pub (from your local machine)
+# Press Ctrl+D when done
+chmod 600 /root/.ssh/authorized_keys
+exit
 ```
 
-### Step 4: Create Project Directory Structure
+**Test it works:**
+```bash
+ssh -i ~/.ssh/freddy_root root@<freddy-tailscale-ip>
+whoami  # Should say "root"
+exit
+```
+
+### Step 3: Add GitHub Secret (1 minute)
+
+1. Go to: https://github.com/nuniesmith/actions/settings/secrets/actions
+2. Click **"New repository secret"**
+3. Name: `ROOT_SSH_KEY`
+4. Value: Copy the ENTIRE content of `~/.ssh/freddy_root` (private key file)
+   ```bash
+   # On your local machine:
+   cat ~/.ssh/freddy_root
+   # Copy everything from "-----BEGIN OPENSSH PRIVATE KEY-----" to "-----END OPENSSH PRIVATE KEY-----"
+   ```
+5. Click **"Add secret"**
+
+---
+
+## ✅ Test the Fix (5 minutes)
+
+### Run the Workflow
+
+1. Go to: https://github.com/nuniesmith/actions/actions
+2. Find **"🏠 Freddy Deploy"** workflow
+3. Click **"Run workflow"**
+4. Settings:
+   - Branch: `main`
+   - ✅ Check **"Force SSL regeneration"**
+   - ⬜ Leave **"Use staging certs"** unchecked (unless testing)
+5. Click **"Run workflow"** button
+
+### Watch for Success
+
+In the workflow logs, look for:
+
+```
+🔑 Using root SSH key for Docker volume operations
+👤 Running as: root
+✅ Certificates deployed to Docker volume: ssl-certs
+✅ Let's Encrypt certificates found in volume
+✓ Certificate and private key match
+issuer=C=US, O=Let's Encrypt, CN=R3
+```
+
+### Verify in Browser
+
+1. Visit: https://7gram.xyz
+2. Click the **lock icon** in address bar
+3. Check certificate:
+   - ✅ Issued by: **Let's Encrypt**
+   - ❌ NOT: "Freddy" or "self-signed"
+
+---
+
+## 🔍 Quick Verification Commands
+
+On Freddy server:
 
 ```bash
-# Switch to actions user
-sudo su - actions
+# Check if certificates are in Docker volume
+sudo docker run --rm -v ssl-certs:/certs:ro busybox ls -la /certs/live/7gram.xyz/
 
-# Create project directory
-mkdir -p ~/freddy
+# Should show: cert.pem, chain.pem, fullchain.pem, privkey.pem
+
+# Check what nginx is serving
+openssl s_client -connect 7gram.xyz:443 -servername 7gram.xyz < /dev/null 2>/dev/null | openssl x509 -noout -issuer
+
+# Should show: issuer=C=US, O=Let's Encrypt, CN=R3
+# NOT: issuer=C=CA, ST=Ontario, L=Toronto, O=Freddy
+```
+
+---
+
+## 🆘 If Something Goes Wrong
+
+### Problem: "Permission denied" when connecting via root SSH
+
+**Fix:**
+```bash
+# Make sure you're using the correct IP
+ssh -i ~/.ssh/freddy_root root@<freddy-tailscale-ip>
+
+# If that fails, check authorized_keys on server
+ssh actions@<freddy-tailscale-ip>
+su -
+cat /root/.ssh/authorized_keys
+# Should contain your public key
+```
+
+### Problem: Still seeing self-signed certificate after deployment
+
+**Fix:**
+```bash
+# SSH to Freddy
+ssh actions@<freddy-tailscale-ip>
+
+# Restart nginx
 cd ~/freddy
+sudo docker compose restart nginx
 
-# The CI/CD will clone the repo here on first deployment
+# Wait 10 seconds, then check
+curl -vI https://7gram.xyz 2>&1 | grep "issuer"
 ```
 
-### Step 5: Create Docker Volume for SSL Certificates
-
-```bash
-# Create the ssl-certs volume (used by CI/CD)
-docker volume create ssl-certs
-
-# Verify it was created
-docker volume ls | grep ssl-certs
-```
-
-### Step 6: Set Up Project Files on Freddy
-
-In your `freddy` repository, create these files:
-
-#### `docker-compose.yml`
-```yaml
-# Copy from: .github/servers/freddy/example-docker-compose.yml
-# Customize as needed for your services
-```
-
-#### `.env`
-```bash
-# Environment variables for your services
-TIMEZONE=America/New_York
-
-# PhotoPrism
-PHOTOPRISM_ADMIN_PASSWORD=your_secure_password
-PHOTOPRISM_DB_PASSWORD=your_db_password
-PHOTOPRISM_DB_ROOT_PASSWORD=your_root_password
-
-# Nextcloud
-NEXTCLOUD_ADMIN_PASSWORD=your_secure_password
-NEXTCLOUD_DB_PASSWORD=your_db_password
-NEXTCLOUD_DB_ROOT_PASSWORD=your_root_password
-
-# Add other service credentials
-```
-
-#### `nginx/nginx.conf`
-```nginx
-# Copy from: .github/servers/freddy/example-nginx.conf
-```
-
-#### `nginx/conf.d/ssl.conf`
-```nginx
-# Copy from: .github/servers/freddy/example-nginx-conf.d/ssl.conf
-```
-
-#### `nginx/conf.d/7gram.xyz.conf`
-```nginx
-# Copy from: .github/servers/freddy/example-nginx-conf.d/7gram.xyz.conf
-# Update SULLIVAN_TAILSCALE_IP if using Sullivan proxy
-```
-
-#### `run.sh`
-```bash
-#!/bin/bash
-# Simple deployment script
-
-case "$1" in
-  start)
-    docker compose up -d
-    ;;
-  stop)
-    docker compose down
-    ;;
-  restart)
-    docker compose restart
-    ;;
-  prod)
-    if [ "$2" = "start" ]; then
-      docker compose up -d --remove-orphans
-    fi
-    ;;
-  logs)
-    docker compose logs -f
-    ;;
-  *)
-    echo "Usage: $0 {start|stop|restart|prod start|logs}"
-    exit 1
-    ;;
-esac
-```
-
-```bash
-chmod +x run.sh
-```
-
-## 🚀 First Deployment
-
-### Option 1: Manual Trigger (Recommended for First Time)
-
-1. Go to your repository on GitHub
-2. Click **Actions** tab
-3. Select **🏠 Freddy Deploy** workflow
-4. Click **Run workflow**
-5. Leave defaults and click **Run workflow**
-
-The workflow will:
-1. ✅ Update Cloudflare DNS records
-2. ✅ Generate Let's Encrypt SSL certificates
-3. ✅ Deploy to Freddy server
-4. ✅ Run health checks
-5. ✅ Send notification (if configured)
+### Problem: Workflow fails at certificate deployment
 
-### Option 2: Push to Main Branch
+**Check:**
+1. Is `ROOT_SSH_KEY` secret set correctly?
+2. Can you manually SSH as root? `ssh -i ~/.ssh/freddy_root root@<freddy-ip>`
+3. Check workflow logs for specific error message
 
-```bash
-git add .
-git commit -m "Initial Freddy deployment"
-git push origin main
-```
+---
 
-## ✅ Verify Deployment
+## 📚 Full Documentation
 
-### Check Workflow Status
+- **Detailed setup:** See `SSL_FIX_README.md`
+- **Step-by-step checklist:** See `SETUP_CHECKLIST.md`
+- **Diagnostic script:** Run `~/check-ssl-setup.sh` on Freddy server
+- **All changes:** See `CHANGES_SUMMARY.md`
 
-1. Go to GitHub Actions
-2. Watch the workflow run
-3. Check each step for success ✅
+---
 
-### Check SSL Certificates
+## ✨ What Changed
 
-```bash
-# On Freddy server
-docker run --rm -v ssl-certs:/certs:ro busybox:latest ls -la /certs/live/7gram.xyz/
-```
+**Before:**
+- CI/CD generates certificates ✅
+- `actions` user can't write to Docker volume ❌
+- Volume stays empty ❌
+- Nginx uses self-signed fallback ❌
 
-Expected output:
-```
--rw-r--r-- cert.pem
--rw-r--r-- chain.pem
--rw-r--r-- fullchain.pem
--rw------- privkey.pem
-```
+**After:**
+- CI/CD generates certificates ✅
+- Uses root SSH key for Docker operations ✅
+- Certificates deployed to volume ✅
+- Nginx uses Let's Encrypt certificates ✅
 
-### Check Running Containers
+---
 
-```bash
-cd ~/freddy
-docker compose ps
-```
+## 🎯 Expected Timeline
 
-Expected output:
-```
-NAME                  STATUS       PORTS
-nginx                 Up (healthy) 0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
-photoprism            Up (healthy) 
-nextcloud             Up (healthy)
-homeassistant         Up (healthy)
-audiobookshelf        Up (healthy)
-```
+- **Setup:** 5 minutes
+- **First deployment:** 5-10 minutes
+- **Verification:** 2 minutes
+- **Total:** ~15 minutes
 
-### Test HTTPS Access
+---
 
-```bash
-# From your local machine
-curl -I https://7gram.xyz
-curl -I https://photo.7gram.xyz
-curl -I https://nc.7gram.xyz
-curl -I https://home.7gram.xyz
-curl -I https://audiobook.7gram.xyz
-```
+## 🔒 Security Notes
 
-Expected: `200 OK` or `302 Found` responses with valid SSL
+- Root SSH key is **only used for Docker volume operations**
+- Regular deployments still use limited `actions` user
+- Key is encrypted in GitHub Secrets
+- Rotate keys every 90 days (calendar reminder recommended)
 
-### Check Nginx Logs
+---
 
-```bash
-docker logs nginx --tail 50
-```
+## ✅ Success Checklist
 
-Look for any errors or warnings.
+- [ ] Root SSH key generated
+- [ ] Public key added to `/root/.ssh/authorized_keys` on Freddy
+- [ ] Can SSH as root: `ssh -i ~/.ssh/freddy_root root@<freddy-ip>`
+- [ ] `ROOT_SSH_KEY` secret added to GitHub
+- [ ] Workflow run completed successfully
+- [ ] Docker volume contains certificates
+- [ ] Browser shows Let's Encrypt certificate (not self-signed)
 
-## 🔍 Troubleshooting
+**When all boxes are checked, you're done! 🎉**
 
-### Issue: nginx 500 Error
+---
 
-**Symptoms:** nginx returns 500 Internal Server Error
-
-**Causes:**
-1. SSL certificates not found
-2. Backend service not running
-3. Nginx config error
-
-**Fix:**
-```bash
-# Check SSL certs
-docker run --rm -v ssl-certs:/certs:ro busybox ls -la /certs/live/7gram.xyz/
-
-# Test nginx config
-docker exec nginx nginx -t
-
-# Check nginx error logs
-docker logs nginx | grep error
-
-# Check backend services
-docker compose ps
-```
-
-### Issue: SSL Certificate Not Found
-
-**Symptoms:** nginx fails to start, "certificate file not found"
-
-**Fix:**
-```bash
-# Verify volume exists
-docker volume inspect ssl-certs
-
-# Re-run SSL generation
-# Go to GitHub Actions → Run workflow manually
-
-# Check if certs are in volume
-docker run --rm -v ssl-certs:/certs:ro busybox ls -la /certs/
-```
-
-### Issue: Git Clone/Pull Fails
-
-**Symptoms:** pre-deploy-command fails with git errors
-
-**Fix:**
-```bash
-# On Freddy server, manually fix
-cd ~
-sudo rm -rf freddy
-mkdir freddy
-cd freddy
-git init
-git remote add origin https://github.com/nuniesmith/freddy.git
-git fetch
-git checkout main
-```
-
-### Issue: Docker Permission Denied
-
-**Symptoms:** "permission denied while trying to connect to Docker daemon"
-
-**Fix:**
-```bash
-# Add actions user to docker group
-sudo usermod -aG docker actions
-
-# Logout and login again
-sudo su - actions
-```
-
-### Issue: Backend Service Unhealthy
-
-**Symptoms:** Health checks fail
-
-**Fix:**
-```bash
-# Check logs for specific service
-docker compose logs photoprism
-docker compose logs nextcloud
-
-# Restart specific service
-docker compose restart photoprism
-
-# Check service status
-docker compose ps
-```
-
-## 🔄 Regular Operations
-
-### Manual Deploy
-
-```bash
-# Trigger GitHub workflow manually
-# OR SSH to server:
-cd ~/freddy
-git pull origin main
-./run.sh restart
-```
-
-### View Logs
-
-```bash
-# All services
-docker compose logs -f
-
-# Specific service
-docker compose logs -f nginx
-docker compose logs -f photoprism
-```
-
-### Restart Services
-
-```bash
-cd ~/freddy
-./run.sh restart
-
-# Or specific service
-docker compose restart nginx
-```
-
-### Update SSL Certificates
-
-Certificates auto-renew weekly via GitHub Actions schedule.
-
-Manual renewal:
-1. Go to GitHub Actions
-2. Run workflow manually
-3. Workflow runs every Sunday at 3am UTC automatically
-
-### Check SSL Expiry
-
-```bash
-# On Freddy server
-docker run --rm -v ssl-certs:/certs:ro alpine/openssl \
-  x509 -in /certs/live/7gram.xyz/fullchain.pem -noout -enddate
-```
-
-## 📚 Additional Resources
-
-- **Detailed Review:** See `REVIEW-AND-FIXES.md` for complete technical analysis
-- **Example Configs:** See `example-*.yml` and `example-nginx-conf.d/` files
-- **Actions Documentation:** See `.github/actions/README.md`
-
-## 🆘 Getting Help
-
-If you're stuck:
-
-1. Check workflow logs in GitHub Actions
-2. Check server logs: `docker compose logs`
-3. Review nginx error logs: `docker logs nginx`
-4. Test nginx config: `docker exec nginx nginx -t`
-5. Verify SSL certs exist in Docker volume
-6. Check all services are running: `docker compose ps`
-
-## 🎉 Success Checklist
-
-- ✅ GitHub secrets configured
-- ✅ Freddy server prepared with Docker & Tailscale
-- ✅ SSH access working
-- ✅ Project files created on server
-- ✅ First deployment successful
-- ✅ SSL certificates generated and deployed
-- ✅ All services running and healthy
-- ✅ HTTPS access working for all subdomains
-- ✅ No nginx 500 errors
-
-**Congratulations! Your Freddy server is now deployed! 🚀**
+**Questions?** Check the troubleshooting section above or review `SSL_FIX_README.md` for details.
