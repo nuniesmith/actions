@@ -352,11 +352,12 @@ runs:
               # Determine which SSH key and user to use
               DEPLOY_SSH_KEY="$SSH_KEY"
               DEPLOY_USER="$SSH_USER"
+              USE_ROOT_KEY=false
 
               if [ -n "$ROOT_SSH_KEY" ]; then
                 echo "🔑 Using root SSH key for deployment operations"
-                DEPLOY_SSH_KEY="$ROOT_SSH_KEY"
                 DEPLOY_USER="root"
+                USE_ROOT_KEY=true
               elif [ "$USE_SUDO" = "true" ]; then
                 echo "🔑 Using sudo for deployment operations"
               fi
@@ -370,9 +371,14 @@ runs:
               # Copy certificates to server
               scp -P $SSH_PORT /tmp/ssl-certs.tar.gz $SSH_USER@$SSH_HOST:/tmp/ssl-certs.tar.gz
 
-              # Setup deployment SSH key (might be different for privileged ops)
-              echo "$DEPLOY_SSH_KEY" > ~/.ssh/id_rsa_deploy
-              chmod 600 ~/.ssh/id_rsa_deploy
+              # Setup deployment SSH key if using root
+              if [ "$USE_ROOT_KEY" = "true" ]; then
+                printf '%s\n' "$ROOT_SSH_KEY" > ~/.ssh/id_rsa_deploy
+                chmod 600 ~/.ssh/id_rsa_deploy
+                SSH_KEY_ARG="-i ~/.ssh/id_rsa_deploy"
+              else
+                SSH_KEY_ARG="-i ~/.ssh/id_rsa"
+              fi
 
               # Determine sudo prefix
               SUDO_CMD=""
@@ -384,31 +390,38 @@ runs:
                 echo "📂 Deploying to host filesystem: $HOST_CERT_PATH"
 
                 # Deploy to host filesystem
-                ssh -i ~/.ssh/id_rsa_deploy -p $SSH_PORT $DEPLOY_USER@$SSH_HOST "
+                ssh $SSH_KEY_ARG -p $SSH_PORT $DEPLOY_USER@$SSH_HOST "
                   set -e
                   echo '📦 Extracting certificates to host filesystem...'
-                  echo '👤 Running as: \$(whoami)'
+                  echo '👤 Running as:' \$(whoami)
+
+                  # Determine sudo command based on user
+                  if [ \"\$(whoami)\" = \"root\" ]; then
+                    SUDO_CMD=\"\"
+                  else
+                    SUDO_CMD=\"sudo\"
+                  fi
 
                   # Create directory structure
-                  $SUDO_CMD mkdir -p $HOST_CERT_PATH
+                  \$SUDO_CMD mkdir -p $HOST_CERT_PATH
 
                   # Extract certificates
                   cd $HOST_CERT_PATH
-                  $SUDO_CMD tar -xzf /tmp/ssl-certs.tar.gz
+                  \$SUDO_CMD tar -xzf /tmp/ssl-certs.tar.gz
 
                   # Set proper permissions
-                  $SUDO_CMD chmod -R 755 $HOST_CERT_PATH
-                  $SUDO_CMD chmod 600 $HOST_CERT_PATH/archive/*/privkey*.pem 2>/dev/null || true
+                  \$SUDO_CMD chmod -R 755 $HOST_CERT_PATH
+                  \$SUDO_CMD chmod 600 $HOST_CERT_PATH/archive/*/privkey*.pem 2>/dev/null || true
 
                   # Cleanup
                   rm -f /tmp/ssl-certs.tar.gz
 
                   # Verify
-                  echo \"✅ Certificates deployed to host path: $HOST_CERT_PATH\"
-                  $SUDO_CMD ls -la $HOST_CERT_PATH/live/
+                  echo '✅ Certificates deployed to host path: $HOST_CERT_PATH'
+                  \$SUDO_CMD ls -la $HOST_CERT_PATH/live/
                   echo '📄 Verifying certificate files exist:'
-                  $SUDO_CMD ls -la $HOST_CERT_PATH/live/$DOMAIN/ || echo '⚠️ Could not list domain directory'
-                  $SUDO_CMD cat $HOST_CERT_PATH/live/$DOMAIN/fullchain.pem | head -5 || echo '⚠️ Could not read fullchain.pem'
+                  \$SUDO_CMD ls -la $HOST_CERT_PATH/live/$DOMAIN/ || echo '⚠️ Could not list domain directory'
+                  \$SUDO_CMD cat $HOST_CERT_PATH/live/$DOMAIN/fullchain.pem | head -5 || echo '⚠️ Could not read fullchain.pem'
                 "
               else
                 echo "📦 Deploying to Docker volume: $DOCKER_VOLUME"
@@ -420,19 +433,26 @@ runs:
                 fi
 
                 # Deploy to Docker volume
-                ssh -i ~/.ssh/id_rsa_deploy -p $SSH_PORT $DEPLOY_USER@$SSH_HOST "
+                ssh $SSH_KEY_ARG -p $SSH_PORT $DEPLOY_USER@$SSH_HOST "
                   set -e
                   echo '📦 Extracting certificates to Docker volume...'
-                  echo '👤 Running as: \$(whoami)'
+                  echo '👤 Running as:' \$(whoami)
+
+                  # Determine sudo command based on user
+                  if [ \"\$(whoami)\" = \"root\" ]; then
+                    SUDO_CMD=\"\"
+                  else
+                    SUDO_CMD=\"sudo\"
+                  fi
 
                   # Docker login if credentials provided
                   $DOCKER_LOGIN_CMD
 
                   # Create volume if it doesn't exist
-                  $SUDO_CMD docker volume create $DOCKER_VOLUME 2>/dev/null || true
+                  \$SUDO_CMD docker volume create $DOCKER_VOLUME 2>/dev/null || true
 
                   # Use busybox for extraction
-                  $SUDO_CMD docker run --rm \
+                  \$SUDO_CMD docker run --rm \
                     -v /tmp/ssl-certs.tar.gz:/tmp/ssl-certs.tar.gz:ro \
                     -v $DOCKER_VOLUME:/etc/letsencrypt \
                     busybox:latest \
@@ -442,11 +462,11 @@ runs:
                   rm -f /tmp/ssl-certs.tar.gz
 
                   # Verify
-                  echo \"✅ Certificates deployed to Docker volume: $DOCKER_VOLUME\"
-                  $SUDO_CMD docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest ls -la /etc/letsencrypt/live/
+                  echo '✅ Certificates deployed to Docker volume: $DOCKER_VOLUME'
+                  \$SUDO_CMD docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest ls -la /etc/letsencrypt/live/
                   echo '📄 Verifying certificate files exist:'
-                  $SUDO_CMD docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest ls -la /etc/letsencrypt/live/$DOMAIN/ || echo '⚠️ Could not list domain directory'
-                  $SUDO_CMD docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest cat /etc/letsencrypt/live/$DOMAIN/fullchain.pem | head -5 || echo '⚠️ Could not read fullchain.pem'
+                  \$SUDO_CMD docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest ls -la /etc/letsencrypt/live/$DOMAIN/ || echo '⚠️ Could not list domain directory'
+                  \$SUDO_CMD docker run --rm -v $DOCKER_VOLUME:/etc/letsencrypt:ro busybox:latest cat /etc/letsencrypt/live/$DOMAIN/fullchain.pem | head -5 || echo '⚠️ Could not read fullchain.pem'
                 "
               fi
 

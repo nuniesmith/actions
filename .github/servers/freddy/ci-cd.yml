@@ -196,26 +196,13 @@ jobs:
                   echo "🧹 Forcing comprehensive SSL certificate cleanup..."
                   echo "This will remove ALL existing certificates from host filesystem"
 
-                  # Determine which SSH key and user to use
-                  if [ -n "$ROOT_SSH_KEY" ]; then
-                    echo "🔑 Using root SSH key for SSL cleanup"
-                    CLEANUP_SSH_KEY="$ROOT_SSH_KEY"
-                    CLEANUP_USER="root"
-                    SUDO_CMD=""
-                  else
-                    echo "🔑 Using actions SSH key with sudo for cleanup"
-                    CLEANUP_SSH_KEY="$SSH_KEY"
-                    CLEANUP_USER="${{ secrets.SSH_USER || 'actions' }}"
-                    SUDO_CMD="sudo"
-                  fi
-
                   # Setup SSH key
                   mkdir -p ~/.ssh
-                  echo "$CLEANUP_SSH_KEY" > ~/.ssh/id_rsa
+                  echo "$SSH_KEY" > ~/.ssh/id_rsa
                   chmod 600 ~/.ssh/id_rsa
 
                   ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p ${{ secrets.SSH_PORT || '22' }} \
-                    $CLEANUP_USER@${{ secrets.FREDDY_TAILSCALE_IP }} << 'ENDSSH'
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.FREDDY_TAILSCALE_IP }} << 'ENDSSH'
 
                   set -e
                   echo "================================================"
@@ -223,22 +210,15 @@ jobs:
                   echo "================================================"
                   echo "👤 Running as: $(whoami)"
 
-                  # Determine sudo command (empty if root)
-                  if [ "$(whoami)" = "root" ]; then
-                    SUDO_CMD=""
-                  else
-                    SUDO_CMD="sudo"
-                  fi
-
-                  # Remove certificates from host filesystem
+                  # Remove certificates from host filesystem (using sudo)
                   echo "→ Removing certificates from /etc/letsencrypt..."
-                  $SUDO_CMD rm -rf /etc/letsencrypt/live
-                  $SUDO_CMD rm -rf /etc/letsencrypt/archive
-                  $SUDO_CMD rm -rf /etc/letsencrypt/renewal
-                  $SUDO_CMD mkdir -p /etc/letsencrypt
+                  sudo rm -rf /etc/letsencrypt/live
+                  sudo rm -rf /etc/letsencrypt/archive
+                  sudo rm -rf /etc/letsencrypt/renewal
+                  sudo mkdir -p /etc/letsencrypt
 
                   # Set proper permissions
-                  $SUDO_CMD chmod 755 /etc/letsencrypt
+                  sudo chmod 755 /etc/letsencrypt
 
                   echo ""
                   echo "✅ Complete cleanup finished"
@@ -250,7 +230,6 @@ jobs:
                   rm -f ~/.ssh/id_rsa
               env:
                   SSH_KEY: ${{ secrets.SSH_KEY }}
-                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
 
             - name: 🔐 Generate SSL Certificates (Let's Encrypt + Cloudflare DNS)
               id: certbot
@@ -271,8 +250,7 @@ jobs:
                   ssh-port: ${{ secrets.SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.SSH_KEY }}
-                  root-ssh-key: ${{ secrets.ROOT_SSH_KEY }}
-                  use-sudo: false
+                  use-sudo: true
                   deploy-method: host-path
                   host-cert-path: /etc/letsencrypt
 
@@ -280,56 +258,36 @@ jobs:
               run: |
                   echo "✅ Verifying certificates on host filesystem..."
 
-                  # Determine which SSH key and user to use
-                  if [ -n "$ROOT_SSH_KEY" ]; then
-                    echo "🔑 Using root SSH key for verification"
-                    VERIFY_SSH_KEY="$ROOT_SSH_KEY"
-                    VERIFY_USER="root"
-                    SUDO_CMD=""
-                  else
-                    echo "🔑 Using actions SSH key for verification"
-                    VERIFY_SSH_KEY="$SSH_KEY"
-                    VERIFY_USER="${{ secrets.SSH_USER || 'actions' }}"
-                    SUDO_CMD="sudo"
-                  fi
-
                   # Setup SSH key
                   mkdir -p ~/.ssh
-                  echo "$VERIFY_SSH_KEY" > ~/.ssh/id_rsa
+                  echo "$SSH_KEY" > ~/.ssh/id_rsa
                   chmod 600 ~/.ssh/id_rsa
 
                   ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p ${{ secrets.SSH_PORT || '22' }} \
-                    $VERIFY_USER@${{ secrets.FREDDY_TAILSCALE_IP }} << 'ENDSSH'
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.FREDDY_TAILSCALE_IP }} << 'ENDSSH'
 
                   echo "================================================"
                   echo "  SSL CERTIFICATE VERIFICATION"
                   echo "================================================"
                   echo "👤 Running as: $(whoami)"
 
-                  # Determine sudo command (empty if root)
-                  if [ "$(whoami)" = "root" ]; then
-                    SUDO_CMD=""
-                  else
-                    SUDO_CMD="sudo"
-                  fi
-
-                  # Check if certificates exist on host filesystem
+                  # Check if certificates exist on host filesystem (using sudo)
                   if [ -f /etc/letsencrypt/live/7gram.xyz/fullchain.pem ]; then
                     echo "✓ Let's Encrypt certificates found on host filesystem"
 
                     # List certificate files
                     echo ""
                     echo "Certificate files in /etc/letsencrypt/live/7gram.xyz/:"
-                    $SUDO_CMD ls -lah /etc/letsencrypt/live/7gram.xyz/
+                    sudo ls -lah /etc/letsencrypt/live/7gram.xyz/
 
                     # Verify certificate details
                     echo ""
                     echo "Certificate details:"
-                    $SUDO_CMD openssl x509 -in /etc/letsencrypt/live/7gram.xyz/fullchain.pem -noout -issuer -dates -subject || true
+                    sudo openssl x509 -in /etc/letsencrypt/live/7gram.xyz/fullchain.pem -noout -issuer -dates -subject || true
 
                     # Verify certificate and private key match (supports both RSA and ECDSA)
-                    CERT_HASH=$($SUDO_CMD openssl x509 -noout -pubkey -in /etc/letsencrypt/live/7gram.xyz/fullchain.pem 2>/dev/null | openssl sha256 || echo "cert_error")
-                    KEY_HASH=$($SUDO_CMD openssl pkey -pubout -in /etc/letsencrypt/live/7gram.xyz/privkey.pem 2>/dev/null | openssl sha256 || echo "key_error")
+                    CERT_HASH=$(sudo openssl x509 -noout -pubkey -in /etc/letsencrypt/live/7gram.xyz/fullchain.pem 2>/dev/null | openssl sha256 || echo "cert_error")
+                    KEY_HASH=$(sudo openssl pkey -pubout -in /etc/letsencrypt/live/7gram.xyz/privkey.pem 2>/dev/null | openssl sha256 || echo "key_error")
 
                     if [ "$CERT_HASH" = "$KEY_HASH" ] && [ "$CERT_HASH" != "cert_error" ]; then
                       echo "✓ Certificate and private key match"
@@ -340,7 +298,7 @@ jobs:
                   else
                     echo "⚠️ No Let's Encrypt certificates found on host"
                     echo "   Checking if directory exists..."
-                    $SUDO_CMD ls -la /etc/letsencrypt/ 2>/dev/null || echo "   /etc/letsencrypt does not exist"
+                    sudo ls -la /etc/letsencrypt/ 2>/dev/null || echo "   /etc/letsencrypt does not exist"
                   fi
 
                   echo "================================================"
@@ -350,7 +308,6 @@ jobs:
                   rm -f ~/.ssh/id_rsa
               env:
                   SSH_KEY: ${{ secrets.SSH_KEY }}
-                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
 
             # ======================================================================
             # DEPLOY VIA SSH
