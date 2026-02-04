@@ -87,46 +87,177 @@ jobs:
                   fields: '[{"name": "Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
 
     # =========================================================================
-    # Stage 2: Build and Push Multi-Arch Docker Image (amd64 + arm64)
+    # Stage 2a: Build and Push AMD64 Docker Image
     # =========================================================================
-    build-and-push:
-        name: 🐳 Build and Push Docker Image
+    build-and-push-amd64:
+        name: 🐳 Build AMD64 Image
         needs: test-and-lint
         runs-on: ubuntu-latest
-        timeout-minutes: 45
+        timeout-minutes: 30
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
-            - name: 🐳 Build and Push
-              uses: nuniesmith/actions/.github/actions/docker-build-push@main
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to Docker Hub
+              uses: docker/login-action@v3
               with:
-                  image-name: ${{ env.IMAGE_NAME }}
                   username: ${{ secrets.DOCKER_USERNAME }}
                   password: ${{ secrets.DOCKER_TOKEN }}
-                  dockerfile: docker/rust/Dockerfile
-                  platforms: linux/amd64,linux/arm64
 
-            - name: ✅ Notify Docker build complete
+            - name: Extract metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.IMAGE_NAME }}
+                  tags: |
+                      type=raw,value=latest-amd64,enable=${{ github.ref == 'refs/heads/main' }}
+                      type=sha,prefix={{branch}}-,suffix=-amd64
+
+            - name: Build and push AMD64
+              uses: docker/build-push-action@v5
+              with:
+                  context: .
+                  file: docker/Dockerfile.web
+                  platforms: linux/amd64
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha,scope=amd64
+                  cache-to: type=gha,mode=max,scope=amd64
+
+            - name: ✅ Notify AMD64 build complete
               if: success()
               continue-on-error: true
               uses: nuniesmith/actions/.github/actions/discord-notify@main
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
-                  title: "🐳 Docker Image Built"
-                  description: "Multi-arch Docker images pushed to Docker Hub"
+                  title: "🐳 AMD64 Image Built"
+                  description: "AMD64 Docker image pushed to Docker Hub"
                   status: success
-                  fields: '[{"name": "Image", "value": "${{ env.IMAGE_NAME }}:latest", "inline": true}, {"name": "Platforms", "value": "amd64, arm64 (Raspberry Pi)", "inline": true}]'
+                  fields: '[{"name": "Image", "value": "${{ env.IMAGE_NAME }}:latest-amd64", "inline": true}, {"name": "Platform", "value": "amd64", "inline": true}]'
 
-            - name: ❌ Notify Docker build failed
+            - name: ❌ Notify AMD64 build failed
               if: failure()
               continue-on-error: true
               uses: nuniesmith/actions/.github/actions/discord-notify@main
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
-                  title: "❌ Docker Build Failed"
-                  description: "Failed to build or push Docker images"
+                  title: "❌ AMD64 Build Failed"
+                  description: "Failed to build or push AMD64 Docker image"
+                  status: failure
+
+    # =========================================================================
+    # Stage 2b: Build and Push ARM64 Docker Image
+    # =========================================================================
+    build-and-push-arm64:
+        name: 🐳 Build ARM64 Image
+        needs: test-and-lint
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@v3
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
+
+            - name: Extract metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.IMAGE_NAME }}
+                  tags: |
+                      type=raw,value=latest-arm64,enable=${{ github.ref == 'refs/heads/main' }}
+                      type=sha,prefix={{branch}}-,suffix=-arm64
+
+            - name: Build and push ARM64
+              uses: docker/build-push-action@v5
+              with:
+                  context: .
+                  file: docker/Dockerfile.web
+                  platforms: linux/arm64
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha,scope=arm64
+                  cache-to: type=gha,mode=max,scope=arm64
+
+            - name: ✅ Notify ARM64 build complete
+              if: success()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🐳 ARM64 Image Built"
+                  description: "ARM64 Docker image pushed to Docker Hub"
+                  status: success
+                  fields: '[{"name": "Image", "value": "${{ env.IMAGE_NAME }}:latest-arm64", "inline": true}, {"name": "Platform", "value": "arm64 (Raspberry Pi)", "inline": true}]'
+
+            - name: ❌ Notify ARM64 build failed
+              if: failure()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "❌ ARM64 Build Failed"
+                  description: "Failed to build or push ARM64 Docker image"
+                  status: failure
+
+    # =========================================================================
+    # Stage 2c: Create Multi-Arch Manifest
+    # =========================================================================
+    create-manifest:
+        name: 🐳 Create Multi-Arch Manifest
+        needs: [build-and-push-amd64, build-and-push-arm64]
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        steps:
+            - name: Log in to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
+
+            - name: Create and push manifest
+              run: |
+                  docker buildx imagetools create -t ${{ env.IMAGE_NAME }}:latest \
+                    ${{ env.IMAGE_NAME }}:latest-amd64 \
+                    ${{ env.IMAGE_NAME }}:latest-arm64
+
+            - name: ✅ Notify manifest creation complete
+              if: success()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🐳 Multi-Arch Manifest Created"
+                  description: "Docker manifest created with AMD64 and ARM64 images"
+                  status: success
+                  fields: '[{"name": "Image", "value": "${{ env.IMAGE_NAME }}:latest", "inline": true}, {"name": "Platforms", "value": "amd64, arm64", "inline": true}]'
+
+            - name: ❌ Notify manifest creation failed
+              if: failure()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "❌ Manifest Creation Failed"
+                  description: "Failed to create multi-arch manifest"
                   status: failure
 
     # =========================================================================
@@ -134,7 +265,7 @@ jobs:
     # =========================================================================
     deploy:
         name: 🚀 Deploy to Raspberry Pi
-        needs: build-and-push
+        needs: create-manifest
         runs-on: ubuntu-latest
         timeout-minutes: 15
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -157,7 +288,7 @@ jobs:
                   host: ${{ secrets.PROD_TAILSCALE_IP }}
                   port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   username: ${{ secrets.PROD_SSH_USER || 'actions' }}
-                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }} # Action saves to ~/.ssh/deploy_key
                   project-path: ~/rustassistant
                   git-pull: false
                   git-branch: main
@@ -205,6 +336,7 @@ jobs:
                         cat > .env <<EOF
                       # RustAssistant Environment Configuration
                       RUST_LOG=info
+                      XAI_API_KEY=${{ secrets.XAI_API_KEY }}
                       EOF
                         chmod 600 .env
                         echo "✅ Created default .env file"
@@ -212,20 +344,50 @@ jobs:
                         echo "✅ Using existing .env file"
                       fi
 
+                      # Update XAI_API_KEY in .env if it exists
+                      if [ -f ".env" ]; then
+                        if grep -q "^XAI_API_KEY=" .env; then
+                          echo "📝 Updating XAI_API_KEY in .env..."
+                          sed -i 's|^XAI_API_KEY=.*|XAI_API_KEY=${{ secrets.XAI_API_KEY }}|' .env
+                        else
+                          echo "📝 Adding XAI_API_KEY to .env..."
+                          echo "XAI_API_KEY=${{ secrets.XAI_API_KEY }}" >> .env
+                        fi
+                        echo "✅ XAI_API_KEY configured"
+                      fi
+
+                      # Update GITHUB_TOKEN in .env if secret is set
+                      if [ -f ".env" ] && [ -n "${{ secrets.REPO_API_KEY }}" ]; then
+                        if grep -q "^GITHUB_TOKEN=" .env; then
+                          echo "📝 Updating GITHUB_TOKEN in .env..."
+                          sed -i 's|^GITHUB_TOKEN=.*|GITHUB_TOKEN=${{ secrets.REPO_API_KEY }}|' .env
+                        else
+                          echo "📝 Adding GITHUB_TOKEN to .env..."
+                          echo "GITHUB_TOKEN=${{ secrets.REPO_API_KEY }}" >> .env
+                        fi
+                        echo "✅ GITHUB_TOKEN configured"
+                      fi
+
+                      # Create required directories with proper permissions
+                      echo "📁 Creating data and config directories..."
+                      mkdir -p data config
+                      chmod 755 data config
+                      echo "✅ Directories ready"
+
                   deploy-command: |
                       cd ~/rustassistant
 
-                      # Deploy using run.sh to pull images and restart services
-                      if [ -x "./run.sh" ]; then
-                        echo "🐳 Stopping existing services..."
-                        ./run.sh stop 2>/dev/null || true
-                        echo "🐳 Pulling latest ARM64 images from Docker Hub..."
-                        ./run.sh start
-                      else
-                        echo "⚠️ run.sh not found, using docker compose directly"
-                        docker compose -f docker-compose.prod.yml pull --ignore-pull-failures
-                        docker compose -f docker-compose.prod.yml up -d --remove-orphans
-                      fi
+                      # Stop existing services
+                      echo "🐳 Stopping existing services..."
+                      docker compose -f docker-compose.prod.yml down 2>/dev/null || true
+
+                      # Pull latest ARM64 images from Docker Hub
+                      echo "🐳 Pulling latest ARM64 images from Docker Hub..."
+                      docker compose -f docker-compose.prod.yml pull
+
+                      # Start services
+                      echo "🚀 Starting services..."
+                      docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
                   post-deploy-command: |
                       cd ~/rustassistant
