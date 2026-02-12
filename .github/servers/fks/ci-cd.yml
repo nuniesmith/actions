@@ -464,7 +464,7 @@ jobs:
                   compose-env-file: .env
 
                   # ── Services ──────────────────────────────────────────────
-                  app-services: "janus execution web authelia nginx"
+                  app-services: "janus web authelia nginx"
                   infra-services: "redis postgres questdb prometheus grafana alertmanager-discord-bridge alertmanager"
 
                   # ── Cleanup ───────────────────────────────────────────────
@@ -530,7 +530,7 @@ jobs:
                       COMPOSE_CMD="docker compose -p fks --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
 
                       # ── 5. Stop app services (keep infra running) ─────────
-                      APP_SERVICES="janus execution web authelia nginx"
+                      APP_SERVICES="janus web authelia nginx"
                       echo "🛑 Stopping app services: $APP_SERVICES"
                       $COMPOSE_CMD stop $APP_SERVICES 2>/dev/null || true
                       $COMPOSE_CMD rm -f $APP_SERVICES 2>/dev/null || true
