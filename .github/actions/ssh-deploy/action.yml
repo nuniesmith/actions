@@ -356,22 +356,24 @@ runs:
                   attempt=$((attempt + 1))
                   exit_code=0
 
+                  # Pipe the command via stdin (bash -s) to avoid all quoting issues
+                  # with single/double quotes inside the command string.
                   case "$SSH_METHOD" in
                     tailscale)
-                      tailscale ssh ${SSH_USER}@${SSH_HOST} "bash -c '${cmd}'" || exit_code=$?
+                      printf '%s' "$cmd" | tailscale ssh ${SSH_USER}@${SSH_HOST} "bash -s" || exit_code=$?
                       ;;
                     key)
-                      ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                      printf '%s' "$cmd" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                           -o ServerAliveInterval=15 -o ServerAliveCountMax=6 \
                           -p ${SSH_PORT} -i ~/.ssh/deploy_key \
-                          ${SSH_USER}@${SSH_HOST} "bash -c '${cmd}'" || exit_code=$?
+                          ${SSH_USER}@${SSH_HOST} "bash -s" || exit_code=$?
                       ;;
                     password)
-                      sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
+                      printf '%s' "$cmd" | sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
                           -o UserKnownHostsFile=/dev/null \
                           -o ServerAliveInterval=15 -o ServerAliveCountMax=6 \
                           -p ${SSH_PORT} \
-                          ${SSH_USER}@${SSH_HOST} "bash -c '${cmd}'" || exit_code=$?
+                          ${SSH_USER}@${SSH_HOST} "bash -s" || exit_code=$?
                       ;;
                   esac
 
