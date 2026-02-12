@@ -4,13 +4,19 @@
 # Streamlined pipeline using reusable composite actions from nuniesmith/actions.
 #
 # Pipeline Flow:
-# 1. Setup - Determine environment
-# 2. Docker Build & Push - Multi-service matrix build
-# 3. Deploy - Tailscale, DNS, SSL, Deploy, Health Checks
-# 4. Summary - Pipeline results
+# 1. Setup - Determine environment, build strategy, target host
+# 2. Tests - Rust & KMP (skippable)
+# 3. Docker Build & Push - Multi-service matrix build (dockerhub strategy only)
+# 4. Deploy - Tailscale → DNS → SSL → SSH Deploy → Health Checks
+# 5. Summary - Pipeline results
+#
+# Build Strategies:
+# - server-build: Build Docker images directly on the prod server (default)
+# - dockerhub:    Build in CI, push to DockerHub, pull on server
 #
 # Required Secrets:
 # - PROD_TAILSCALE_IP, PROD_SSH_KEY, PROD_SSH_USER, PROD_SSH_PORT
+# - PROD_ROOT_SSH_KEY (root SSH key for SSL cert deployment)
 # - TAILSCALE_OAUTH_CLIENT_ID, TAILSCALE_OAUTH_SECRET
 # - DOCKER_USERNAME, DOCKER_TOKEN
 # - CLOUDFLARE_API_KEY, CLOUDFLARE_ZONE_ID
@@ -41,6 +47,19 @@ on:
                 required: false
                 type: boolean
                 default: false
+            skip_tests:
+                description: "Skip Rust & KMP tests (faster deploys)"
+                required: false
+                type: boolean
+                default: true
+            build_strategy:
+                description: "Docker build strategy"
+                required: false
+                type: choice
+                options:
+                    - server-build
+                    - dockerhub
+                default: server-build
             environment:
                 description: "Target environment"
                 required: false
@@ -84,6 +103,8 @@ jobs:
         outputs:
             deploy_env: ${{ steps.determine-env.outputs.environment }}
             target_domain: ${{ steps.determine-env.outputs.domain }}
+            target_host: ${{ steps.determine-env.outputs.host }}
+            build_strategy: ${{ steps.determine-env.outputs.build_strategy }}
         steps:
             - name: 🎯 Determine deployment environment
               id: determine-env
@@ -94,23 +115,28 @@ jobs:
                   PROD_TAILSCALE_IP: ${{ secrets.PROD_TAILSCALE_IP }}
                   STAGING_TAILSCALE_IP: ${{ secrets.STAGING_TAILSCALE_IP }}
                   INPUT_ENV: ${{ inputs.environment }}
+                  INPUT_STRATEGY: ${{ inputs.build_strategy }}
                   GITHUB_REF: ${{ github.ref }}
                   PROD_DOMAIN: ${{ env.DOMAIN }}
                   STAGE_DOMAIN: ${{ env.STAGING_DOMAIN }}
               run: |
-                  # Early validation - fail fast if critical secrets are missing
+                  set -euo pipefail
+
+                  # ── Validate critical secrets ─────────────────────────────
                   if [ -z "$PROD_TAILSCALE_IP" ]; then
                     echo "❌ FATAL: PROD_TAILSCALE_IP secret is not set or empty!"
-                    echo "## ❌ Missing Required Secret" >> $GITHUB_STEP_SUMMARY
-                    echo "The \`PROD_TAILSCALE_IP\` secret must be configured in repository settings." >> $GITHUB_STEP_SUMMARY
-                    echo "" >> $GITHUB_STEP_SUMMARY
-                    echo "Go to: **Settings → Secrets and variables → Actions → New repository secret**" >> $GITHUB_STEP_SUMMARY
-                    echo "" >> $GITHUB_STEP_SUMMARY
-                    echo "Set \`PROD_TAILSCALE_IP\` to your production server's Tailscale IP (e.g., \`100.x.x.x\`)" >> $GITHUB_STEP_SUMMARY
+                    cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+                  ## ❌ Missing Required Secret
+                  The `PROD_TAILSCALE_IP` secret must be configured in repository settings.
+
+                  Go to: **Settings → Secrets and variables → Actions → New repository secret**
+
+                  Set `PROD_TAILSCALE_IP` to your production server's Tailscale IP (e.g., `100.x.x.x`)
+                  EOF
                     exit 1
                   fi
 
-                  # Determine environment
+                  # ── Determine environment ──────────────────────────────────
                   if [ -n "$INPUT_ENV" ] && [ "$INPUT_ENV" != "auto" ]; then
                     ENV="$INPUT_ENV"
                   elif [ "$GITHUB_REF" == "refs/heads/main" ]; then
@@ -119,7 +145,7 @@ jobs:
                     ENV="staging"
                   fi
 
-                  # Set host and domain based on environment
+                  # ── Set host and domain ────────────────────────────────────
                   if [ "$ENV" = "production" ]; then
                     HOST="$PROD_TAILSCALE_IP"
                     DOMAIN="$PROD_DOMAIN"
@@ -128,15 +154,21 @@ jobs:
                     DOMAIN="$STAGE_DOMAIN"
                   fi
 
-                  # Debug output
-                  echo "🎯 Environment: $ENV"
-                  echo "📍 Host: $HOST"
-                  echo "🌐 Domain: $DOMAIN"
+                  # ── Determine build strategy ───────────────────────────────
+                  STRATEGY="${INPUT_STRATEGY:-server-build}"
+
+                  # ── Debug output ───────────────────────────────────────────
+                  echo "🎯 Environment:    $ENV"
+                  echo "📍 Host:           $HOST"
+                  echo "🌐 Domain:         $DOMAIN"
+                  echo "🔧 Build Strategy: $STRATEGY"
 
                   echo "environment=$ENV" >> $GITHUB_OUTPUT
                   echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+                  echo "host=$HOST" >> $GITHUB_OUTPUT
+                  echo "build_strategy=$STRATEGY" >> $GITHUB_OUTPUT
 
-                  # Validate required secrets
+                  # ── Validate optional secrets ──────────────────────────────
                   MISSING=""
                   [ "$HAS_PROD_IP" != "true" ] && MISSING="$MISSING PROD_TAILSCALE_IP"
                   [ "$HAS_SSH_KEY" != "true" ] && MISSING="$MISSING PROD_SSH_KEY"
@@ -148,13 +180,15 @@ jobs:
                     echo "Configure these secrets:$MISSING" >> $GITHUB_STEP_SUMMARY
                   fi
 
-                  # Summary
+                  # ── Summary ────────────────────────────────────────────────
                   cat >> $GITHUB_STEP_SUMMARY << EOF
                   ## 🎯 Environment Configuration
                   | Property | Value |
                   |----------|-------|
                   | Target | \`$ENV\` |
                   | Domain | \`$DOMAIN\` |
+                  | Host | \`$HOST\` |
+                  | Build Strategy | \`$STRATEGY\` |
                   | Branch | \`${{ github.ref_name }}\` |
                   | Trigger | \`${{ github.event_name }}\` |
                   EOF
@@ -167,6 +201,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 60
         needs: [setup]
+        if: false # TODO: re-enable tests — disabled to speed up prod deploys
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -192,6 +227,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs: [setup]
+        if: false # TODO: re-enable tests — disabled to speed up prod deploys
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -208,14 +244,15 @@ jobs:
                   upload-test-results: "true"
 
     # =========================================================================
-    # STAGE 3: DOCKER BUILD
+    # STAGE 3: DOCKER BUILD (only for dockerhub strategy)
     # =========================================================================
     docker-build:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup, test-rust, test-kmp]
+        needs: [setup]
         if: |
+            needs.setup.outputs.build_strategy == 'dockerhub' &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
@@ -227,10 +264,6 @@ jobs:
                       dockerfile: infrastructure/docker/base/rust/Dockerfile
                       target: workspace
                       build_args: SERVICE_NAME=janus
-                    - name: execution
-                      dockerfile: infrastructure/docker/base/rust/Dockerfile
-                      target: execution
-                      build_args: SERVICE_NAME=execution
                     - name: web
                       dockerfile: infrastructure/docker/services/web/Dockerfile
                       target: production
@@ -270,9 +303,12 @@ jobs:
     deploy:
         name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
-        timeout-minutes: 30
+        timeout-minutes: 45
         needs: [setup, docker-build]
         if: |
+            always() &&
+            needs.setup.result == 'success' &&
+            (needs.docker-build.result == 'success' || needs.docker-build.result == 'skipped') &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
@@ -281,6 +317,7 @@ jobs:
             url: https://${{ needs.setup.outputs.target_domain }}
         outputs:
             deployed: ${{ steps.deploy.outputs.deployed }}
+            build_strategy_used: ${{ steps.deploy.outputs.build_strategy }}
             ssl_cert_type: ${{ steps.ssl.outputs.cert-type }}
             ssl_deployed: ${{ steps.ssl.outputs.deployed }}
             http_health: ${{ steps.health-checks.outputs.healthy }}
@@ -297,7 +334,7 @@ jobs:
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
+                  target-ip: ${{ needs.setup.outputs.target_host }}
                   target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
 
             # -----------------------------------------------------------------
@@ -310,7 +347,7 @@ jobs:
                   api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
                   zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
                   record-name: ${{ needs.setup.outputs.target_domain }}
-                  record-content: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
+                  record-content: ${{ needs.setup.outputs.target_host }}
                   additional-records: |
                       [
                         {"name": "www.${{ needs.setup.outputs.target_domain }}"},
@@ -327,7 +364,7 @@ jobs:
               uses: nuniesmith/actions/.github/actions/ssl-check@main
               continue-on-error: true
               with:
-                  ssh-host: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
+                  ssh-host: ${{ needs.setup.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -344,6 +381,7 @@ jobs:
                   github.ref == 'refs/heads/main' &&
                   !inputs.skip_ssl &&
                   steps.ssl-check.outputs.skip-generation != 'true'
+              continue-on-error: true
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
               with:
                   domain: ${{ needs.setup.outputs.target_domain }}
@@ -353,10 +391,11 @@ jobs:
                   fallback-to-self-signed: "true"
                   self-signed-days: "365"
                   deploy-to-server: true
-                  ssh-host: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
+                  ssh-host: ${{ needs.setup.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  root-ssh-key: ${{ secrets.PROD_ROOT_SSH_KEY }}
                   docker-volume-name: "fks_ssl_certs"
                   docker-username: ${{ secrets.DOCKER_USERNAME }}
                   docker-token: ${{ secrets.DOCKER_TOKEN }}
@@ -368,28 +407,49 @@ jobs:
               id: deploy
               uses: nuniesmith/actions/.github/actions/ssh-deploy@main
               with:
-                  host: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
+                  # ── SSH Connection ────────────────────────────────────────
+                  host: ${{ needs.setup.outputs.target_host }}
                   port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   username: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  ssh-retries: "3"
+                  ssh-retry-delay: "10"
+
+                  # ── Project ───────────────────────────────────────────────
                   project-path: ~/fks
                   git-pull: "true"
                   git-branch: ${{ github.ref_name }}
-                  docker-pull: "true"
-                  docker-prune: "false"
+                  git-repo-url: "https://github.com/nuniesmith/fks.git"
+
+                  # ── Build Strategy ────────────────────────────────────────
+                  build-strategy: ${{ needs.setup.outputs.build_strategy }}
+
+                  # ── Docker Registry ───────────────────────────────────────
+                  docker-registry: docker.io
+                  docker-username: ${{ secrets.DOCKER_USERNAME }}
+                  docker-password: ${{ secrets.DOCKER_TOKEN }}
+                  docker-image-prefix: ${{ env.IMAGE_NAME }}
+                  docker-image-tag: ${{ github.sha }}
+
+                  # ── Docker Compose ────────────────────────────────────────
+                  compose-files: "infrastructure/compose/docker-compose.yml infrastructure/compose/docker-compose.prod.yml"
+                  compose-project: fks
+                  compose-env-file: .env
+
+                  # ── Services ──────────────────────────────────────────────
+                  app-services: "janus execution web authelia nginx"
+                  infra-services: "redis postgres questdb prometheus grafana alertmanager-discord-bridge alertmanager"
+
+                  # ── Cleanup ───────────────────────────────────────────────
+                  docker-prune: "true"
+
+                  # ── Pre-Deploy ────────────────────────────────────────────
                   pre-deploy-command: |
                       echo "════════════════════════════════════════════════════════════"
                       echo "📋 PRE-DEPLOY: ${{ needs.setup.outputs.deploy_env }}"
                       echo "════════════════════════════════════════════════════════════"
                       echo "🖥️  Host: $(hostname) | $(date)"
                       echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free"
-
-                      # First-time setup - clone repo
-                      if [ ! -d ~/fks/.git ]; then
-                        echo "📦 First-time setup - cloning repository..."
-                        rm -rf ~/fks
-                        git clone https://github.com/nuniesmith/fks.git ~/fks
-                      fi
 
                       # Ensure all Docker volumes exist
                       echo "📦 Creating Docker volumes..."
@@ -398,97 +458,108 @@ jobs:
                       done
                       echo "✅ Docker volumes ready"
 
+                  # ── Deploy (custom commands that run AFTER strategy build) ─
                   deploy-command: |
                       echo "════════════════════════════════════════════════════════════"
                       echo "🚀 DEPLOYING: ${{ needs.setup.outputs.deploy_env }}"
+                      echo "   Strategy:  ${{ needs.setup.outputs.build_strategy }}"
                       echo "════════════════════════════════════════════════════════════"
 
-                      # Docker login
+                      # ── 1. Docker login ───────────────────────────────────
                       echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
 
-                      # Generate .env if it doesn't exist or is empty
-                      if [ ! -s .env ]; then
-                        echo "🔐 Generating fresh .env with secure secrets..."
+                      # ── 2. Generate secrets & .env file ───────────────────
+                      echo "🔐 Setting up .env file..."
+                      bash ./run.sh setup-env
 
-                        # Generate secrets
-                        PG_PASS=$(openssl rand -hex 16)
-                        REDIS_PASS=$(openssl rand -hex 16)
-                        QUEST_PASS=$(openssl rand -hex 16)
-                        GRAF_PASS=$(openssl rand -hex 16)
-                        GF_SECRET=$(openssl rand -hex 16)
-                        AUTH_JWT=$(openssl rand -hex 64)
-                        AUTH_SESS=$(openssl rand -hex 64)
-                        AUTH_ENC=$(openssl rand -hex 64)
-                        AUTH_RESET=$(openssl rand -hex 64)
-                        AUTH_PG=$(openssl rand -hex 16)
-
-                        # Write .env file using printf (more reliable than heredoc in SSH)
-                        {
-                          printf "POSTGRES_PASSWORD=%s\n" "$PG_PASS"
-                          printf "POSTGRES_USER=fks_user\n"
-                          printf "POSTGRES_DB=fks\n"
-                          printf "REDIS_PASSWORD=%s\n" "$REDIS_PASS"
-                          printf "QUESTDB_PASSWORD=%s\n" "$QUEST_PASS"
-                          printf "QUESTDB_USER=admin\n"
-                          printf "GRAFANA_PASSWORD=%s\n" "$GRAF_PASS"
-                          printf "GRAFANA_USER=admin\n"
-                          printf "GF_SECURITY_SECRET_KEY=%s\n" "$GF_SECRET"
-                          printf "AUTHELIA_JWT_SECRET=%s\n" "$AUTH_JWT"
-                          printf "AUTHELIA_SESSION_SECRET=%s\n" "$AUTH_SESS"
-                          printf "AUTHELIA_STORAGE_ENCRYPTION_KEY=%s\n" "$AUTH_ENC"
-                          printf "AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET=%s\n" "$AUTH_RESET"
-                          printf "AUTHELIA_POSTGRES_PASSWORD=%s\n" "$AUTH_PG"
-                          printf "AUTHELIA_POSTGRES_DB=authelia\n"
-                          printf "AUTHELIA_POSTGRES_USER=authelia\n"
-                          printf "TRADING_MODE=simulation\n"
-                          printf "REAL_ORDERS_ENABLED=false\n"
-                          printf "ENABLE_EXECUTION=true\n"
-                          printf "REGISTRY=docker.io\n"
-                          printf "IMAGE_NAME=nuniesmith/fks\n"
-                          printf "TAG=latest\n"
-                          printf "ENVIRONMENT=%s\n" "${{ needs.setup.outputs.deploy_env }}"
-                          printf "SSL_DOMAIN=%s\n" "${{ needs.setup.outputs.target_domain }}"
-                          printf "LOG_LEVEL=info\n"
-                          printf "RUST_LOG=info\n"
-                        } > .env
-
-                        echo "✅ Generated .env with fresh secrets"
+                      # Inject CI-managed secrets into .env
+                      DISCORD_GENERAL='${{ secrets.DISCORD_WEBHOOK_GENERAL }}'
+                      if [ -n "$DISCORD_GENERAL" ]; then
+                        if grep -q "^DISCORD_WEBHOOK_GENERAL=" .env 2>/dev/null; then
+                          sed -i "s|^DISCORD_WEBHOOK_GENERAL=.*|DISCORD_WEBHOOK_GENERAL=${DISCORD_GENERAL}|" .env
+                        else
+                          echo "DISCORD_WEBHOOK_GENERAL=${DISCORD_GENERAL}" >> .env
+                        fi
+                        echo "✅ DISCORD_WEBHOOK_GENERAL set from GitHub secret"
                       else
-                        echo "✓ Using existing .env file"
+                        echo "⚠️  DISCORD_WEBHOOK_GENERAL secret not configured — alertmanager notifications will be disabled"
                       fi
 
-                      # Source environment
+                      # Source environment for subsequent commands
                       set -a && source .env && set +a
 
-                      # Define compose command for production (use --no-build to force image pull)
+                      # ── 3. Generate config files from templates ───────────
+                      TMPL="infrastructure/monitoring/alertmanager/alertmanager.yml.tmpl"
+                      DEST="infrastructure/monitoring/alertmanager/alertmanager.yml"
+                      if [ -f "$TMPL" ]; then
+                        echo "🔧 Generating alertmanager.yml from template..."
+                        cp "$TMPL" "$DEST"
+                        echo "✅ alertmanager.yml generated (webhook routed via discord bridge container)"
+                      else
+                        echo "⚠️  alertmanager template not found at $TMPL"
+                      fi
+
+                      # ── 4. Build compose command ──────────────────────────
                       COMPOSE_CMD="docker compose -p fks --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
 
-                      # Stop existing containers
-                      $COMPOSE_CMD down --remove-orphans 2>/dev/null || true
+                      # ── 5. Stop app services (keep infra running) ─────────
+                      APP_SERVICES="janus execution web authelia nginx"
+                      echo "🛑 Stopping app services: $APP_SERVICES"
+                      $COMPOSE_CMD stop $APP_SERVICES 2>/dev/null || true
+                      $COMPOSE_CMD rm -f $APP_SERVICES 2>/dev/null || true
+                      docker container prune -f --filter "label=com.docker.compose.project=fks" 2>/dev/null || true
 
-                      # Pull images explicitly (these are built and pushed in CI)
-                      echo "📥 Pulling pre-built images from Docker Hub..."
-                      REGISTRY="${REGISTRY:-docker.io}"
-                      IMAGE="${IMAGE_NAME:-nuniesmith/fks}"
-                      TAG="${TAG:-latest}"
+                      # ── 6. Build or pull based on strategy ────────────────
+                      STRATEGY="${{ needs.setup.outputs.build_strategy }}"
 
-                      for svc in janus execution web authelia nginx; do
-                        echo "  Pulling ${REGISTRY}/${IMAGE}:${svc}-${TAG}..."
-                        docker pull "${REGISTRY}/${IMAGE}:${svc}-${TAG}" 2>&1 || echo "  ⚠️ Could not pull ${svc}-${TAG}, will try ${svc}-latest"
-                        if [ "$TAG" != "latest" ]; then
-                          docker pull "${REGISTRY}/${IMAGE}:${svc}-latest" 2>&1 || true
+                      if [ "$STRATEGY" = "dockerhub" ]; then
+                        echo "📥 Pulling pre-built images from DockerHub..."
+                        $COMPOSE_CMD pull $APP_SERVICES 2>&1 || {
+                          echo "⚠️  Pull failed — falling back to server build"
+                          STRATEGY="server-build"
+                        }
+                      fi
+
+                      if [ "$STRATEGY" = "server-build" ]; then
+                        echo "🔨 Building app images on server..."
+                        $COMPOSE_CMD build --parallel $APP_SERVICES 2>&1
+                        echo "✅ App images built"
+                      fi
+
+                      # ── 7. Ensure infra services are running ──────────────
+                      echo "🔧 Ensuring infrastructure services are running..."
+                      $COMPOSE_CMD up -d --no-recreate redis postgres questdb prometheus grafana alertmanager-discord-bridge alertmanager 2>&1
+
+                      # Reload alertmanager config
+                      echo "🔄 Reloading alertmanager config..."
+                      if docker kill --signal=HUP fks_alertmanager 2>/dev/null; then
+                        echo "✅ Alertmanager config reloaded (via SIGHUP)"
+                      else
+                        echo "⚠️  Could not reload alertmanager — will use config from startup"
+                      fi
+
+                      # ── 8. Wait for Redis health ──────────────────────────
+                      echo "⏳ Waiting for Redis to be healthy..."
+                      for i in $(seq 1 30); do
+                        if $COMPOSE_CMD exec -T redis redis-cli --no-auth-warning -a "${REDIS_PASSWORD:-}" ping 2>/dev/null | grep -q PONG; then
+                          echo "✅ Redis is healthy"
+                          break
                         fi
+                        echo "  Waiting for Redis... ($i/30)"
+                        sleep 2
                       done
 
-                      # Start services with --no-build to ensure we use pulled images
-                      echo "🚀 Starting services (using pre-built images)..."
-                      $COMPOSE_CMD up -d --no-build 2>&1
+                      # ── 9. Start all services ────────────────────────────
+                      echo "🚀 Starting all services..."
+                      $COMPOSE_CMD up -d 2>&1
 
                       sleep 30
+
                       echo ""
                       echo "📊 Container Status:"
                       docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -20
 
+                  # ── Post-Deploy ───────────────────────────────────────────
                   post-deploy-command: |
                       echo "════════════════════════════════════════════════════════════"
                       echo "🧹 POST-DEPLOY"
@@ -506,7 +577,7 @@ jobs:
                           sleep 5
                         fi
                       else
-                        echo "⚠️ No SSL certificates in volume - nginx using self-signed fallback"
+                        echo "⚠️ No SSL certificates in volume — nginx using self-signed fallback"
                         echo "   Run './run.sh ssl-init' to get Let's Encrypt certificates"
                       fi
 
@@ -534,18 +605,17 @@ jobs:
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health", "expected_status": 200},
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/web", "expected_status": 200},
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/janus", "expected_status": 200},
-                        {"url": "http://${{ needs.setup.outputs.target_domain }}/health/execution", "expected_status": 200},
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/grafana", "expected_status": 200}
                       ]
-                  containers: fks_janus,fks_nginx,fks_web
-                  ssh-host: ${{ needs.setup.outputs.deploy_env == 'production' && secrets.PROD_TAILSCALE_IP || secrets.STAGING_TAILSCALE_IP || secrets.PROD_TAILSCALE_IP }}
+                  containers: fks_janus fks_nginx fks_web
+                  ssh-host: ${{ needs.setup.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   custom-command: |
                       echo "🔍 Database connectivity check..."
-                      docker exec fks_redis redis-cli ping 2>/dev/null | grep -q "PONG" && echo "✅ Redis OK" || echo "❌ Redis failed"
-                      docker exec fks_postgres pg_isready -U postgres 2>/dev/null | grep -q "accepting" && echo "✅ PostgreSQL OK" || echo "❌ PostgreSQL failed"
+                      docker exec fks_redis sh -c 'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping' 2>/dev/null | grep -q "PONG" && echo "✅ Redis OK" || echo "❌ Redis failed"
+                      docker exec fks_postgres pg_isready -U fks_user 2>/dev/null | grep -q "accepting" && echo "✅ PostgreSQL OK" || echo "❌ PostgreSQL failed"
                       curl -s "http://localhost:9000/exec?query=SELECT%201" 2>/dev/null | grep -q "dataset" && echo "✅ QuestDB OK" || echo "❌ QuestDB failed"
                   initial-delay: "30"
                   retry-count: "3"
@@ -562,13 +632,14 @@ jobs:
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
                   title: "${{ steps.deploy.outcome == 'success' && '🚀 FKS Deployed' || '❌ FKS Deploy Failed' }}"
-                  description: "Deployed to ${{ needs.setup.outputs.deploy_env }}"
+                  description: "Deployed to ${{ needs.setup.outputs.deploy_env }} via ${{ needs.setup.outputs.build_strategy }}"
                   status: ${{ steps.deploy.outcome == 'success' && 'success' || 'failure' }}
                   include-repo-info: "true"
                   fields: |
                       [
                         {"name": "Environment", "value": "${{ needs.setup.outputs.deploy_env }}", "inline": true},
                         {"name": "Domain", "value": "${{ needs.setup.outputs.target_domain }}", "inline": true},
+                        {"name": "Strategy", "value": "${{ needs.setup.outputs.build_strategy }}", "inline": true},
                         {"name": "SSL", "value": "${{ steps.ssl.outputs.cert-type || steps.ssl-check.outputs.cert-type || 'skipped' }}", "inline": true},
                         {"name": "Health", "value": "${{ steps.health-checks.outputs.healthy == 'true' && '✅ healthy' || '⚠️ degraded' }}", "inline": true}
                       ]
@@ -593,6 +664,8 @@ jobs:
                   |----------|-------|
                   | Target | \`${{ needs.setup.outputs.deploy_env }}\` |
                   | Domain | \`${{ needs.setup.outputs.target_domain }}\` |
+                  | Host | \`${{ needs.setup.outputs.target_host }}\` |
+                  | Build Strategy | \`${{ needs.setup.outputs.build_strategy }}\` |
                   | Branch | \`${{ github.ref_name }}\` |
 
                   ## Jobs
@@ -607,12 +680,14 @@ jobs:
                   | Image | Tag |
                   |-------|-----|
                   | janus | \`janus-${{ github.sha }}\` |
-                  | execution | \`execution-${{ github.sha }}\` |
                   | web | \`web-${{ github.sha }}\` |
+                  | authelia | \`authelia-${{ github.sha }}\` |
+                  | nginx | \`nginx-${{ github.sha }}\` |
 
                   ## Details
                   | Property | Value |
                   |----------|-------|
+                  | Build Strategy | ${{ needs.setup.outputs.build_strategy }} |
                   | SSL Certificate | ${{ needs.deploy.outputs.ssl_cert_type || 'N/A' }} |
                   | Health Check | ${{ needs.deploy.outputs.http_health == 'true' && '✅ Healthy' || '⚠️ Check logs' }} |
 

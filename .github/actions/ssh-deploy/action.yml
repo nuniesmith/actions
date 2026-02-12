@@ -1,5 +1,5 @@
 name: "SSH Deploy"
-description: "Deploy to a remote server via SSH over Tailscale"
+description: "Deploy to a remote server via SSH with support for DockerHub pull or server-side build strategies"
 author: "nuniesmith"
 
 branding:
@@ -7,6 +7,7 @@ branding:
     color: "green"
 
 inputs:
+    # ── SSH Connection ──────────────────────────────────────────────────────
     host:
         description: "Target host (Tailscale IP or hostname)"
         required: true
@@ -25,49 +26,6 @@ inputs:
         description: "SSH password (fallback if no key)"
         required: false
         default: ""
-    project-path:
-        description: "Path to project on remote server"
-        required: true
-    deploy-command:
-        description: "Custom deploy command to run on remote"
-        required: false
-        default: ""
-    pre-deploy-command:
-        description: "Command to run before deployment"
-        required: false
-        default: ""
-    post-deploy-command:
-        description: "Command to run after deployment"
-        required: false
-        default: ""
-    docker-compose-file:
-        description: "Docker compose file to use"
-        required: false
-        default: "docker-compose.yml"
-    docker-services:
-        description: "Space-separated list of services to deploy (empty = all)"
-        required: false
-        default: ""
-    git-pull:
-        description: "Pull latest changes from git"
-        required: false
-        default: "true"
-    git-branch:
-        description: "Git branch to checkout/pull"
-        required: false
-        default: "main"
-    docker-pull:
-        description: "Pull latest Docker images"
-        required: false
-        default: "true"
-    docker-prune:
-        description: "Prune unused Docker resources after deploy"
-        required: false
-        default: "true"
-    env-files:
-        description: "JSON object of env files to create {filename: content}"
-        required: false
-        default: ""
     timeout:
         description: "SSH connection timeout in seconds"
         required: false
@@ -76,6 +34,115 @@ inputs:
         description: "Try Tailscale SSH first before regular SSH"
         required: false
         default: "true"
+    ssh-retries:
+        description: "Number of SSH connection retry attempts"
+        required: false
+        default: "3"
+    ssh-retry-delay:
+        description: "Delay in seconds between SSH retry attempts"
+        required: false
+        default: "10"
+
+    # ── Project ─────────────────────────────────────────────────────────────
+    project-path:
+        description: "Path to project on remote server"
+        required: true
+
+    # ── Git ──────────────────────────────────────────────────────────────────
+    git-pull:
+        description: "Pull latest changes from git"
+        required: false
+        default: "true"
+    git-branch:
+        description: "Git branch to checkout/pull"
+        required: false
+        default: "main"
+    git-repo-url:
+        description: "Git clone URL for first-time setup"
+        required: false
+        default: ""
+
+    # ── Build Strategy ──────────────────────────────────────────────────────
+    build-strategy:
+        description: "How to source Docker images: 'dockerhub' (pull pre-built), 'server-build' (build on server), or 'none' (skip build)"
+        required: false
+        default: "server-build"
+
+    # ── Docker Registry (for dockerhub strategy) ────────────────────────────
+    docker-registry:
+        description: "Docker registry URL"
+        required: false
+        default: "docker.io"
+    docker-username:
+        description: "Docker registry username (for pull or push)"
+        required: false
+        default: ""
+    docker-password:
+        description: "Docker registry password/token (for pull or push)"
+        required: false
+        default: ""
+    docker-image-prefix:
+        description: "Docker image prefix for pulling (e.g. 'nuniesmith/fks')"
+        required: false
+        default: ""
+    docker-image-tag:
+        description: "Docker image tag to pull (e.g. 'latest' or a sha)"
+        required: false
+        default: "latest"
+
+    # ── Docker Compose ──────────────────────────────────────────────────────
+    compose-files:
+        description: "Space-separated list of compose files (e.g. 'docker-compose.yml docker-compose.prod.yml')"
+        required: false
+        default: "docker-compose.yml"
+    compose-project:
+        description: "Docker Compose project name (-p flag)"
+        required: false
+        default: ""
+    compose-env-file:
+        description: "Path to .env file for docker compose (relative to project-path)"
+        required: false
+        default: ".env"
+    compose-profiles:
+        description: "Space-separated list of compose profiles to activate"
+        required: false
+        default: ""
+
+    # ── Services ────────────────────────────────────────────────────────────
+    app-services:
+        description: "Space-separated list of app services to build/restart (empty = all)"
+        required: false
+        default: ""
+    infra-services:
+        description: "Space-separated list of infra services to ensure are running (kept alive during deploys)"
+        required: false
+        default: ""
+
+    # ── Commands ────────────────────────────────────────────────────────────
+    pre-deploy-command:
+        description: "Command to run before deployment (runs in project-path context)"
+        required: false
+        default: ""
+    deploy-command:
+        description: "Custom deploy command (overrides the entire built-in deploy flow)"
+        required: false
+        default: ""
+    post-deploy-command:
+        description: "Command to run after deployment"
+        required: false
+        default: ""
+
+    # ── Cleanup ─────────────────────────────────────────────────────────────
+    docker-prune:
+        description: "Prune unused Docker resources after deploy"
+        required: false
+        default: "true"
+
+    # ── Env Files (legacy) ──────────────────────────────────────────────────
+    env-files:
+        description: "JSON object of env files to create {filename: content}"
+        required: false
+        default: ""
 
 outputs:
     deployed:
@@ -87,18 +154,24 @@ outputs:
     services-started:
         description: "Services that were started"
         value: ${{ steps.deploy.outputs.services }}
+    build-strategy-used:
+        description: "Build strategy that was used (dockerhub/server-build/none/custom)"
+        value: ${{ steps.deploy.outputs.build_strategy }}
 
 runs:
     using: "composite"
     steps:
+        # ─────────────────────────────────────────────────────────────────────
+        # SSH SETUP
+        # ─────────────────────────────────────────────────────────────────────
         - name: 📦 Install SSH tools
           shell: bash
           run: |
               if ! command -v sshpass &> /dev/null; then
-                sudo apt-get update && sudo apt-get install -y sshpass
+                sudo apt-get update -qq && sudo apt-get install -y -qq sshpass 2>/dev/null
               fi
               if ! command -v nc &> /dev/null; then
-                sudo apt-get install -y netcat-openbsd || sudo apt-get install -y netcat
+                sudo apt-get install -y -qq netcat-openbsd 2>/dev/null || sudo apt-get install -y -qq netcat 2>/dev/null
               fi
 
         - name: 🔐 Configure SSH
@@ -112,20 +185,25 @@ runs:
               SSH_PASSWORD: ${{ inputs.password }}
               USE_TAILSCALE_SSH: ${{ inputs.use-tailscale-ssh }}
               TIMEOUT: ${{ inputs.timeout }}
+              RETRIES: ${{ inputs.ssh-retries }}
+              RETRY_DELAY: ${{ inputs.ssh-retry-delay }}
           run: |
+              set -euo pipefail
+
               mkdir -p ~/.ssh
               chmod 700 ~/.ssh
 
               # Configure SSH options
-              cat >> ~/.ssh/config << EOF
-              Host $SSH_HOST
+              cat >> ~/.ssh/config << SSHEOF
+              Host ${SSH_HOST}
                   StrictHostKeyChecking no
                   UserKnownHostsFile /dev/null
-                  ConnectTimeout $TIMEOUT
-                  ServerAliveInterval 10
-                  ServerAliveCountMax 3
-                  Port $SSH_PORT
-              EOF
+                  ConnectTimeout ${TIMEOUT}
+                  ServerAliveInterval 15
+                  ServerAliveCountMax 6
+                  Port ${SSH_PORT}
+                  LogLevel ERROR
+              SSHEOF
 
               # Setup SSH key if provided
               if [ -n "$SSH_KEY" ]; then
@@ -134,54 +212,95 @@ runs:
                 echo "✅ SSH private key configured"
               fi
 
-              # Determine best SSH method
+              # ── Try SSH methods with retry ────────────────────────────────
+              try_ssh() {
+                local method="$1"
+                local attempt=0
+                local max_attempts="${RETRIES}"
+
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  echo "  🔄 Attempt ${attempt}/${max_attempts} via ${method}..."
+
+                  local result=0
+                  case "$method" in
+                    tailscale)
+                      timeout 15 tailscale ssh ${SSH_USER}@${SSH_HOST} "echo '__SSH_OK__'" 2>&1 | grep -q "__SSH_OK__" || result=$?
+                      ;;
+                    key)
+                      timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                          -o ConnectTimeout=${TIMEOUT} -p ${SSH_PORT} -i ~/.ssh/deploy_key \
+                          ${SSH_USER}@${SSH_HOST} "echo '__SSH_OK__'" 2>&1 | grep -q "__SSH_OK__" || result=$?
+                      ;;
+                    password)
+                      sshpass -p "$SSH_PASSWORD" timeout 15 ssh -o StrictHostKeyChecking=no \
+                          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=${TIMEOUT} -p ${SSH_PORT} \
+                          ${SSH_USER}@${SSH_HOST} "echo '__SSH_OK__'" 2>&1 | grep -q "__SSH_OK__" || result=$?
+                      ;;
+                  esac
+
+                  if [ $result -eq 0 ]; then
+                    return 0
+                  fi
+
+                  if [ $attempt -lt $max_attempts ]; then
+                    echo "  ⏳ Retrying in ${RETRY_DELAY}s..."
+                    sleep "${RETRY_DELAY}"
+                  fi
+                done
+                return 1
+              }
+
               SSH_METHOD=""
 
               # Try Tailscale SSH first
               if [ "$USE_TAILSCALE_SSH" = "true" ] && command -v tailscale &> /dev/null; then
                 echo "🔍 Testing Tailscale SSH..."
-                if timeout 15 tailscale ssh ${SSH_USER}@${SSH_HOST} "echo 'Connected'" 2>&1 | grep -q "Connected"; then
+                if try_ssh "tailscale"; then
                   SSH_METHOD="tailscale"
-                  echo "✅ Tailscale SSH works"
+                  echo "✅ Tailscale SSH connected"
                 else
-                  echo "⚠️ Tailscale SSH not available"
+                  echo "⚠️  Tailscale SSH not available, falling back..."
                 fi
               fi
 
               # Try SSH with key
               if [ -z "$SSH_METHOD" ] && [ -f ~/.ssh/deploy_key ]; then
                 echo "🔍 Testing SSH with key..."
-                if timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                    -o ConnectTimeout=10 -p ${SSH_PORT} -i ~/.ssh/deploy_key \
-                    ${SSH_USER}@${SSH_HOST} "echo 'Connected'" 2>&1 | grep -q "Connected"; then
+                if try_ssh "key"; then
                   SSH_METHOD="key"
-                  echo "✅ SSH key authentication works"
+                  echo "✅ SSH key authentication connected"
                 else
-                  echo "⚠️ SSH key authentication failed"
+                  echo "⚠️  SSH key authentication failed, falling back..."
                 fi
               fi
 
               # Try SSH with password
-              if [ -z "$SSH_METHOD" ] && [ -n "$SSH_PASSWORD" ]; then
+              if [ -z "$SSH_METHOD" ] && [ -n "${SSH_PASSWORD:-}" ]; then
                 echo "🔍 Testing SSH with password..."
-                if sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                    -o ConnectTimeout=10 -p ${SSH_PORT} \
-                    ${SSH_USER}@${SSH_HOST} "echo 'Connected'" 2>&1 | grep -q "Connected"; then
+                if try_ssh "password"; then
                   SSH_METHOD="password"
-                  echo "✅ SSH password authentication works"
+                  echo "✅ SSH password authentication connected"
                 else
-                  echo "⚠️ SSH password authentication failed"
+                  echo "⚠️  SSH password authentication failed"
                 fi
               fi
 
               if [ -z "$SSH_METHOD" ]; then
-                echo "❌ No working SSH method found"
+                echo "❌ No working SSH method found after ${RETRIES} attempts per method"
+                echo "   Host: ${SSH_HOST}:${SSH_PORT}"
+                echo "   User: ${SSH_USER}"
+                echo "   Key provided: $([ -f ~/.ssh/deploy_key ] && echo 'yes' || echo 'no')"
+                echo "   Password provided: $([ -n '${SSH_PASSWORD:-}' ] && echo 'yes' || echo 'no')"
                 exit 1
               fi
 
-              echo "method=$SSH_METHOD" >> $GITHUB_OUTPUT
-              echo "📡 Using SSH method: $SSH_METHOD"
+              echo "method=${SSH_METHOD}" >> $GITHUB_OUTPUT
+              echo "📡 SSH method: ${SSH_METHOD}"
 
+        # ─────────────────────────────────────────────────────────────────────
+        # DEPLOY
+        # ─────────────────────────────────────────────────────────────────────
         - name: 🚀 Deploy to server
           id: deploy
           shell: bash
@@ -192,134 +311,345 @@ runs:
               SSH_PASSWORD: ${{ inputs.password }}
               SSH_METHOD: ${{ steps.ssh-setup.outputs.method }}
               PROJECT_PATH: ${{ inputs.project-path }}
-              DEPLOY_COMMAND: ${{ inputs.deploy-command }}
-              PRE_DEPLOY_COMMAND: ${{ inputs.pre-deploy-command }}
-              POST_DEPLOY_COMMAND: ${{ inputs.post-deploy-command }}
-              COMPOSE_FILE: ${{ inputs.docker-compose-file }}
-              DOCKER_SERVICES: ${{ inputs.docker-services }}
+              # Git
               GIT_PULL: ${{ inputs.git-pull }}
               GIT_BRANCH: ${{ inputs.git-branch }}
-              DOCKER_PULL: ${{ inputs.docker-pull }}
+              GIT_REPO_URL: ${{ inputs.git-repo-url }}
+              # Build strategy
+              BUILD_STRATEGY: ${{ inputs.build-strategy }}
+              # Docker registry
+              DOCKER_REGISTRY: ${{ inputs.docker-registry }}
+              DOCKER_USERNAME: ${{ inputs.docker-username }}
+              DOCKER_PASSWORD: ${{ inputs.docker-password }}
+              DOCKER_IMAGE_PREFIX: ${{ inputs.docker-image-prefix }}
+              DOCKER_IMAGE_TAG: ${{ inputs.docker-image-tag }}
+              # Compose
+              COMPOSE_FILES: ${{ inputs.compose-files }}
+              COMPOSE_PROJECT: ${{ inputs.compose-project }}
+              COMPOSE_ENV_FILE: ${{ inputs.compose-env-file }}
+              COMPOSE_PROFILES: ${{ inputs.compose-profiles }}
+              # Services
+              APP_SERVICES: ${{ inputs.app-services }}
+              INFRA_SERVICES: ${{ inputs.infra-services }}
+              # Commands
+              PRE_DEPLOY_COMMAND: ${{ inputs.pre-deploy-command }}
+              DEPLOY_COMMAND: ${{ inputs.deploy-command }}
+              POST_DEPLOY_COMMAND: ${{ inputs.post-deploy-command }}
+              # Cleanup
               DOCKER_PRUNE: ${{ inputs.docker-prune }}
+              # Legacy
               ENV_FILES: ${{ inputs.env-files }}
           run: |
-              # SSH execution function
+              set -euo pipefail
+
+              # ── SSH execution helper ──────────────────────────────────────
+              # Wraps commands with retry logic and proper error handling.
+              # Usage: ssh_exec "command" [retries] [delay]
               ssh_exec() {
-                case "$SSH_METHOD" in
-                  tailscale)
-                    tailscale ssh ${SSH_USER}@${SSH_HOST} "$1"
-                    ;;
-                  key)
-                    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                        -p ${SSH_PORT} -i ~/.ssh/deploy_key ${SSH_USER}@${SSH_HOST} "$1"
-                    ;;
-                  password)
-                    sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
-                        -o UserKnownHostsFile=/dev/null -p ${SSH_PORT} \
-                        ${SSH_USER}@${SSH_HOST} "$1"
-                    ;;
-                esac
+                local cmd="$1"
+                local max_retries="${2:-2}"
+                local retry_delay="${3:-5}"
+                local attempt=0
+                local exit_code=0
+
+                while [ $attempt -lt $max_retries ]; do
+                  attempt=$((attempt + 1))
+                  exit_code=0
+
+                  case "$SSH_METHOD" in
+                    tailscale)
+                      tailscale ssh ${SSH_USER}@${SSH_HOST} "bash -c '${cmd}'" || exit_code=$?
+                      ;;
+                    key)
+                      ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                          -o ServerAliveInterval=15 -o ServerAliveCountMax=6 \
+                          -p ${SSH_PORT} -i ~/.ssh/deploy_key \
+                          ${SSH_USER}@${SSH_HOST} "bash -c '${cmd}'" || exit_code=$?
+                      ;;
+                    password)
+                      sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
+                          -o UserKnownHostsFile=/dev/null \
+                          -o ServerAliveInterval=15 -o ServerAliveCountMax=6 \
+                          -p ${SSH_PORT} \
+                          ${SSH_USER}@${SSH_HOST} "bash -c '${cmd}'" || exit_code=$?
+                      ;;
+                  esac
+
+                  if [ $exit_code -eq 0 ]; then
+                    return 0
+                  fi
+
+                  if [ $attempt -lt $max_retries ]; then
+                    echo "  ⚠️  Command failed (exit ${exit_code}), retrying in ${retry_delay}s... (${attempt}/${max_retries})"
+                    sleep "${retry_delay}"
+                  fi
+                done
+
+                echo "  ❌ Command failed after ${max_retries} attempts (exit ${exit_code})"
+                return $exit_code
               }
 
-              echo "🚀 Starting deployment to ${SSH_HOST}..."
-              echo "📁 Project path: ${PROJECT_PATH}"
+              # ── Build the compose command ─────────────────────────────────
+              build_compose_cmd() {
+                local cmd="docker compose"
 
-              # Run pre-deploy command (doesn't require PROJECT_PATH to exist)
-              if [ -n "$PRE_DEPLOY_COMMAND" ]; then
-                echo "⚙️ Running pre-deploy command..."
-                ssh_exec "cd ${PROJECT_PATH} 2>/dev/null || cd ~ && ${PRE_DEPLOY_COMMAND}"
+                # Project name
+                if [ -n "${COMPOSE_PROJECT}" ]; then
+                  cmd="${cmd} -p ${COMPOSE_PROJECT}"
+                fi
+
+                # Env file
+                if [ -n "${COMPOSE_ENV_FILE}" ]; then
+                  cmd="${cmd} --env-file ${COMPOSE_ENV_FILE}"
+                fi
+
+                # Compose files
+                for f in ${COMPOSE_FILES}; do
+                  cmd="${cmd} -f ${f}"
+                done
+
+                # Profiles
+                for p in ${COMPOSE_PROFILES}; do
+                  cmd="${cmd} --profile ${p}"
+                done
+
+                echo "${cmd}"
+              }
+
+              COMPOSE_CMD="$(build_compose_cmd)"
+
+              echo "════════════════════════════════════════════════════════════"
+              echo "🚀 SSH Deploy"
+              echo "════════════════════════════════════════════════════════════"
+              echo "📍 Host:           ${SSH_HOST}:${SSH_PORT}"
+              echo "👤 User:           ${SSH_USER}"
+              echo "📡 SSH Method:     ${SSH_METHOD}"
+              echo "📁 Project:        ${PROJECT_PATH}"
+              echo "🔧 Build Strategy: ${BUILD_STRATEGY}"
+              echo "🐳 Compose:        ${COMPOSE_CMD}"
+              echo "════════════════════════════════════════════════════════════"
+
+              # ── Phase 0: First-time clone ─────────────────────────────────
+              if [ -n "${GIT_REPO_URL}" ]; then
+                echo ""
+                echo "📦 Checking for existing project..."
+                ssh_exec "
+                  if [ ! -d '${PROJECT_PATH}/.git' ]; then
+                    echo '📦 First-time setup — cloning repository...'
+                    rm -rf '${PROJECT_PATH}'
+                    git clone '${GIT_REPO_URL}' '${PROJECT_PATH}'
+                    echo '✅ Repository cloned'
+                  else
+                    echo '✅ Project already exists'
+                  fi
+                "
               fi
 
-              # Create env files if provided
-              if [ -n "$ENV_FILES" ] && [ "$ENV_FILES" != "{}" ]; then
+              # ── Phase 1: Pre-deploy command ───────────────────────────────
+              if [ -n "${PRE_DEPLOY_COMMAND}" ]; then
+                echo ""
+                echo "════════════════════════════════════════════════════════════"
+                echo "⚙️  PHASE 1: Pre-Deploy"
+                echo "════════════════════════════════════════════════════════════"
+                ssh_exec "cd '${PROJECT_PATH}' 2>/dev/null || cd ~ && ${PRE_DEPLOY_COMMAND}"
+              fi
+
+              # ── Phase 2: Git pull ─────────────────────────────────────────
+              if [ "${GIT_PULL}" = "true" ]; then
+                echo ""
+                echo "════════════════════════════════════════════════════════════"
+                echo "📥 PHASE 2: Git Pull (${GIT_BRANCH})"
+                echo "════════════════════════════════════════════════════════════"
+                ssh_exec "
+                  cd '${PROJECT_PATH}'
+                  echo '📥 Fetching from origin...'
+                  git fetch origin
+                  git checkout '${GIT_BRANCH}' 2>/dev/null || true
+                  git pull origin '${GIT_BRANCH}'
+                  echo \"✅ Now at: \$(git log --oneline -1)\"
+                " 3 10
+              fi
+
+              # ── Phase 3: Create env files (legacy JSON support) ───────────
+              if [ -n "${ENV_FILES}" ] && [ "${ENV_FILES}" != "{}" ]; then
+                echo ""
                 echo "📝 Creating environment files..."
-                # Parse JSON and create files (simplified - expects flat JSON)
-                echo "$ENV_FILES" | jq -r 'to_entries[] | "\(.key):\(.value)"' 2>/dev/null | while IFS=: read -r filename content; do
+                echo "${ENV_FILES}" | jq -r 'to_entries[] | "\(.key):\(.value)"' 2>/dev/null | while IFS=: read -r filename content; do
                   if [ -n "$filename" ] && [ -n "$content" ]; then
-                    echo "  Creating ${filename}..."
-                    ssh_exec "echo '${content}' > ${PROJECT_PATH}/${filename} && chmod 600 ${PROJECT_PATH}/${filename}"
+                    echo "  📄 ${filename}"
+                    ssh_exec "echo '${content}' > '${PROJECT_PATH}/${filename}' && chmod 600 '${PROJECT_PATH}/${filename}'"
                   fi
                 done || echo "  (No env files to create or JSON parsing skipped)"
               fi
 
-              # Git pull (always runs if enabled, regardless of custom deploy command)
-              if [ "$GIT_PULL" = "true" ]; then
-                echo "📥 Pulling latest changes from git (${GIT_BRANCH})..."
-                ssh_exec "cd ${PROJECT_PATH} && git fetch origin && git checkout ${GIT_BRANCH} 2>/dev/null || true && git pull origin ${GIT_BRANCH}"
-              fi
+              # ── Phase 4: Deploy ───────────────────────────────────────────
+              echo ""
+              echo "════════════════════════════════════════════════════════════"
+              echo "🚀 PHASE 4: Deploy (strategy: ${BUILD_STRATEGY})"
+              echo "════════════════════════════════════════════════════════════"
 
-              # Custom deploy command takes precedence
-              if [ -n "$DEPLOY_COMMAND" ]; then
-                echo "⚙️ Running custom deploy command..."
-                ssh_exec "cd ${PROJECT_PATH} && ${DEPLOY_COMMAND}"
-              else
-                # Standard Docker Compose deployment
+              # If a custom deploy command is provided, it overrides everything
+              if [ -n "${DEPLOY_COMMAND}" ]; then
+                echo "⚙️  Running custom deploy command..."
+                ssh_exec "cd '${PROJECT_PATH}' && ${DEPLOY_COMMAND}"
+                echo "build_strategy=custom" >> $GITHUB_OUTPUT
+                echo "services=custom" >> $GITHUB_OUTPUT
 
-                # Stop containers
-                echo "🛑 Stopping current containers..."
-                ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} down || docker-compose -f ${COMPOSE_FILE} down || true"
+              elif [ "${BUILD_STRATEGY}" = "dockerhub" ]; then
+                # ── DockerHub Strategy ──────────────────────────────────────
+                # Pull pre-built images from registry, then start services.
+                echo "🐳 Strategy: Pull from DockerHub"
 
-                # Docker pull
-                if [ "$DOCKER_PULL" = "true" ]; then
-                  echo "📥 Pulling latest Docker images..."
-                  ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} pull || docker-compose -f ${COMPOSE_FILE} pull || true"
+                # Docker login on remote
+                if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
+                  echo "🔑 Logging into Docker registry (${DOCKER_REGISTRY})..."
+                  ssh_exec "echo '${DOCKER_PASSWORD}' | docker login -u '${DOCKER_USERNAME}' --password-stdin '${DOCKER_REGISTRY}'" 2 5
                 fi
 
-                # Start containers
-                echo "🚀 Starting containers..."
-                if [ -n "$DOCKER_SERVICES" ]; then
-                  echo "  Services: ${DOCKER_SERVICES}"
-                  ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} up -d ${DOCKER_SERVICES} || docker-compose -f ${COMPOSE_FILE} up -d ${DOCKER_SERVICES}"
-                  echo "services=${DOCKER_SERVICES}" >> $GITHUB_OUTPUT
+                # Stop app services (keep infra running)
+                if [ -n "${APP_SERVICES}" ]; then
+                  echo "🛑 Stopping app services: ${APP_SERVICES}"
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} stop ${APP_SERVICES} 2>/dev/null || true && ${COMPOSE_CMD} rm -f ${APP_SERVICES} 2>/dev/null || true"
+                fi
+
+                # Pull images
+                if [ -n "${APP_SERVICES}" ]; then
+                  echo "📥 Pulling images for: ${APP_SERVICES}"
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} pull ${APP_SERVICES}" 3 10
                 else
-                  ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} up -d || docker-compose -f ${COMPOSE_FILE} up -d"
-                  echo "services=all" >> $GITHUB_OUTPUT
+                  echo "📥 Pulling all images..."
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} pull" 3 10
                 fi
 
-                # Docker prune
-                if [ "$DOCKER_PRUNE" = "true" ]; then
-                  echo "🧹 Pruning unused Docker resources..."
-                  ssh_exec "docker image prune -af && docker container prune -f && docker builder prune -af" || true
+                # Ensure infra services are running
+                if [ -n "${INFRA_SERVICES}" ]; then
+                  echo "🔧 Ensuring infrastructure services are running..."
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d --no-recreate ${INFRA_SERVICES}"
                 fi
 
-                # Show status
+                # Start all services
+                echo "🚀 Starting services..."
+                ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d"
+
+                echo "build_strategy=dockerhub" >> $GITHUB_OUTPUT
+                echo "services=${APP_SERVICES:-all}" >> $GITHUB_OUTPUT
+
+              elif [ "${BUILD_STRATEGY}" = "server-build" ]; then
+                # ── Server Build Strategy ───────────────────────────────────
+                # Build images directly on the server from source.
+                echo "🔨 Strategy: Build on server"
+
+                # Docker login (may be needed for base images)
+                if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
+                  echo "🔑 Logging into Docker registry (${DOCKER_REGISTRY})..."
+                  ssh_exec "echo '${DOCKER_PASSWORD}' | docker login -u '${DOCKER_USERNAME}' --password-stdin '${DOCKER_REGISTRY}'" 2 5
+                fi
+
+                # Stop app services (keep infra running)
+                if [ -n "${APP_SERVICES}" ]; then
+                  echo "🛑 Stopping app services: ${APP_SERVICES}"
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} stop ${APP_SERVICES} 2>/dev/null || true && ${COMPOSE_CMD} rm -f ${APP_SERVICES} 2>/dev/null || true"
+                fi
+
+                # Clean orphan containers
+                ssh_exec "docker container prune -f --filter 'label=com.docker.compose.project=${COMPOSE_PROJECT}' 2>/dev/null || true"
+
+                # Build images on server
+                if [ -n "${APP_SERVICES}" ]; then
+                  echo "🔨 Building app images: ${APP_SERVICES}"
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} build --parallel ${APP_SERVICES}" 1 0
+                else
+                  echo "🔨 Building all images..."
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} build --parallel" 1 0
+                fi
+                echo "✅ Images built"
+
+                # Ensure infra services are running
+                if [ -n "${INFRA_SERVICES}" ]; then
+                  echo "🔧 Ensuring infrastructure services are running..."
+                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d --no-recreate ${INFRA_SERVICES}"
+                fi
+
+                # Start all services
+                echo "🚀 Starting all services..."
+                ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d"
+
+                echo "build_strategy=server-build" >> $GITHUB_OUTPUT
+                echo "services=${APP_SERVICES:-all}" >> $GITHUB_OUTPUT
+
+              else
+                # ── None / Skip ─────────────────────────────────────────────
+                echo "⏭️  Build strategy: none — skipping build phase"
+                echo "🚀 Starting services with existing images..."
+                ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d"
+
+                echo "build_strategy=none" >> $GITHUB_OUTPUT
+                echo "services=all" >> $GITHUB_OUTPUT
+              fi
+
+              # ── Phase 5: Docker prune ─────────────────────────────────────
+              if [ "${DOCKER_PRUNE}" = "true" ]; then
                 echo ""
-                echo "📊 Container status:"
-                ssh_exec "cd ${PROJECT_PATH} && docker compose -f ${COMPOSE_FILE} ps || docker-compose -f ${COMPOSE_FILE} ps" || true
-              fi
-
-              # Docker prune (runs for both custom and standard deployments if enabled)
-              if [ "$DOCKER_PRUNE" = "true" ] && [ -n "$DEPLOY_COMMAND" ]; then
                 echo "🧹 Pruning unused Docker resources..."
-                ssh_exec "docker image prune -af && docker container prune -f && docker builder prune -af" || true
+                ssh_exec "docker image prune -f --filter 'until=24h' 2>/dev/null; docker container prune -f 2>/dev/null; docker builder prune -f 2>/dev/null" 1 0 || true
               fi
 
-              # Run post-deploy command
-              if [ -n "$POST_DEPLOY_COMMAND" ]; then
-                echo "⚙️ Running post-deploy command..."
-                ssh_exec "cd ${PROJECT_PATH} && ${POST_DEPLOY_COMMAND}"
+              # ── Phase 6: Show status ──────────────────────────────────────
+              echo ""
+              echo "════════════════════════════════════════════════════════════"
+              echo "📊 Container Status"
+              echo "════════════════════════════════════════════════════════════"
+              ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || docker ps -a --filter 'name=${COMPOSE_PROJECT}' --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || echo 'Could not retrieve container status'" 1 0 || true
+
+              # ── Phase 7: Post-deploy command ──────────────────────────────
+              if [ -n "${POST_DEPLOY_COMMAND}" ]; then
+                echo ""
+                echo "════════════════════════════════════════════════════════════"
+                echo "⚙️  PHASE 7: Post-Deploy"
+                echo "════════════════════════════════════════════════════════════"
+                ssh_exec "cd '${PROJECT_PATH}' && ${POST_DEPLOY_COMMAND}"
               fi
 
               echo ""
+              echo "════════════════════════════════════════════════════════════"
               echo "✅ Deployment complete!"
+              echo "════════════════════════════════════════════════════════════"
               echo "deployed=true" >> $GITHUB_OUTPUT
 
+        # ─────────────────────────────────────────────────────────────────────
+        # SUMMARY
+        # ─────────────────────────────────────────────────────────────────────
         - name: 📊 Deployment Summary
+          if: always()
           shell: bash
           env:
               SSH_METHOD: ${{ steps.ssh-setup.outputs.method }}
               SERVICES: ${{ steps.deploy.outputs.services }}
+              BUILD_STRATEGY: ${{ steps.deploy.outputs.build_strategy }}
+              DEPLOYED: ${{ steps.deploy.outputs.deployed }}
           run: |
-              echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-              echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-              echo "| Host | \`${{ inputs.host }}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| User | \`${{ inputs.username }}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| SSH Method | \`${SSH_METHOD}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| Project Path | \`${{ inputs.project-path }}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| Services | \`${SERVICES:-all}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| Git Pull | \`${{ inputs.git-pull }}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| Docker Pull | \`${{ inputs.docker-pull }}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "✅ **Deployment successful!**" >> $GITHUB_STEP_SUMMARY
+              STATUS="${DEPLOYED:-false}"
+              if [ "$STATUS" = "true" ]; then
+                ICON="✅"
+                MSG="Deployment successful!"
+              else
+                ICON="❌"
+                MSG="Deployment failed"
+              fi
+
+              cat >> $GITHUB_STEP_SUMMARY << EOF
+              ## 🚀 SSH Deploy Summary
+
+              | Property | Value |
+              |----------|-------|
+              | Host | \`${{ inputs.host }}:${{ inputs.port }}\` |
+              | User | \`${{ inputs.username }}\` |
+              | SSH Method | \`${SSH_METHOD:-unknown}\` |
+              | Project Path | \`${{ inputs.project-path }}\` |
+              | Build Strategy | \`${BUILD_STRATEGY:-unknown}\` |
+              | Services | \`${SERVICES:-all}\` |
+              | Git Pull | \`${{ inputs.git-pull }}\` |
+              | Git Branch | \`${{ inputs.git-branch }}\` |
+
+              ${ICON} **${MSG}**
+              EOF
