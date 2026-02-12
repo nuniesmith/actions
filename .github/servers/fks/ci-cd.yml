@@ -103,8 +103,10 @@ jobs:
         outputs:
             deploy_env: ${{ steps.determine-env.outputs.environment }}
             target_domain: ${{ steps.determine-env.outputs.domain }}
-            target_host: ${{ steps.determine-env.outputs.host }}
             build_strategy: ${{ steps.determine-env.outputs.build_strategy }}
+            # NOTE: target_host is NOT passed cross-job (GitHub Actions drops it).
+            # Instead, the deploy job resolves the host IP directly from secrets
+            # via the 'resolve-host' step. See STAGE 4.
         steps:
             - name: 🎯 Determine deployment environment
               id: determine-env
@@ -120,19 +122,22 @@ jobs:
                   PROD_DOMAIN: ${{ env.DOMAIN }}
                   STAGE_DOMAIN: ${{ env.STAGING_DOMAIN }}
               run: |
-                  set -euo pipefail
+                  # NOTE: Do NOT use `set -euo pipefail` here — the `&&` pattern
+                  # in the optional-secrets validation block causes `set -e` to
+                  # terminate the script when the test returns false (exit 1).
+                  # We handle errors explicitly with `exit 1` where needed.
 
                   # ── Validate critical secrets ─────────────────────────────
                   if [ -z "$PROD_TAILSCALE_IP" ]; then
                     echo "❌ FATAL: PROD_TAILSCALE_IP secret is not set or empty!"
-                    cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+                    cat >> $GITHUB_STEP_SUMMARY << 'EOFSUM'
                   ## ❌ Missing Required Secret
                   The `PROD_TAILSCALE_IP` secret must be configured in repository settings.
 
                   Go to: **Settings → Secrets and variables → Actions → New repository secret**
 
                   Set `PROD_TAILSCALE_IP` to your production server's Tailscale IP (e.g., `100.x.x.x`)
-                  EOF
+                  EOFSUM
                     exit 1
                   fi
 
@@ -145,12 +150,10 @@ jobs:
                     ENV="staging"
                   fi
 
-                  # ── Set host and domain ────────────────────────────────────
+                  # ── Set domain ─────────────────────────────────────────────
                   if [ "$ENV" = "production" ]; then
-                    HOST="$PROD_TAILSCALE_IP"
                     DOMAIN="$PROD_DOMAIN"
                   else
-                    HOST="${STAGING_TAILSCALE_IP:-$PROD_TAILSCALE_IP}"
                     DOMAIN="$STAGE_DOMAIN"
                   fi
 
@@ -159,20 +162,19 @@ jobs:
 
                   # ── Debug output ───────────────────────────────────────────
                   echo "🎯 Environment:    $ENV"
-                  echo "📍 Host:           $HOST"
                   echo "🌐 Domain:         $DOMAIN"
                   echo "🔧 Build Strategy: $STRATEGY"
 
-                  echo "environment=$ENV" >> $GITHUB_OUTPUT
-                  echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
-                  echo "host=$HOST" >> $GITHUB_OUTPUT
-                  echo "build_strategy=$STRATEGY" >> $GITHUB_OUTPUT
+                  # ── Write outputs ──────────────────────────────────────────
+                  echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+                  echo "domain=$DOMAIN" >> "$GITHUB_OUTPUT"
+                  echo "build_strategy=$STRATEGY" >> "$GITHUB_OUTPUT"
 
                   # ── Validate optional secrets ──────────────────────────────
                   MISSING=""
-                  [ "$HAS_PROD_IP" != "true" ] && MISSING="$MISSING PROD_TAILSCALE_IP"
-                  [ "$HAS_SSH_KEY" != "true" ] && MISSING="$MISSING PROD_SSH_KEY"
-                  [ "$HAS_TAILSCALE" != "true" ] && MISSING="$MISSING TAILSCALE_OAUTH_CLIENT_ID"
+                  if [ "$HAS_PROD_IP" != "true" ]; then MISSING="$MISSING PROD_TAILSCALE_IP"; fi
+                  if [ "$HAS_SSH_KEY" != "true" ]; then MISSING="$MISSING PROD_SSH_KEY"; fi
+                  if [ "$HAS_TAILSCALE" != "true" ]; then MISSING="$MISSING TAILSCALE_OAUTH_CLIENT_ID"; fi
 
                   if [ -n "$MISSING" ]; then
                     echo "⚠️ Missing secrets:$MISSING"
@@ -187,7 +189,6 @@ jobs:
                   |----------|-------|
                   | Target | \`$ENV\` |
                   | Domain | \`$DOMAIN\` |
-                  | Host | \`$HOST\` |
                   | Build Strategy | \`$STRATEGY\` |
                   | Branch | \`${{ github.ref_name }}\` |
                   | Trigger | \`${{ github.event_name }}\` |
@@ -326,6 +327,31 @@ jobs:
               uses: actions/checkout@v4
 
             # -----------------------------------------------------------------
+            # RESOLVE TARGET HOST (in-job — secrets can't reliably pass cross-job)
+            # -----------------------------------------------------------------
+            - name: 🎯 Resolve target host
+              id: resolve-host
+              env:
+                  DEPLOY_ENV: ${{ needs.setup.outputs.deploy_env }}
+                  PROD_IP: ${{ secrets.PROD_TAILSCALE_IP }}
+                  STAGING_IP: ${{ secrets.STAGING_TAILSCALE_IP }}
+              run: |
+                  if [ "$DEPLOY_ENV" = "production" ]; then
+                    HOST="$PROD_IP"
+                  else
+                    HOST="${STAGING_IP:-$PROD_IP}"
+                  fi
+
+                  if [ -z "$HOST" ]; then
+                    echo "❌ FATAL: Could not resolve target host IP!"
+                    echo "   DEPLOY_ENV=$DEPLOY_ENV"
+                    exit 1
+                  fi
+
+                  echo "target_host=$HOST" >> "$GITHUB_OUTPUT"
+                  echo "✅ Target host: $HOST (env: $DEPLOY_ENV)"
+
+            # -----------------------------------------------------------------
             # TAILSCALE CONNECTION
             # -----------------------------------------------------------------
             - name: 🔌 Connect to Tailscale
@@ -334,20 +360,21 @@ jobs:
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ needs.setup.outputs.target_host }}
+                  target-ip: ${{ steps.resolve-host.outputs.target_host }}
                   target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
 
             # -----------------------------------------------------------------
             # DNS UPDATE
             # -----------------------------------------------------------------
             - name: 🌐 Update Cloudflare DNS
-              if: steps.tailscale.outputs.connected == 'true'
+              if: steps.tailscale.outputs.connected == 'true' && steps.resolve-host.outputs.target_host != ''
               uses: nuniesmith/actions/.github/actions/cloudflare-dns-update@main
+              continue-on-error: true
               with:
                   api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
                   zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
                   record-name: ${{ needs.setup.outputs.target_domain }}
-                  record-content: ${{ needs.setup.outputs.target_host }}
+                  record-content: ${{ steps.resolve-host.outputs.target_host }}
                   additional-records: |
                       [
                         {"name": "www.${{ needs.setup.outputs.target_domain }}"},
@@ -364,7 +391,7 @@ jobs:
               uses: nuniesmith/actions/.github/actions/ssl-check@main
               continue-on-error: true
               with:
-                  ssh-host: ${{ needs.setup.outputs.target_host }}
+                  ssh-host: ${{ steps.resolve-host.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -391,7 +418,7 @@ jobs:
                   fallback-to-self-signed: "true"
                   self-signed-days: "365"
                   deploy-to-server: true
-                  ssh-host: ${{ needs.setup.outputs.target_host }}
+                  ssh-host: ${{ steps.resolve-host.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -408,7 +435,7 @@ jobs:
               uses: nuniesmith/actions/.github/actions/ssh-deploy@main
               with:
                   # ── SSH Connection ────────────────────────────────────────
-                  host: ${{ needs.setup.outputs.target_host }}
+                  host: ${{ steps.resolve-host.outputs.target_host }}
                   port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   username: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -608,7 +635,7 @@ jobs:
                         {"url": "http://${{ needs.setup.outputs.target_domain }}/health/grafana", "expected_status": 200}
                       ]
                   containers: fks_janus fks_nginx fks_web
-                  ssh-host: ${{ needs.setup.outputs.target_host }}
+                  ssh-host: ${{ steps.resolve-host.outputs.target_host }}
                   ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
@@ -664,7 +691,6 @@ jobs:
                   |----------|-------|
                   | Target | \`${{ needs.setup.outputs.deploy_env }}\` |
                   | Domain | \`${{ needs.setup.outputs.target_domain }}\` |
-                  | Host | \`${{ needs.setup.outputs.target_host }}\` |
                   | Build Strategy | \`${{ needs.setup.outputs.build_strategy }}\` |
                   | Branch | \`${{ github.ref_name }}\` |
 

@@ -1,182 +1,202 @@
-name: 'Cloudflare DNS Update'
-description: 'Create or update Cloudflare DNS A records'
-author: 'nuniesmith'
+name: "Cloudflare DNS Update"
+description: "Create or update Cloudflare DNS A records"
+author: "nuniesmith"
 
 branding:
-  icon: 'globe'
-  color: 'orange'
+    icon: "globe"
+    color: "orange"
 
 inputs:
-  api-token:
-    description: 'Cloudflare API token with DNS edit permissions'
-    required: true
-  zone-id:
-    description: 'Cloudflare Zone ID'
-    required: true
-  record-name:
-    description: 'DNS record name (e.g., example.com or sub.example.com)'
-    required: true
-  record-content:
-    description: 'IP address or content for the DNS record'
-    required: true
-  record-type:
-    description: 'DNS record type'
-    required: false
-    default: 'A'
-  ttl:
-    description: 'TTL in seconds (1 = automatic)'
-    required: false
-    default: '1'
-  proxied:
-    description: 'Whether to proxy through Cloudflare (true/false)'
-    required: false
-    default: 'false'
-  additional-records:
-    description: 'JSON array of additional records to update: [{"name": "www.example.com", "content": "1.2.3.4"}]'
-    required: false
-    default: '[]'
+    api-token:
+        description: "Cloudflare API token with DNS edit permissions"
+        required: true
+    zone-id:
+        description: "Cloudflare Zone ID"
+        required: true
+    record-name:
+        description: "DNS record name (e.g., example.com or sub.example.com)"
+        required: true
+    record-content:
+        description: "IP address or content for the DNS record"
+        required: true
+    record-type:
+        description: "DNS record type"
+        required: false
+        default: "A"
+    ttl:
+        description: "TTL in seconds (1 = automatic)"
+        required: false
+        default: "1"
+    proxied:
+        description: "Whether to proxy through Cloudflare (true/false)"
+        required: false
+        default: "false"
+    additional-records:
+        description: 'JSON array of additional records to update: [{"name": "www.example.com", "content": "1.2.3.4"}]'
+        required: false
+        default: "[]"
 
 outputs:
-  updated:
-    description: 'Whether the DNS record was updated successfully'
-    value: ${{ steps.update.outputs.updated }}
-  record-id:
-    description: 'The Cloudflare record ID'
-    value: ${{ steps.update.outputs.record_id }}
-  records-updated:
-    description: 'Number of records updated'
-    value: ${{ steps.update.outputs.records_updated }}
+    updated:
+        description: "Whether the DNS record was updated successfully"
+        value: ${{ steps.update.outputs.updated }}
+    record-id:
+        description: "The Cloudflare record ID"
+        value: ${{ steps.update.outputs.record_id }}
+    records-updated:
+        description: "Number of records updated"
+        value: ${{ steps.update.outputs.records_updated }}
 
 runs:
-  using: 'composite'
-  steps:
-    - name: 🌐 Update Cloudflare DNS Records
-      id: update
-      shell: bash
-      env:
-        CF_API_TOKEN: ${{ inputs.api-token }}
-        CF_ZONE_ID: ${{ inputs.zone-id }}
-      run: |
-        set -e
+    using: "composite"
+    steps:
+        - name: 🌐 Update Cloudflare DNS Records
+          id: update
+          shell: bash
+          env:
+              CF_API_TOKEN: ${{ inputs.api-token }}
+              CF_ZONE_ID: ${{ inputs.zone-id }}
+          run: |
+              set -e
 
-        RECORDS_UPDATED=0
+              # ── Validate inputs ────────────────────────────────────────
+              RECORD_CONTENT="${{ inputs.record-content }}"
+              if [ -z "$RECORD_CONTENT" ]; then
+                echo "❌ FATAL: record-content is empty!"
+                echo "   Cannot set a DNS A record without a valid IPv4 address."
+                echo "   This usually means the target host IP was not resolved in a prior step."
+                echo ""
+                echo "## ❌ DNS Update Failed" >> $GITHUB_STEP_SUMMARY
+                echo "The \`record-content\` input was empty. Ensure the target host IP is set correctly." >> $GITHUB_STEP_SUMMARY
+                exit 1
+              fi
 
-        # Function to update or create a DNS record
-        update_dns_record() {
-          local RECORD_NAME="$1"
-          local RECORD_CONTENT="$2"
-          local RECORD_TYPE="${3:-${{ inputs.record-type }}}"
-          local TTL="${4:-${{ inputs.ttl }}}"
-          local PROXIED="${5:-${{ inputs.proxied }}}"
+              # Basic IPv4 format check for A records
+              if [ "${{ inputs.record-type }}" = "A" ]; then
+                if ! echo "$RECORD_CONTENT" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                  echo "❌ FATAL: record-content '$RECORD_CONTENT' is not a valid IPv4 address!"
+                  exit 1
+                fi
+              fi
 
-          echo "📡 Processing DNS record: $RECORD_NAME → $RECORD_CONTENT"
+              RECORDS_UPDATED=0
 
-          # Check if record exists
-          RECORD_RESPONSE=$(curl -s -X GET \
-            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=${RECORD_TYPE}&name=${RECORD_NAME}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json")
+              # Function to update or create a DNS record
+              update_dns_record() {
+                local RECORD_NAME="$1"
+                local RECORD_CONTENT="$2"
+                local RECORD_TYPE="${3:-${{ inputs.record-type }}}"
+                local TTL="${4:-${{ inputs.ttl }}}"
+                local PROXIED="${5:-${{ inputs.proxied }}}"
 
-          # Check for API errors
-          SUCCESS=$(echo "$RECORD_RESPONSE" | jq -r '.success')
-          if [ "$SUCCESS" != "true" ]; then
-            echo "❌ API Error: $(echo "$RECORD_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')"
-            return 1
-          fi
+                echo "📡 Processing DNS record: $RECORD_NAME → $RECORD_CONTENT"
 
-          RECORD_ID=$(echo "$RECORD_RESPONSE" | jq -r '.result[0].id // empty')
-          CURRENT_CONTENT=$(echo "$RECORD_RESPONSE" | jq -r '.result[0].content // empty')
+                # Check if record exists
+                RECORD_RESPONSE=$(curl -s -X GET \
+                  "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=${RECORD_TYPE}&name=${RECORD_NAME}" \
+                  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                  -H "Content-Type: application/json")
 
-          # Convert proxied string to boolean for JSON
-          PROXIED_BOOL="false"
-          if [ "$PROXIED" = "true" ]; then
-            PROXIED_BOOL="true"
-          fi
+                # Check for API errors
+                SUCCESS=$(echo "$RECORD_RESPONSE" | jq -r '.success')
+                if [ "$SUCCESS" != "true" ]; then
+                  echo "❌ API Error: $(echo "$RECORD_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')"
+                  return 1
+                fi
 
-          if [ -z "$RECORD_ID" ]; then
-            # Create new record
-            echo "  Creating new ${RECORD_TYPE} record..."
-            CREATE_RESPONSE=$(curl -s -X POST \
-              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
-              -H "Content-Type: application/json" \
-              --data "{\"type\":\"${RECORD_TYPE}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${RECORD_CONTENT}\",\"ttl\":${TTL},\"proxied\":${PROXIED_BOOL}}")
+                RECORD_ID=$(echo "$RECORD_RESPONSE" | jq -r '.result[0].id // empty')
+                CURRENT_CONTENT=$(echo "$RECORD_RESPONSE" | jq -r '.result[0].content // empty')
 
-            SUCCESS=$(echo "$CREATE_RESPONSE" | jq -r '.success')
-            if [ "$SUCCESS" = "true" ]; then
-              NEW_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id')
-              echo "  ✅ Created record (ID: $NEW_ID)"
-              echo "record_id=$NEW_ID" >> $GITHUB_OUTPUT
-              RECORDS_UPDATED=$((RECORDS_UPDATED + 1))
-            else
-              echo "  ❌ Failed to create: $(echo "$CREATE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')"
-              return 1
-            fi
-          elif [ "$CURRENT_CONTENT" = "$RECORD_CONTENT" ]; then
-            # No update needed
-            echo "  ⏭️ Record already up to date"
-            echo "record_id=$RECORD_ID" >> $GITHUB_OUTPUT
-          else
-            # Update existing record
-            echo "  Updating existing record ($CURRENT_CONTENT → $RECORD_CONTENT)..."
-            UPDATE_RESPONSE=$(curl -s -X PUT \
-              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
-              -H "Content-Type: application/json" \
-              --data "{\"type\":\"${RECORD_TYPE}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${RECORD_CONTENT}\",\"ttl\":${TTL},\"proxied\":${PROXIED_BOOL}}")
+                # Convert proxied string to boolean for JSON
+                PROXIED_BOOL="false"
+                if [ "$PROXIED" = "true" ]; then
+                  PROXIED_BOOL="true"
+                fi
 
-            SUCCESS=$(echo "$UPDATE_RESPONSE" | jq -r '.success')
-            if [ "$SUCCESS" = "true" ]; then
-              echo "  ✅ Updated record (ID: $RECORD_ID)"
-              echo "record_id=$RECORD_ID" >> $GITHUB_OUTPUT
-              RECORDS_UPDATED=$((RECORDS_UPDATED + 1))
-            else
-              echo "  ❌ Failed to update: $(echo "$UPDATE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')"
-              return 1
-            fi
-          fi
-        }
+                if [ -z "$RECORD_ID" ]; then
+                  # Create new record
+                  echo "  Creating new ${RECORD_TYPE} record..."
+                  CREATE_RESPONSE=$(curl -s -X POST \
+                    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+                    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                    -H "Content-Type: application/json" \
+                    --data "{\"type\":\"${RECORD_TYPE}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${RECORD_CONTENT}\",\"ttl\":${TTL},\"proxied\":${PROXIED_BOOL}}")
 
-        # Update primary record
-        update_dns_record "${{ inputs.record-name }}" "${{ inputs.record-content }}"
+                  SUCCESS=$(echo "$CREATE_RESPONSE" | jq -r '.success')
+                  if [ "$SUCCESS" = "true" ]; then
+                    NEW_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id')
+                    echo "  ✅ Created record (ID: $NEW_ID)"
+                    echo "record_id=$NEW_ID" >> $GITHUB_OUTPUT
+                    RECORDS_UPDATED=$((RECORDS_UPDATED + 1))
+                  else
+                    echo "  ❌ Failed to create: $(echo "$CREATE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')"
+                    return 1
+                  fi
+                elif [ "$CURRENT_CONTENT" = "$RECORD_CONTENT" ]; then
+                  # No update needed
+                  echo "  ⏭️ Record already up to date"
+                  echo "record_id=$RECORD_ID" >> $GITHUB_OUTPUT
+                else
+                  # Update existing record
+                  echo "  Updating existing record ($CURRENT_CONTENT → $RECORD_CONTENT)..."
+                  UPDATE_RESPONSE=$(curl -s -X PUT \
+                    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+                    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                    -H "Content-Type: application/json" \
+                    --data "{\"type\":\"${RECORD_TYPE}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${RECORD_CONTENT}\",\"ttl\":${TTL},\"proxied\":${PROXIED_BOOL}}")
 
-        # Update additional records if provided
-        ADDITIONAL='${{ inputs.additional-records }}'
-        if [ "$ADDITIONAL" != "[]" ] && [ -n "$ADDITIONAL" ]; then
-          echo ""
-          echo "📋 Processing additional records..."
+                  SUCCESS=$(echo "$UPDATE_RESPONSE" | jq -r '.success')
+                  if [ "$SUCCESS" = "true" ]; then
+                    echo "  ✅ Updated record (ID: $RECORD_ID)"
+                    echo "record_id=$RECORD_ID" >> $GITHUB_OUTPUT
+                    RECORDS_UPDATED=$((RECORDS_UPDATED + 1))
+                  else
+                    echo "  ❌ Failed to update: $(echo "$UPDATE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')"
+                    return 1
+                  fi
+                fi
+              }
 
-          # Parse JSON array and iterate
-          echo "$ADDITIONAL" | jq -c '.[]' | while read -r record; do
-            NAME=$(echo "$record" | jq -r '.name')
-            CONTENT=$(echo "$record" | jq -r '.content // "${{ inputs.record-content }}"')
-            TYPE=$(echo "$record" | jq -r '.type // "${{ inputs.record-type }}"')
-            REC_TTL=$(echo "$record" | jq -r '.ttl // "${{ inputs.ttl }}"')
-            REC_PROXIED=$(echo "$record" | jq -r '.proxied // "${{ inputs.proxied }}"')
+              # Update primary record
+              update_dns_record "${{ inputs.record-name }}" "${{ inputs.record-content }}"
 
-            if [ -n "$NAME" ] && [ "$NAME" != "null" ]; then
-              update_dns_record "$NAME" "$CONTENT" "$TYPE" "$REC_TTL" "$REC_PROXIED"
-            fi
-          done
-        fi
+              # Update additional records if provided
+              ADDITIONAL='${{ inputs.additional-records }}'
+              if [ "$ADDITIONAL" != "[]" ] && [ -n "$ADDITIONAL" ]; then
+                echo ""
+                echo "📋 Processing additional records..."
 
-        echo ""
-        echo "updated=true" >> $GITHUB_OUTPUT
-        echo "records_updated=$RECORDS_UPDATED" >> $GITHUB_OUTPUT
-        echo "✅ DNS update complete"
+                # Parse JSON array and iterate
+                echo "$ADDITIONAL" | jq -c '.[]' | while read -r record; do
+                  NAME=$(echo "$record" | jq -r '.name')
+                  CONTENT=$(echo "$record" | jq -r '.content // "${{ inputs.record-content }}"')
+                  TYPE=$(echo "$record" | jq -r '.type // "${{ inputs.record-type }}"')
+                  REC_TTL=$(echo "$record" | jq -r '.ttl // "${{ inputs.ttl }}"')
+                  REC_PROXIED=$(echo "$record" | jq -r '.proxied // "${{ inputs.proxied }}"')
 
-    - name: 📋 Generate Summary
-      shell: bash
-      run: |
-        cat >> $GITHUB_STEP_SUMMARY << EOF
-        ## 🌐 Cloudflare DNS Update
+                  if [ -n "$NAME" ] && [ "$NAME" != "null" ]; then
+                    update_dns_record "$NAME" "$CONTENT" "$TYPE" "$REC_TTL" "$REC_PROXIED"
+                  fi
+                done
+              fi
 
-        | Record | Content |
-        |--------|---------|
-        | \`${{ inputs.record-name }}\` | \`${{ inputs.record-content }}\` |
+              echo ""
+              echo "updated=true" >> $GITHUB_OUTPUT
+              echo "records_updated=$RECORDS_UPDATED" >> $GITHUB_OUTPUT
+              echo "✅ DNS update complete"
 
-        **Type:** ${{ inputs.record-type }}
-        **TTL:** ${{ inputs.ttl }}
-        **Proxied:** ${{ inputs.proxied }}
-        **Records Updated:** ${{ steps.update.outputs.records_updated }}
-        EOF
+        - name: 📋 Generate Summary
+          shell: bash
+          run: |
+              cat >> $GITHUB_STEP_SUMMARY << EOF
+              ## 🌐 Cloudflare DNS Update
+
+              | Record | Content |
+              |--------|---------|
+              | \`${{ inputs.record-name }}\` | \`${{ inputs.record-content }}\` |
+
+              **Type:** ${{ inputs.record-type }}
+              **TTL:** ${{ inputs.ttl }}
+              **Proxied:** ${{ inputs.proxied }}
+              **Records Updated:** ${{ steps.update.outputs.records_updated }}
+              EOF
