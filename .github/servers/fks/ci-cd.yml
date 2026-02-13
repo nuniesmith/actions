@@ -48,7 +48,7 @@ on:
                 type: boolean
                 default: false
             skip_tests:
-                description: "Skip Rust & KMP tests (faster deploys)"
+                description: "Skip all Rust tests including ML/Backward crates (faster deploys)"
                 required: false
                 type: boolean
                 default: true
@@ -202,26 +202,27 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 60
         needs: [setup]
-        if: false # TODO: re-enable tests — disabled to speed up prod deploys
+        if: ${{ !inputs.skip_tests }}
+        env:
+            # Reduce build parallelism to avoid OOM on CI runners
+            CARGO_BUILD_JOBS: 4
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
-
-            - name: 📦 Install protoc
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y protobuf-compiler
 
             - name: 🦀 Run Rust CI
               uses: nuniesmith/actions/.github/actions/rust-ci@main
               with:
                   toolchain: ${{ env.RUST_VERSION }}
                   components: clippy, rustfmt
+                  install-protobuf: "true"
                   run-fmt: "true"
                   run-clippy: "true"
                   run-tests: "true"
                   run-build: "false"
                   workspace: "true"
+                  all-features: "true"
+                  clippy-args: "-D warnings"
 
     test-kmp:
         name: 📱 KMP Tests
@@ -305,10 +306,11 @@ jobs:
         name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup, docker-build]
+        needs: [setup, test-rust, docker-build]
         if: |
             always() &&
             needs.setup.result == 'success' &&
+            (needs.test-rust.result == 'success' || needs.test-rust.result == 'skipped') &&
             (needs.docker-build.result == 'success' || needs.docker-build.result == 'skipped') &&
             github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
