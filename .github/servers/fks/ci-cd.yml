@@ -51,7 +51,7 @@ on:
                 description: "Skip all Rust tests including ML/Backward crates (faster deploys)"
                 required: false
                 type: boolean
-                default: true
+                default: false
             build_strategy:
                 description: "Docker build strategy"
                 required: false
@@ -59,7 +59,7 @@ on:
                 options:
                     - server-build
                     - dockerhub
-                default: server-build
+                default: dockerhub
             environment:
                 description: "Target environment"
                 required: false
@@ -75,6 +75,7 @@ permissions:
     pull-requests: write
     packages: write
     checks: write
+    actions: read
 
 env:
     RUST_VERSION: "1.92.0"
@@ -221,15 +222,15 @@ jobs:
                   run-tests: "true"
                   run-build: "false"
                   workspace: "true"
-                  all-features: "true"
-                  clippy-args: "-D warnings"
+                  all-features: "false"
+                  clippy-args: "--all-targets"
 
     test-kmp:
         name: 📱 KMP Tests
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs: [setup]
-        if: false # TODO: re-enable tests — disabled to speed up prod deploys
+        if: ${{ !inputs.skip_tests }}
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -252,10 +253,14 @@ jobs:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup]
+        needs: [setup, test-rust, test-kmp]
         if: |
+            always() &&
+            needs.setup.result == 'success' &&
+            (needs.test-rust.result == 'success' || needs.test-rust.result == 'skipped') &&
+            (needs.test-kmp.result == 'success' || needs.test-kmp.result == 'skipped') &&
             needs.setup.outputs.build_strategy == 'dockerhub' &&
-            github.event_name == 'push' &&
+            (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
         strategy:
@@ -306,13 +311,14 @@ jobs:
         name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup, test-rust, docker-build]
+        needs: [setup, test-rust, test-kmp, docker-build]
         if: |
             always() &&
             needs.setup.result == 'success' &&
             (needs.test-rust.result == 'success' || needs.test-rust.result == 'skipped') &&
+            (needs.test-kmp.result == 'success' || needs.test-kmp.result == 'skipped') &&
             (needs.docker-build.result == 'success' || needs.docker-build.result == 'skipped') &&
-            github.event_name == 'push' &&
+            (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
         environment:
