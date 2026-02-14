@@ -317,7 +317,7 @@ jobs:
             needs.setup.result == 'success' &&
             (needs.test-rust.result == 'success' || needs.test-rust.result == 'skipped') &&
             (needs.test-kmp.result == 'success' || needs.test-kmp.result == 'skipped') &&
-            (needs.docker-build.result == 'success' || needs.docker-build.result == 'skipped') &&
+            (needs.docker-build.result == 'success' || (needs.docker-build.result == 'skipped' && needs.setup.outputs.build_strategy != 'dockerhub')) &&
             (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
             !inputs.skip_deploy
