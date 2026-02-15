@@ -1,0 +1,570 @@
+name: "LaTeX Lint"
+description: "Run LaTeX quality checks using chktex, lacheck, and custom validation rules"
+author: "nuniesmith"
+
+branding:
+    icon: "check-square"
+    color: "yellow"
+
+inputs:
+    working-directory:
+        description: "Root directory to search for .tex files"
+        required: false
+        default: "."
+    run-chktex:
+        description: "Run chktex linter"
+        required: false
+        default: "true"
+    run-lacheck:
+        description: "Run lacheck linter"
+        required: false
+        default: "true"
+    run-custom-checks:
+        description: "Run custom validation rules (TODO detection, long lines, encoding, etc.)"
+        required: false
+        default: "true"
+    chktex-args:
+        description: "Additional arguments to pass to chktex"
+        required: false
+        default: ""
+    chktex-warnings-as-errors:
+        description: "Treat chktex warnings as errors (fail the step)"
+        required: false
+        default: "false"
+    chktex-nowarn:
+        description: "Comma-separated list of chktex warning numbers to suppress (e.g. '1,24,36')"
+        required: false
+        default: ""
+    max-line-length:
+        description: "Maximum line length to flag (0 to disable)"
+        required: false
+        default: "0"
+    check-encoding:
+        description: "Verify all .tex files are valid UTF-8"
+        required: false
+        default: "true"
+    check-todos:
+        description: "Report TODO/FIXME/HACK/XXX comments in .tex files"
+        required: false
+        default: "true"
+    check-bibliography:
+        description: "Validate bibliography references and .bib file syntax"
+        required: false
+        default: "true"
+    exclude-pattern:
+        description: "Regex pattern for file paths to exclude from linting"
+        required: false
+        default: ""
+    fail-on-warnings:
+        description: "Fail the action if any warnings are found across all linters"
+        required: false
+        default: "false"
+
+outputs:
+    chktex-result:
+        description: "Result of chktex (success/warning/failure/skipped)"
+        value: ${{ steps.chktex.outputs.result || steps.chktex-skip.outputs.result }}
+    lacheck-result:
+        description: "Result of lacheck (success/warning/failure/skipped)"
+        value: ${{ steps.lacheck.outputs.result || steps.lacheck-skip.outputs.result }}
+    custom-result:
+        description: "Result of custom checks (success/warning/failure/skipped)"
+        value: ${{ steps.custom-checks.outputs.result || steps.custom-skip.outputs.result }}
+    total-warnings:
+        description: "Total number of warnings across all linters"
+        value: ${{ steps.summary.outputs.total-warnings }}
+    total-errors:
+        description: "Total number of errors across all linters"
+        value: ${{ steps.summary.outputs.total-errors }}
+    files-checked:
+        description: "Number of .tex files checked"
+        value: ${{ steps.discover.outputs.file-count }}
+
+runs:
+    using: "composite"
+    steps:
+        - name: 🔍 Discover LaTeX files
+          id: discover
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🔍 Searching for .tex files in ${{ inputs.working-directory }}..."
+
+              EXCLUDE="${{ inputs.exclude-pattern }}"
+              TEX_FILES_LIST=$(mktemp)
+
+              if [ -n "$EXCLUDE" ]; then
+                find . -name "*.tex" -type f ! -path "*/\.*" \
+                  | grep -v -E "$EXCLUDE" \
+                  | sort > "$TEX_FILES_LIST"
+              else
+                find . -name "*.tex" -type f ! -path "*/\.*" \
+                  | sort > "$TEX_FILES_LIST"
+              fi
+
+              FILE_COUNT=$(wc -l < "$TEX_FILES_LIST" | tr -d ' ')
+
+              if [ "$FILE_COUNT" -eq 0 ]; then
+                echo "⚠️  No .tex files found"
+                echo "file-count=0" >> $GITHUB_OUTPUT
+                echo "tex-files=" >> $GITHUB_OUTPUT
+              else
+                echo "📄 Found $FILE_COUNT .tex file(s):"
+                cat "$TEX_FILES_LIST" | sed 's/^/  /'
+                echo "file-count=$FILE_COUNT" >> $GITHUB_OUTPUT
+
+                # Store as newline-separated for later steps
+                {
+                  echo "tex-files<<TEXEOF"
+                  cat "$TEX_FILES_LIST"
+                  echo "TEXEOF"
+                } >> $GITHUB_OUTPUT
+              fi
+
+              # Also identify main documents (contain \documentclass)
+              MAIN_COUNT=0
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                if grep -q '\\documentclass' "$f" 2>/dev/null; then
+                  MAIN_COUNT=$((MAIN_COUNT + 1))
+                  echo "  📘 Main document: $f"
+                fi
+              done < "$TEX_FILES_LIST"
+              echo "main-count=$MAIN_COUNT" >> $GITHUB_OUTPUT
+
+              rm -f "$TEX_FILES_LIST"
+
+        - name: ✨ Run chktex
+          id: chktex
+          if: inputs.run-chktex == 'true' && steps.discover.outputs.file-count != '0'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "✨ Running chktex..."
+
+              if ! command -v chktex &>/dev/null; then
+                echo "❌ chktex not found. Install it via latex-setup action with install-chktex: true"
+                echo "result=failure" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+
+              CHKTEX_ARGS="-q"
+
+              # Build nowarn flags
+              NOWARN="${{ inputs.chktex-nowarn }}"
+              if [ -n "$NOWARN" ]; then
+                IFS=',' read -ra WARNINGS <<< "$NOWARN"
+                for w in "${WARNINGS[@]}"; do
+                  w=$(echo "$w" | tr -d ' ')
+                  CHKTEX_ARGS="$CHKTEX_ARGS -n$w"
+                done
+              fi
+
+              # Append user-provided args
+              USER_ARGS="${{ inputs.chktex-args }}"
+              if [ -n "$USER_ARGS" ]; then
+                CHKTEX_ARGS="$CHKTEX_ARGS $USER_ARGS"
+              fi
+
+              TOTAL_WARNINGS=0
+              TOTAL_ERRORS=0
+              FILES_WITH_ISSUES=0
+              OUTPUT_FILE=$(mktemp)
+
+              while IFS= read -r tex_file; do
+                [ -z "$tex_file" ] && continue
+
+                # Run chktex and capture output
+                if RESULT=$(chktex $CHKTEX_ARGS "$tex_file" 2>&1); then
+                  : # clean file
+                else
+                  : # chktex returns non-zero on warnings
+                fi
+
+                if [ -n "$RESULT" ]; then
+                  echo "$RESULT" >> "$OUTPUT_FILE"
+                  FILES_WITH_ISSUES=$((FILES_WITH_ISSUES + 1))
+
+                  # Count warnings and errors from chktex output
+                  FILE_WARNINGS=$(echo "$RESULT" | grep -c "Warning" 2>/dev/null || true)
+                  FILE_ERRORS=$(echo "$RESULT" | grep -c "Error" 2>/dev/null || true)
+                  TOTAL_WARNINGS=$((TOTAL_WARNINGS + FILE_WARNINGS))
+                  TOTAL_ERRORS=$((TOTAL_ERRORS + FILE_ERRORS))
+
+                  echo "  ⚠️  $tex_file: $FILE_WARNINGS warning(s), $FILE_ERRORS error(s)"
+                fi
+              done <<< "${{ steps.discover.outputs.tex-files }}"
+
+              echo ""
+              echo "chktex-warnings=$TOTAL_WARNINGS" >> $GITHUB_OUTPUT
+              echo "chktex-errors=$TOTAL_ERRORS" >> $GITHUB_OUTPUT
+
+              if [ "$TOTAL_ERRORS" -gt 0 ]; then
+                echo "❌ chktex: $TOTAL_ERRORS error(s), $TOTAL_WARNINGS warning(s) in $FILES_WITH_ISSUES file(s)"
+                cat "$OUTPUT_FILE"
+                echo "result=failure" >> $GITHUB_OUTPUT
+                rm -f "$OUTPUT_FILE"
+                exit 1
+              elif [ "$TOTAL_WARNINGS" -gt 0 ]; then
+                echo "⚠️  chktex: $TOTAL_WARNINGS warning(s) in $FILES_WITH_ISSUES file(s)"
+                cat "$OUTPUT_FILE"
+                if [ "${{ inputs.chktex-warnings-as-errors }}" = "true" ]; then
+                  echo "result=failure" >> $GITHUB_OUTPUT
+                  rm -f "$OUTPUT_FILE"
+                  exit 1
+                fi
+                echo "result=warning" >> $GITHUB_OUTPUT
+              else
+                echo "✅ chktex: all files clean"
+                echo "result=success" >> $GITHUB_OUTPUT
+              fi
+
+              rm -f "$OUTPUT_FILE"
+
+        - name: ⏭ Skip chktex
+          id: chktex-skip
+          if: inputs.run-chktex != 'true' || steps.discover.outputs.file-count == '0'
+          shell: bash
+          run: echo "result=skipped" >> $GITHUB_OUTPUT
+
+        - name: 🔎 Run lacheck
+          id: lacheck
+          if: inputs.run-lacheck == 'true' && steps.discover.outputs.file-count != '0'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🔎 Running lacheck..."
+
+              if ! command -v lacheck &>/dev/null; then
+                echo "⚠️  lacheck not found — skipping (install texlive-latex-extra for lacheck)"
+                echo "result=skipped" >> $GITHUB_OUTPUT
+                echo "lacheck-warnings=0" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+
+              TOTAL_WARNINGS=0
+              FILES_WITH_ISSUES=0
+              OUTPUT_FILE=$(mktemp)
+
+              # lacheck only works on main documents (with \documentclass)
+              while IFS= read -r tex_file; do
+                [ -z "$tex_file" ] && continue
+
+                # Only run on main documents
+                if ! grep -q '\\documentclass' "$tex_file" 2>/dev/null; then
+                  continue
+                fi
+
+                RESULT=$(lacheck "$tex_file" 2>&1 || true)
+
+                if [ -n "$RESULT" ]; then
+                  echo "$RESULT" >> "$OUTPUT_FILE"
+                  FILES_WITH_ISSUES=$((FILES_WITH_ISSUES + 1))
+                  FILE_WARNINGS=$(echo "$RESULT" | wc -l | tr -d ' ')
+                  TOTAL_WARNINGS=$((TOTAL_WARNINGS + FILE_WARNINGS))
+                  echo "  ⚠️  $tex_file: $FILE_WARNINGS issue(s)"
+                fi
+              done <<< "${{ steps.discover.outputs.tex-files }}"
+
+              echo "lacheck-warnings=$TOTAL_WARNINGS" >> $GITHUB_OUTPUT
+
+              if [ "$TOTAL_WARNINGS" -gt 0 ]; then
+                echo "⚠️  lacheck: $TOTAL_WARNINGS warning(s) in $FILES_WITH_ISSUES file(s)"
+                cat "$OUTPUT_FILE"
+                echo "result=warning" >> $GITHUB_OUTPUT
+              else
+                echo "✅ lacheck: all main documents clean"
+                echo "result=success" >> $GITHUB_OUTPUT
+              fi
+
+              rm -f "$OUTPUT_FILE"
+
+        - name: ⏭ Skip lacheck
+          id: lacheck-skip
+          if: inputs.run-lacheck != 'true' || steps.discover.outputs.file-count == '0'
+          shell: bash
+          run: echo "result=skipped" >> $GITHUB_OUTPUT
+
+        - name: 🛠 Run custom checks
+          id: custom-checks
+          if: inputs.run-custom-checks == 'true' && steps.discover.outputs.file-count != '0'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🛠 Running custom validation checks..."
+              echo ""
+
+              TOTAL_WARNINGS=0
+              TOTAL_ERRORS=0
+
+              # ── Check 1: UTF-8 encoding ──────────────────────────────────
+              if [ "${{ inputs.check-encoding }}" = "true" ]; then
+                echo "📝 Checking file encoding..."
+                ENCODING_ISSUES=0
+
+                while IFS= read -r tex_file; do
+                  [ -z "$tex_file" ] && continue
+                  if ! iconv -f UTF-8 -t UTF-8 "$tex_file" > /dev/null 2>&1; then
+                    echo "  ❌ $tex_file: not valid UTF-8"
+                    ENCODING_ISSUES=$((ENCODING_ISSUES + 1))
+                  fi
+                done <<< "${{ steps.discover.outputs.tex-files }}"
+
+                if [ "$ENCODING_ISSUES" -gt 0 ]; then
+                  echo "  ❌ $ENCODING_ISSUES file(s) with encoding issues"
+                  TOTAL_ERRORS=$((TOTAL_ERRORS + ENCODING_ISSUES))
+                else
+                  echo "  ✅ All files are valid UTF-8"
+                fi
+                echo ""
+              fi
+
+              # ── Check 2: TODO/FIXME markers ──────────────────────────────
+              if [ "${{ inputs.check-todos }}" = "true" ]; then
+                echo "📌 Checking for TODO/FIXME markers..."
+                TODO_COUNT=0
+                TODO_OUTPUT=$(mktemp)
+
+                while IFS= read -r tex_file; do
+                  [ -z "$tex_file" ] && continue
+                  MATCHES=$(grep -n -i -E '(TODO|FIXME|HACK|XXX)\b' "$tex_file" 2>/dev/null || true)
+                  if [ -n "$MATCHES" ]; then
+                    FILE_MATCHES=$(echo "$MATCHES" | wc -l | tr -d ' ')
+                    TODO_COUNT=$((TODO_COUNT + FILE_MATCHES))
+                    echo "  📌 $tex_file:" >> "$TODO_OUTPUT"
+                    echo "$MATCHES" | sed 's/^/     /' >> "$TODO_OUTPUT"
+                  fi
+                done <<< "${{ steps.discover.outputs.tex-files }}"
+
+                if [ "$TODO_COUNT" -gt 0 ]; then
+                  echo "  ⚠️  Found $TODO_COUNT TODO/FIXME marker(s):"
+                  cat "$TODO_OUTPUT"
+                  TOTAL_WARNINGS=$((TOTAL_WARNINGS + TODO_COUNT))
+                else
+                  echo "  ✅ No TODO/FIXME markers found"
+                fi
+                rm -f "$TODO_OUTPUT"
+                echo ""
+              fi
+
+              # ── Check 3: Line length ─────────────────────────────────────
+              MAX_LEN="${{ inputs.max-line-length }}"
+              if [ "$MAX_LEN" != "0" ] && [ -n "$MAX_LEN" ]; then
+                echo "📏 Checking line lengths (max: $MAX_LEN)..."
+                LONG_LINES=0
+
+                while IFS= read -r tex_file; do
+                  [ -z "$tex_file" ] && continue
+                  MATCHES=$(awk -v max="$MAX_LEN" 'length > max {printf "  %s:%d: %d chars\n", FILENAME, NR, length}' "$tex_file" 2>/dev/null || true)
+                  if [ -n "$MATCHES" ]; then
+                    FILE_LONG=$(echo "$MATCHES" | wc -l | tr -d ' ')
+                    LONG_LINES=$((LONG_LINES + FILE_LONG))
+                    echo "$MATCHES"
+                  fi
+                done <<< "${{ steps.discover.outputs.tex-files }}"
+
+                if [ "$LONG_LINES" -gt 0 ]; then
+                  echo "  ⚠️  $LONG_LINES line(s) exceed $MAX_LEN characters"
+                  TOTAL_WARNINGS=$((TOTAL_WARNINGS + LONG_LINES))
+                else
+                  echo "  ✅ All lines within $MAX_LEN characters"
+                fi
+                echo ""
+              fi
+
+              # ── Check 4: Bibliography validation ─────────────────────────
+              if [ "${{ inputs.check-bibliography }}" = "true" ]; then
+                echo "📚 Checking bibliography references..."
+                BIB_WARNINGS=0
+
+                # Find all .bib files
+                BIB_FILES=$(find . -name "*.bib" -type f ! -path "*/\.*" 2>/dev/null || true)
+
+                if [ -n "$BIB_FILES" ]; then
+                  while IFS= read -r bib_file; do
+                    [ -z "$bib_file" ] && continue
+
+                    # Check for empty required fields in bib entries
+                    EMPTY_FIELDS=$(grep -n -E '^\s*(title|author|year)\s*=\s*\{\s*\}' "$bib_file" 2>/dev/null || true)
+                    if [ -n "$EMPTY_FIELDS" ]; then
+                      FIELD_COUNT=$(echo "$EMPTY_FIELDS" | wc -l | tr -d ' ')
+                      BIB_WARNINGS=$((BIB_WARNINGS + FIELD_COUNT))
+                      echo "  ⚠️  $bib_file: $FIELD_COUNT empty required field(s)"
+                      echo "$EMPTY_FIELDS" | sed 's/^/     /'
+                    fi
+
+                    # Check for duplicate citation keys
+                    KEYS=$(grep -o -E '^\s*@\w+\{([^,]+),' "$bib_file" 2>/dev/null | sed 's/.*{\(.*\),/\1/' | sort || true)
+                    DUPES=$(echo "$KEYS" | uniq -d 2>/dev/null || true)
+                    if [ -n "$DUPES" ]; then
+                      DUPE_COUNT=$(echo "$DUPES" | wc -l | tr -d ' ')
+                      BIB_WARNINGS=$((BIB_WARNINGS + DUPE_COUNT))
+                      echo "  ⚠️  $bib_file: $DUPE_COUNT duplicate citation key(s):"
+                      echo "$DUPES" | sed 's/^/     /'
+                    fi
+                  done <<< "$BIB_FILES"
+
+                  # Check for unused citations (cited in .tex but not in .bib, or vice versa)
+                  ALL_BIB_KEYS=$(mktemp)
+                  ALL_CITE_KEYS=$(mktemp)
+
+                  while IFS= read -r bib_file; do
+                    [ -z "$bib_file" ] && continue
+                    grep -o -E '^\s*@\w+\{([^,]+),' "$bib_file" 2>/dev/null \
+                      | sed 's/.*{\(.*\),/\1/' >> "$ALL_BIB_KEYS" || true
+                  done <<< "$BIB_FILES"
+
+                  while IFS= read -r tex_file; do
+                    [ -z "$tex_file" ] && continue
+                    # Match \cite{key}, \citep{key}, \citet{key}, \parencite{key}, \textcite{key}, etc.
+                    grep -o -E '\\(cite[pt]?|[Pp]arencite|[Tt]extcite|[Aa]utocite|[Ff]ullcite|[Nn]ocite)\*?\{[^}]+\}' "$tex_file" 2>/dev/null \
+                      | sed 's/.*{\(.*\)}/\1/' \
+                      | tr ',' '\n' \
+                      | sed 's/^[[:space:]]*//' \
+                      | sed 's/[[:space:]]*$//' >> "$ALL_CITE_KEYS" || true
+                  done <<< "${{ steps.discover.outputs.tex-files }}"
+
+                  sort -u "$ALL_BIB_KEYS" -o "$ALL_BIB_KEYS"
+                  sort -u "$ALL_CITE_KEYS" -o "$ALL_CITE_KEYS"
+
+                  # Keys cited but not in .bib
+                  MISSING=$(comm -23 "$ALL_CITE_KEYS" "$ALL_BIB_KEYS" 2>/dev/null | grep -v '^$' || true)
+                  if [ -n "$MISSING" ]; then
+                    MISS_COUNT=$(echo "$MISSING" | wc -l | tr -d ' ')
+                    BIB_WARNINGS=$((BIB_WARNINGS + MISS_COUNT))
+                    echo "  ⚠️  $MISS_COUNT citation(s) referenced but not found in .bib files:"
+                    echo "$MISSING" | sed 's/^/     /'
+                  fi
+
+                  # Keys in .bib but never cited (informational only)
+                  UNUSED=$(comm -13 "$ALL_CITE_KEYS" "$ALL_BIB_KEYS" 2>/dev/null | grep -v '^$' || true)
+                  if [ -n "$UNUSED" ]; then
+                    UNUSED_COUNT=$(echo "$UNUSED" | wc -l | tr -d ' ')
+                    echo "  ℹ️  $UNUSED_COUNT bib entry/entries not cited (informational):"
+                    echo "$UNUSED" | sed 's/^/     /'
+                  fi
+
+                  rm -f "$ALL_BIB_KEYS" "$ALL_CITE_KEYS"
+
+                  if [ "$BIB_WARNINGS" -eq 0 ]; then
+                    echo "  ✅ Bibliography checks passed"
+                  fi
+                  TOTAL_WARNINGS=$((TOTAL_WARNINGS + BIB_WARNINGS))
+                else
+                  echo "  ⏭  No .bib files found — skipping bibliography checks"
+                fi
+                echo ""
+              fi
+
+              # ── Check 5: Common LaTeX issues ─────────────────────────────
+              echo "🔬 Checking for common LaTeX issues..."
+              ISSUE_COUNT=0
+
+              while IFS= read -r tex_file; do
+                [ -z "$tex_file" ] && continue
+
+                # Check for $$ (should use \[ \] or equation environment)
+                DOUBLE_DOLLAR=$(grep -n -c '\$\$' "$tex_file" 2>/dev/null || true)
+                if [ "${DOUBLE_DOLLAR:-0}" -gt 0 ]; then
+                  echo "  ⚠️  $tex_file: $DOUBLE_DOLLAR use(s) of \$\$ (prefer \\[ \\] or equation environment)"
+                  ISSUE_COUNT=$((ISSUE_COUNT + DOUBLE_DOLLAR))
+                fi
+
+                # Check for \def (should use \newcommand or \renewcommand)
+                DEF_USAGE=$(grep -n -c '\\def\\' "$tex_file" 2>/dev/null || true)
+                if [ "${DEF_USAGE:-0}" -gt 0 ]; then
+                  echo "  ⚠️  $tex_file: $DEF_USAGE use(s) of \\def (prefer \\newcommand)"
+                  ISSUE_COUNT=$((ISSUE_COUNT + DEF_USAGE))
+                fi
+
+                # Check for trailing whitespace in critical environments
+                TRAILING=$(grep -n -E '[[:space:]]+$' "$tex_file" 2>/dev/null | wc -l | tr -d ' ')
+                if [ "${TRAILING:-0}" -gt 10 ]; then
+                  echo "  ℹ️  $tex_file: $TRAILING line(s) with trailing whitespace"
+                fi
+
+              done <<< "${{ steps.discover.outputs.tex-files }}"
+
+              TOTAL_WARNINGS=$((TOTAL_WARNINGS + ISSUE_COUNT))
+
+              if [ "$ISSUE_COUNT" -eq 0 ]; then
+                echo "  ✅ No common LaTeX issues found"
+              fi
+              echo ""
+
+              # ── Results ──────────────────────────────────────────────────
+              echo "custom-warnings=$TOTAL_WARNINGS" >> $GITHUB_OUTPUT
+              echo "custom-errors=$TOTAL_ERRORS" >> $GITHUB_OUTPUT
+
+              if [ "$TOTAL_ERRORS" -gt 0 ]; then
+                echo "result=failure" >> $GITHUB_OUTPUT
+                exit 1
+              elif [ "$TOTAL_WARNINGS" -gt 0 ]; then
+                echo "result=warning" >> $GITHUB_OUTPUT
+              else
+                echo "result=success" >> $GITHUB_OUTPUT
+              fi
+
+        - name: ⏭ Skip custom checks
+          id: custom-skip
+          if: inputs.run-custom-checks != 'true' || steps.discover.outputs.file-count == '0'
+          shell: bash
+          run: echo "result=skipped" >> $GITHUB_OUTPUT
+
+        - name: 📊 Lint Summary
+          id: summary
+          if: always()
+          shell: bash
+          run: |
+              CHKTEX_W="${{ steps.chktex.outputs.chktex-warnings || '0' }}"
+              CHKTEX_E="${{ steps.chktex.outputs.chktex-errors || '0' }}"
+              LACHECK_W="${{ steps.lacheck.outputs.lacheck-warnings || '0' }}"
+              CUSTOM_W="${{ steps.custom-checks.outputs.custom-warnings || '0' }}"
+              CUSTOM_E="${{ steps.custom-checks.outputs.custom-errors || '0' }}"
+
+              TOTAL_W=$((${CHKTEX_W:-0} + ${LACHECK_W:-0} + ${CUSTOM_W:-0}))
+              TOTAL_E=$((${CHKTEX_E:-0} + ${CUSTOM_E:-0}))
+
+              echo "total-warnings=$TOTAL_W" >> $GITHUB_OUTPUT
+              echo "total-errors=$TOTAL_E" >> $GITHUB_OUTPUT
+
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📊 LaTeX Lint Summary"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo ""
+              echo "| Check         | Result                                                               |"
+              echo "|---------------|----------------------------------------------------------------------|"
+              echo "| chktex        | ${{ steps.chktex.outputs.result || steps.chktex-skip.outputs.result }}  |"
+              echo "| lacheck       | ${{ steps.lacheck.outputs.result || steps.lacheck-skip.outputs.result }}  |"
+              echo "| Custom checks | ${{ steps.custom-checks.outputs.result || steps.custom-skip.outputs.result }}  |"
+              echo ""
+              echo "📄 Files checked: ${{ steps.discover.outputs.file-count }}"
+              echo "⚠️  Total warnings: $TOTAL_W"
+              echo "❌ Total errors: $TOTAL_E"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+              # Write step summary
+              {
+                echo "## ✨ LaTeX Lint Results"
+                echo ""
+                echo "| Linter | Result |"
+                echo "|--------|--------|"
+                echo "| chktex | ${{ steps.chktex.outputs.result || steps.chktex-skip.outputs.result }} |"
+                echo "| lacheck | ${{ steps.lacheck.outputs.result || steps.lacheck-skip.outputs.result }} |"
+                echo "| Custom checks | ${{ steps.custom-checks.outputs.result || steps.custom-skip.outputs.result }} |"
+                echo ""
+                echo "**Files checked:** ${{ steps.discover.outputs.file-count }} · **Warnings:** $TOTAL_W · **Errors:** $TOTAL_E"
+              } >> $GITHUB_STEP_SUMMARY
+
+              # Fail if configured to fail on warnings
+              if [ "${{ inputs.fail-on-warnings }}" = "true" ] && [ "$TOTAL_W" -gt 0 ]; then
+                echo ""
+                echo "❌ Failing due to $TOTAL_W warning(s) (fail-on-warnings is enabled)"
+                exit 1
+              fi
+
+              if [ "$TOTAL_E" -gt 0 ]; then
+                echo ""
+                echo "❌ Failing due to $TOTAL_E error(s)"
+                exit 1
+              fi

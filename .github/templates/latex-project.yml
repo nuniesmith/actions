@@ -1,0 +1,467 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# 📄 LaTeX Project CI/CD Template
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Complete CI/CD pipeline for LaTeX-based projects (papers, theses, books).
+#
+# Features:
+#   - LaTeX linting with chktex, lacheck, and custom checks
+#   - Multi-engine support (pdflatex, xelatex, lualatex)
+#   - Auto-detection of bibliography engine (biber vs bibtex)
+#   - TeX Live caching for faster builds
+#   - PDF artifact upload and optional commit-back
+#   - Optional Python testing for companion code
+#   - Discord notifications
+#
+# Quick Start:
+#   1. Copy this file to .github/workflows/ci-cd.yml
+#   2. Edit the env: section below for your project
+#   3. Add required secrets (see bottom of file)
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: 📄 CI/CD Pipeline
+
+on:
+    push:
+        branches:
+            - main
+        paths-ignore:
+            - "*.md"
+            - "LICENSE"
+            - ".gitignore"
+    pull_request:
+        branches:
+            - main
+    workflow_dispatch:
+        inputs:
+            skip_tests:
+                description: "Skip Python tests"
+                required: false
+                type: boolean
+                default: false
+            skip_lint:
+                description: "Skip LaTeX linting"
+                required: false
+                type: boolean
+                default: false
+            latex_engine:
+                description: "LaTeX engine override"
+                required: false
+                type: choice
+                options:
+                    - pdflatex
+                    - xelatex
+                    - lualatex
+                default: pdflatex
+
+env:
+    # ── Project settings ───────────────────────────────────────────────────
+    PROJECT_NAME: my-latex-project
+
+    # ── LaTeX settings ─────────────────────────────────────────────────────
+    LATEX_ENGINE: "pdflatex" # pdflatex, xelatex, lualatex
+    LATEX_SCHEME: "custom" # small, medium, full, custom
+    BIB_ENGINE: "auto" # auto, biber, bibtex
+    COMPILE_PASSES: "3" # 2–5 passes for cross-refs
+    SHELL_ESCAPE: "false" # Enable for minted, tikz externalize
+    USE_LATEXMK: "false" # Use latexmk instead of multi-pass
+    COMMIT_PDFS: "true" # Auto-commit PDFs on main push
+
+    # ── Linting settings ───────────────────────────────────────────────────
+    RUN_LINT: "true" # Run LaTeX linting stage
+    RUN_CHKTEX: "true"
+    RUN_LACHECK: "true"
+    CHKTEX_NOWARN: "1,24,36,44" # Suppress noisy warnings
+    LINT_FAIL_ON_WARNINGS: "false" # Treat lint warnings as errors
+
+    # ── Python settings (leave empty to skip) ──────────────────────────────
+    PYTHON_VERSION: "" # e.g. "3.12" — empty skips Python tests
+    PYTHON_VERSIONS: "" # e.g. '["3.10", "3.11", "3.12"]'
+    PYTHON_PACKAGE: "" # Package name for coverage (e.g. "my_package")
+
+    # ── Docker settings (leave empty to skip) ──────────────────────────────
+    DOCKER_IMAGE: ""
+
+    # ── Deployment settings ────────────────────────────────────────────────
+    DEPLOY_PATH: "" # e.g. ~/my-project
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: write
+    pull-requests: write
+    checks: write
+
+defaults:
+    run:
+        shell: bash
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Jobs
+# ══════════════════════════════════════════════════════════════════════════════
+
+jobs:
+    # ── Lint LaTeX ─────────────────────────────────────────────────────────
+    lint-latex:
+        name: ✨ Lint LaTeX
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        if: ${{ !inputs.skip_lint }}
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 📣 Notify lint started
+              if: ${{ secrets.DISCORD_WEBHOOK != '' }}
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+                  title: "✨ LaTeX Lint Started"
+                  description: "Running LaTeX quality checks..."
+                  status: started
+                  include-repo-info: "true"
+
+            - name: 📦 Setup TeX Live
+              uses: nuniesmith/actions/.github/actions/latex-setup@main
+              with:
+                  scheme: ${{ env.LATEX_SCHEME }}
+                  install-biber: "true"
+                  install-chktex: "true"
+                  install-latexmk: "false"
+                  cache-enabled: "true"
+                  cache-key-suffix: "lint"
+
+            - name: ✨ Lint LaTeX files
+              uses: nuniesmith/actions/.github/actions/latex-lint@main
+              with:
+                  working-directory: "."
+                  run-chktex: ${{ env.RUN_CHKTEX }}
+                  run-lacheck: ${{ env.RUN_LACHECK }}
+                  run-custom-checks: "true"
+                  chktex-warnings-as-errors: "false"
+                  chktex-nowarn: ${{ env.CHKTEX_NOWARN }}
+                  check-encoding: "true"
+                  check-todos: "true"
+                  check-bibliography: "true"
+                  fail-on-warnings: ${{ env.LINT_FAIL_ON_WARNINGS }}
+
+    # ── Test Python (optional) ─────────────────────────────────────────────
+    test-python:
+        name: 🧪 Test Python (${{ matrix.python-version }})
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        if: ${{ !inputs.skip_tests && vars.PYTHON_VERSION != '' }}
+        strategy:
+            fail-fast: false
+            matrix:
+                python-version: ${{ fromJson(vars.PYTHON_VERSIONS || '["3.12"]') }}
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 🐍 Set up Python ${{ matrix.python-version }}
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ matrix.python-version }}
+                  cache: "pip"
+
+            - name: 📦 Install dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  if [ -f "requirements-dev.txt" ]; then
+                    pip install -r requirements-dev.txt
+                  elif [ -f "requirements.txt" ]; then
+                    pip install -r requirements.txt
+                  fi
+                  # Try editable install if setup.py/pyproject.toml exists
+                  if [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+                    pip install -e ".[dev]" 2>/dev/null || pip install -e "." 2>/dev/null || true
+                  fi
+
+            - name: 🧪 Run tests with coverage
+              run: |
+                  COV_PKG="${{ env.PYTHON_PACKAGE }}"
+                  if [ -n "$COV_PKG" ]; then
+                    pytest --cov="$COV_PKG" --cov-report=xml --cov-report=term
+                  else
+                    pytest
+                  fi
+
+            - name: 📊 Upload coverage to Codecov
+              if: ${{ env.PYTHON_PACKAGE != '' && matrix.python-version == env.PYTHON_VERSION && secrets.CODECOV_TOKEN != '' }}
+              uses: codecov/codecov-action@v5
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  files: ./coverage.xml
+                  flags: python-${{ matrix.python-version }}
+                  name: python-${{ matrix.python-version }}
+                  fail_ci_if_error: false
+
+    # ── Build LaTeX PDFs ───────────────────────────────────────────────────
+    build-latex:
+        name: 📄 Build LaTeX PDFs
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [lint-latex]
+        if: |
+            always() &&
+            (needs.lint-latex.result == 'success' || needs.lint-latex.result == 'skipped')
+        permissions:
+            contents: write
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 📦 Setup TeX Live
+              uses: nuniesmith/actions/.github/actions/latex-setup@main
+              with:
+                  scheme: ${{ env.LATEX_SCHEME }}
+                  install-biber: "true"
+                  install-chktex: "false"
+                  install-latexmk: ${{ env.USE_LATEXMK }}
+                  cache-enabled: "true"
+                  cache-key-suffix: "build"
+
+            - name: 🔨 Compile LaTeX documents
+              id: build
+              uses: nuniesmith/actions/.github/actions/latex-build@main
+              with:
+                  working-directory: "."
+                  engine: ${{ inputs.latex_engine || env.LATEX_ENGINE }}
+                  bib-engine: ${{ env.BIB_ENGINE }}
+                  compile-passes: ${{ env.COMPILE_PASSES }}
+                  interaction-mode: "nonstopmode"
+                  halt-on-error: "true"
+                  shell-escape: ${{ env.SHELL_ESCAPE }}
+                  clean-aux: "true"
+                  keep-log-on-failure: "true"
+                  latexmk: ${{ env.USE_LATEXMK }}
+                  fail-on-warnings: "false"
+
+            - name: 📦 List generated PDFs
+              run: |
+                  echo "📦 Generated PDFs:"
+                  find . -name "*.pdf" -type f ! -path "*/\.*" -exec ls -lh {} \;
+
+            - name: 📤 Upload PDF artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: latex-pdfs-${{ github.run_number }}
+                  path: "**/*.pdf"
+                  retention-days: 90
+
+            - name: 📝 Commit PDFs to repository
+              if: |
+                  env.COMMIT_PDFS == 'true' &&
+                  github.event_name == 'push' &&
+                  github.ref == 'refs/heads/main'
+              run: |
+                  git config --local user.email "github-actions[bot]@users.noreply.github.com"
+                  git config --local user.name "GitHub Actions"
+
+                  # Pull latest to avoid conflicts with concurrent runs
+                  git pull --rebase origin main || true
+
+                  # Add all PDFs
+                  find . -name "*.pdf" -type f ! -path "*/\.*" -exec git add -f {} \;
+
+                  # Commit only if there are staged changes
+                  if git diff --staged --quiet; then
+                    echo "ℹ️  No PDF changes to commit"
+                  else
+                    git commit -m "🤖 Auto-compile LaTeX PDFs [skip ci]" \
+                      -m "Built with ${{ inputs.latex_engine || env.LATEX_ENGINE }}" \
+                      -m "Commit: ${{ github.sha }}" \
+                      -m "PDFs compiled: ${{ steps.build.outputs.pdf-count }}"
+                    git push || echo "⚠️  Push failed — another commit may have landed"
+                  fi
+
+            - name: ✅ Notify build success
+              if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+                  title: "📄 LaTeX Build Complete"
+                  description: "${{ steps.build.outputs.pdf-count }} PDF(s) compiled successfully"
+                  status: success
+                  include-repo-info: "true"
+                  fields: '[{"name": "PDFs", "value": "${{ steps.build.outputs.pdf-count }}", "inline": true}, {"name": "Warnings", "value": "${{ steps.build.outputs.total-warnings }}", "inline": true}]'
+
+            - name: ❌ Notify build failed
+              if: ${{ failure() && secrets.DISCORD_WEBHOOK != '' }}
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+                  title: "📄 LaTeX Build Failed"
+                  description: "${{ steps.build.outputs.fail-count }} document(s) failed to compile"
+                  status: failure
+                  include-repo-info: "true"
+
+            - name: 📋 Build Summary
+              if: always()
+              run: |
+                  {
+                    echo "# 📄 LaTeX Build Results"
+                    echo ""
+                    echo "| Detail | Value |"
+                    echo "|--------|-------|"
+                    echo "| **Commit** | \`${{ github.sha }}\` |"
+                    echo "| **Branch** | \`${{ github.ref_name }}\` |"
+                    echo "| **Engine** | ${{ inputs.latex_engine || env.LATEX_ENGINE }} |"
+                    echo "| **PDFs built** | ${{ steps.build.outputs.pdf-count || '—' }} |"
+                    echo "| **Failures** | ${{ steps.build.outputs.fail-count || '—' }} |"
+                    echo "| **Warnings** | ${{ steps.build.outputs.total-warnings || '—' }} |"
+                    echo "| **Result** | ${{ steps.build.outputs.build-result || '—' }} |"
+                    echo ""
+                    echo "Download compiled PDFs from the **Artifacts** section above ⬆️"
+                  } >> $GITHUB_STEP_SUMMARY
+
+    # ── Docker (optional) ──────────────────────────────────────────────────
+    docker:
+        name: 🐳 Build Docker Image
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: [test-python, build-latex]
+        if: |
+            always() &&
+            needs.build-latex.result == 'success' &&
+            (needs.test-python.result == 'success' || needs.test-python.result == 'skipped')
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 🐳 Build and Push Docker Image
+              if: ${{ env.DOCKER_IMAGE != '' }}
+              uses: nuniesmith/actions/.github/actions/docker-build-push@main
+              with:
+                  image-name: ${{ env.DOCKER_IMAGE }}
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
+                  push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+            - name: 📝 Skip Docker (not configured)
+              if: ${{ env.DOCKER_IMAGE == '' }}
+              run: echo "Docker build skipped — DOCKER_IMAGE not configured"
+
+    # ── Deploy (optional) ──────────────────────────────────────────────────
+    deploy:
+        name: 🚀 Deploy
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        needs: [build-latex]
+        if: |
+            github.event_name == 'push' &&
+            github.ref == 'refs/heads/main' &&
+            needs.build-latex.result == 'success' &&
+            vars.ENABLE_DEPLOY == 'true'
+        environment:
+            name: production
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🚀 Deploy via SSH
+              uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+              with:
+                  host: ${{ secrets.PROD_TAILSCALE_IP }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  project-path: ${{ env.DEPLOY_PATH }}
+                  git-pull: "true"
+                  git-branch: main
+
+            - name: ✅ Notify deploy success
+              if: ${{ success() && secrets.DISCORD_WEBHOOK != '' }}
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+                  title: "🚀 Deployment Complete"
+                  description: "${{ env.PROJECT_NAME }} deployed successfully"
+                  status: success
+                  include-repo-info: "true"
+
+    # ── Pipeline Summary ──────────────────────────────────────────────────
+    summary:
+        name: 📊 Pipeline Summary
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        needs: [lint-latex, test-python, build-latex]
+        if: always()
+
+        steps:
+            - name: 📊 Generate summary
+              run: |
+                  {
+                    echo "# 🎉 CI Pipeline Summary"
+                    echo ""
+                    echo "| Job | Status |"
+                    echo "|-----|--------|"
+                    echo "| ✨ LaTeX Lint | \`${{ needs.lint-latex.result }}\` |"
+                    echo "| 🧪 Python Tests | \`${{ needs.test-python.result }}\` |"
+                    echo "| 📄 LaTeX Build | \`${{ needs.build-latex.result }}\` |"
+                    echo ""
+                    echo "**Commit:** \`${{ github.sha }}\`"
+                    echo "**Branch:** \`${{ github.ref_name }}\`"
+                    echo "**Triggered by:** \`${{ github.event_name }}\`"
+                  } >> $GITHUB_STEP_SUMMARY
+
+            - name: ❌ Fail if critical stages failed
+              if: |
+                  needs.lint-latex.result == 'failure' ||
+                  needs.test-python.result == 'failure' ||
+                  needs.build-latex.result == 'failure'
+              run: |
+                  echo "❌ One or more jobs failed:"
+                  echo "  LaTeX Lint:   ${{ needs.lint-latex.result }}"
+                  echo "  Python Tests: ${{ needs.test-python.result }}"
+                  echo "  LaTeX Build:  ${{ needs.build-latex.result }}"
+                  exit 1
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Required Secrets
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Minimum (CI only):
+#   No secrets required — linting and builds work out of the box.
+#
+# For Python coverage:
+#   CODECOV_TOKEN          — Codecov upload token
+#
+# For Discord notifications:
+#   DISCORD_WEBHOOK        — Discord webhook URL
+#
+# For Docker builds:
+#   DOCKER_USERNAME        — Docker Hub username
+#   DOCKER_TOKEN           — Docker Hub access token
+#
+# For deployment:
+#   TAILSCALE_OAUTH_CLIENT_ID — Tailscale OAuth Client ID
+#   TAILSCALE_OAUTH_SECRET    — Tailscale OAuth Secret
+#   PROD_TAILSCALE_IP         — Server Tailscale IP (100.x.x.x)
+#   PROD_SSH_KEY              — SSH private key
+#   PROD_SSH_USER             — SSH username (default: actions)
+#   PROD_SSH_PORT             — SSH port (default: 22)
+#
+# Repository Variables (Settings → Variables):
+#   ENABLE_DEPLOY          — Set to "true" to enable deployment
+#   PYTHON_VERSION         — Python version (empty to skip Python tests)
+#   PYTHON_VERSIONS        — JSON array of Python versions to test
+#
+# ══════════════════════════════════════════════════════════════════════════════

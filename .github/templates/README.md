@@ -10,6 +10,7 @@ Ready-to-use CI/CD workflow templates for different project types. These templat
 | [kotlin-project.yml](./kotlin-project.yml) | Kotlin/KMP CI with multi-platform builds | Kotlin, KMP |
 | [nodejs-project.yml](./nodejs-project.yml) | Node.js/TypeScript CI with npm/yarn/pnpm | Node.js, TypeScript |
 | [python-project.yml](./python-project.yml) | Python CI with pip/poetry/pipenv | Python |
+| [latex-project.yml](./latex-project.yml) | LaTeX CI/CD with linting, multi-engine builds & PDF artifacts | LaTeX, TeX |
 | [simple-deploy.yml](./simple-deploy.yml) | Minimal deployment-only workflow | Any |
 | [soak-test.yml](./soak-test.yml) | Generic long-running soak test template | Any |
 | [48hr-paper-trading-test.yml](./48hr-paper-trading-test.yml) | 48-hour paper trading soak test (FKS-specific) | Trading Systems |
@@ -123,6 +124,25 @@ No secrets required! The workflows will run tests without any configuration.
   - Playwright/Cypress E2E support
   - npm audit security scanning
   - NPM registry publishing
+
+### 📄 LaTeX Template (`latex-project.yml`)
+
+- **Stages**: Lint → Build PDFs → Docker (optional) → Deploy (optional)
+- **Features**:
+  - LaTeX linting with chktex, lacheck, and custom rules
+  - Bibliography validation (duplicate keys, missing citations, unused entries)
+  - TODO/FIXME marker detection
+  - UTF-8 encoding verification
+  - Multi-engine support (pdflatex, xelatex, lualatex)
+  - Auto-detection of bibliography engine (biber vs bibtex)
+  - TeX Live caching for faster builds
+  - Configurable installation schemes (small, medium, full, custom)
+  - Multi-pass compilation with cross-reference resolution
+  - Optional latexmk-based build orchestration
+  - PDF artifact upload with configurable retention
+  - Optional auto-commit of compiled PDFs back to repository
+  - Optional companion Python test suite support
+  - Discord notifications
 
 ### 🐍 Python Template (`python-project.yml`)
 

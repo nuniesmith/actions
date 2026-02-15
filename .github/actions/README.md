@@ -26,6 +26,9 @@ Looking for ready-to-use workflows? Check out our **[Workflow Templates](../temp
 | [rust-ci](#rust-ci) | Complete Rust CI pipeline with caching, protobuf, and workspace support |
 | [setup-rust](#setup-rust) | Setup Rust toolchain with protobuf and caching |
 | [kotlin-ci](#kotlin-ci) | Kotlin/KMP CI pipeline with Gradle |
+| [latex-setup](#latex-setup) | Install and cache TeX Live with configurable package sets |
+| [latex-lint](#latex-lint) | Run LaTeX quality checks (chktex, lacheck, bibliography, custom rules) |
+| [latex-build](#latex-build) | Compile LaTeX documents to PDF with bibliography and cross-reference support |
 | [ssh-deploy](#ssh-deploy) | Deploy to remote server via SSH over Tailscale |
 | [health-check](#health-check) | Verify deployment health via HTTP, Docker containers, and custom commands |
 | [llm-audit](#llm-audit) | LLM-powered code audits (xAI, Anthropic, Google) |
@@ -692,6 +695,227 @@ Check existing SSL certificates on a remote server via SSH. Useful for avoiding 
     domain: myapp.example.com
     cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
     email: admin@example.com
+```
+
+---
+
+## latex-setup
+
+Install and cache TeX Live with configurable package sets for LaTeX document compilation. Supports multiple installation schemes and optional tools like biber, chktex, and latexmk.
+
+### Usage
+
+```yaml
+- name: 📦 Setup TeX Live
+  uses: nuniesmith/actions/.github/actions/latex-setup@main
+  with:
+    scheme: custom
+    install-biber: "true"
+    install-chktex: "true"
+    install-latexmk: "false"
+    cache-enabled: "true"
+```
+
+### Inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `scheme` | TeX Live installation scheme (`small`, `medium`, `full`, `custom`) | No | `custom` |
+| `extra-packages` | Space-separated list of additional TeX Live packages to install | No | `""` |
+| `install-biber` | Install biber for biblatex bibliography processing | No | `true` |
+| `install-chktex` | Install chktex for LaTeX linting | No | `true` |
+| `install-latexmk` | Install latexmk for automated build orchestration | No | `true` |
+| `install-xindy` | Install xindy for index processing (large dependency) | No | `false` |
+| `cache-enabled` | Enable caching of TeX Live installation | No | `true` |
+| `cache-key-suffix` | Suffix appended to the cache key for disambiguation | No | `""` |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `cache-hit` | Whether the TeX Live cache was hit |
+| `texlive-version` | Installed TeX Live version string |
+| `pdflatex-path` | Path to the pdflatex binary |
+
+### Installation Schemes
+
+| Scheme | Description | Size |
+|--------|-------------|------|
+| `small` | Base + recommended packages and fonts | ~300 MB |
+| `medium` | Small + extra packages and fonts | ~600 MB |
+| `full` | Complete TeX Live installation | ~5 GB |
+| `custom` | Balanced set for academic papers (science, publishers, pictures) | ~800 MB |
+
+---
+
+## latex-lint
+
+Run LaTeX quality checks using chktex, lacheck, and custom validation rules. Checks for encoding issues, TODO markers, bibliography problems, and common LaTeX anti-patterns.
+
+### Usage
+
+```yaml
+- name: ✨ Lint LaTeX files
+  uses: nuniesmith/actions/.github/actions/latex-lint@main
+  with:
+    working-directory: "."
+    run-chktex: "true"
+    run-lacheck: "true"
+    run-custom-checks: "true"
+    chktex-nowarn: "1,24,36,44"
+    check-bibliography: "true"
+    fail-on-warnings: "false"
+```
+
+### Inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `working-directory` | Root directory to search for `.tex` files | No | `.` |
+| `run-chktex` | Run chktex linter | No | `true` |
+| `run-lacheck` | Run lacheck linter | No | `true` |
+| `run-custom-checks` | Run custom validation rules (TODOs, encoding, etc.) | No | `true` |
+| `chktex-args` | Additional arguments to pass to chktex | No | `""` |
+| `chktex-warnings-as-errors` | Treat chktex warnings as errors | No | `false` |
+| `chktex-nowarn` | Comma-separated chktex warning numbers to suppress (e.g. `1,24,36`) | No | `""` |
+| `max-line-length` | Maximum line length to flag (0 to disable) | No | `0` |
+| `check-encoding` | Verify all `.tex` files are valid UTF-8 | No | `true` |
+| `check-todos` | Report TODO/FIXME/HACK/XXX comments | No | `true` |
+| `check-bibliography` | Validate bibliography references and `.bib` syntax | No | `true` |
+| `exclude-pattern` | Regex pattern for file paths to exclude from linting | No | `""` |
+| `fail-on-warnings` | Fail the action if any warnings are found | No | `false` |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `chktex-result` | Result of chktex (`success`/`warning`/`failure`/`skipped`) |
+| `lacheck-result` | Result of lacheck (`success`/`warning`/`failure`/`skipped`) |
+| `custom-result` | Result of custom checks (`success`/`warning`/`failure`/`skipped`) |
+| `total-warnings` | Total number of warnings across all linters |
+| `total-errors` | Total number of errors across all linters |
+| `files-checked` | Number of `.tex` files checked |
+
+### Custom Checks
+
+The custom checks include:
+
+- **UTF-8 encoding** — Verifies all `.tex` files are valid UTF-8
+- **TODO/FIXME markers** — Reports unresolved TODO, FIXME, HACK, XXX comments
+- **Line length** — Flags lines exceeding the configured maximum (disabled by default)
+- **Bibliography validation** — Checks for empty required fields, duplicate citation keys, missing/unused citations
+- **Common LaTeX issues** — Flags `$$` (prefer `\[`/`\]`), `\def` (prefer `\newcommand`), excessive trailing whitespace
+
+---
+
+## latex-build
+
+Compile LaTeX documents to PDF with full bibliography (biber/bibtex) and cross-reference support. Supports multi-pass compilation and latexmk-based builds.
+
+### Usage
+
+```yaml
+- name: 🔨 Compile LaTeX documents
+  id: build
+  uses: nuniesmith/actions/.github/actions/latex-build@main
+  with:
+    working-directory: "."
+    engine: pdflatex
+    bib-engine: auto
+    compile-passes: "3"
+    halt-on-error: "true"
+    clean-aux: "true"
+    keep-log-on-failure: "true"
+```
+
+### Advanced Usage (latexmk + XeLaTeX)
+
+```yaml
+- name: 🔨 Compile with latexmk
+  uses: nuniesmith/actions/.github/actions/latex-build@main
+  with:
+    engine: xelatex
+    latexmk: "true"
+    shell-escape: "true"
+    fail-on-warnings: "false"
+```
+
+### Inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `working-directory` | Root directory to search for `.tex` files | No | `.` |
+| `engine` | LaTeX engine (`pdflatex`, `xelatex`, `lualatex`) | No | `pdflatex` |
+| `bib-engine` | Bibliography engine (`biber`, `bibtex`, `auto`) | No | `auto` |
+| `compile-passes` | Number of compilation passes (2–5) | No | `3` |
+| `extra-args` | Additional arguments passed to the LaTeX engine | No | `""` |
+| `interaction-mode` | LaTeX interaction mode (`nonstopmode`, `batchmode`, `scrollmode`) | No | `nonstopmode` |
+| `halt-on-error` | Stop compilation on the first error | No | `true` |
+| `shell-escape` | Enable `\write18` / shell escape (for minted, tikz externalize) | No | `false` |
+| `file-pattern` | Glob pattern to match specific `.tex` files | No | `""` (auto-discover) |
+| `exclude-pattern` | Regex pattern for file paths to exclude | No | `""` |
+| `clean-aux` | Remove auxiliary files after successful compilation | No | `true` |
+| `keep-log-on-failure` | Preserve `.log` files when compilation fails | No | `true` |
+| `output-directory` | Directory to collect all generated PDFs into | No | `""` (in-place) |
+| `fail-on-warnings` | Treat LaTeX warnings as errors | No | `false` |
+| `max-warnings` | Maximum LaTeX warnings allowed before failing (0 = unlimited) | No | `0` |
+| `latexmk` | Use latexmk for build orchestration | No | `false` |
+| `latexmk-args` | Additional arguments passed to latexmk | No | `""` |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `pdf-count` | Number of PDFs successfully generated |
+| `fail-count` | Number of documents that failed to compile |
+| `pdf-files` | Newline-separated list of generated PDF file paths |
+| `total-warnings` | Total number of LaTeX warnings across all documents |
+| `build-result` | Overall build result (`success`/`failure`/`partial`) |
+
+### Bibliography Auto-Detection
+
+When `bib-engine` is set to `auto` (the default), the action detects the correct bibliography engine:
+
+| Document Content | Detected Engine |
+|------------------|-----------------|
+| `\usepackage{biblatex}` | biber |
+| `\usepackage[backend=bibtex]{biblatex}` | bibtex |
+| `\bibliography{...}` or `\bibliographystyle{...}` | bibtex |
+| `\addbibresource{...}` | biber |
+| `.bib` files present (no explicit commands) | bibtex |
+
+### Using All Three Actions Together
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+
+  - name: 📦 Setup TeX Live
+    uses: nuniesmith/actions/.github/actions/latex-setup@main
+    with:
+      scheme: custom
+      install-biber: "true"
+      install-chktex: "true"
+
+  - name: ✨ Lint LaTeX
+    uses: nuniesmith/actions/.github/actions/latex-lint@main
+    with:
+      run-chktex: "true"
+      check-bibliography: "true"
+
+  - name: 🔨 Build PDFs
+    id: build
+    uses: nuniesmith/actions/.github/actions/latex-build@main
+    with:
+      engine: pdflatex
+      bib-engine: auto
+      clean-aux: "true"
+
+  - name: 📤 Upload PDFs
+    uses: actions/upload-artifact@v4
+    with:
+      name: papers
+      path: "**/*.pdf"
 ```
 
 ---

@@ -1,0 +1,659 @@
+name: "LaTeX Build"
+description: "Compile LaTeX documents to PDF with full bibliography (biber/bibtex) and cross-reference support"
+author: "nuniesmith"
+
+branding:
+    icon: "file-text"
+    color: "green"
+
+inputs:
+    working-directory:
+        description: "Root directory to search for .tex files"
+        required: false
+        default: "."
+    engine:
+        description: "LaTeX engine to use (pdflatex, xelatex, lualatex)"
+        required: false
+        default: "pdflatex"
+    bib-engine:
+        description: "Bibliography engine (biber, bibtex, auto). 'auto' detects from document content."
+        required: false
+        default: "auto"
+    compile-passes:
+        description: "Number of LaTeX compilation passes (minimum 2, max 5). More passes resolve complex cross-refs."
+        required: false
+        default: "3"
+    extra-args:
+        description: "Additional arguments passed to the LaTeX engine on every invocation"
+        required: false
+        default: ""
+    interaction-mode:
+        description: "LaTeX interaction mode (nonstopmode, batchmode, scrollmode)"
+        required: false
+        default: "nonstopmode"
+    halt-on-error:
+        description: "Stop compilation on the first error"
+        required: false
+        default: "true"
+    shell-escape:
+        description: "Enable \\write18 / shell escape (needed for minted, tikz externalize, etc.)"
+        required: false
+        default: "false"
+    file-pattern:
+        description: "Glob pattern to match specific .tex files instead of auto-discovering all main documents"
+        required: false
+        default: ""
+    exclude-pattern:
+        description: "Regex pattern for file paths to exclude from compilation"
+        required: false
+        default: ""
+    clean-aux:
+        description: "Remove auxiliary files after successful compilation"
+        required: false
+        default: "true"
+    keep-log-on-failure:
+        description: "Preserve .log files when compilation fails for debugging"
+        required: false
+        default: "true"
+    output-directory:
+        description: "Directory to collect all generated PDFs into (empty = leave PDFs in place)"
+        required: false
+        default: ""
+    fail-on-warnings:
+        description: "Treat LaTeX warnings (overfull/underfull boxes, missing refs) as errors"
+        required: false
+        default: "false"
+    max-warnings:
+        description: "Maximum number of LaTeX warnings allowed before failing (0 = unlimited)"
+        required: false
+        default: "0"
+    latexmk:
+        description: "Use latexmk for build orchestration instead of manual multi-pass compilation"
+        required: false
+        default: "false"
+    latexmk-args:
+        description: "Additional arguments passed to latexmk (only used when latexmk input is true)"
+        required: false
+        default: ""
+
+outputs:
+    pdf-count:
+        description: "Number of PDFs successfully generated"
+        value: ${{ steps.results.outputs.pdf-count }}
+    fail-count:
+        description: "Number of documents that failed to compile"
+        value: ${{ steps.results.outputs.fail-count }}
+    pdf-files:
+        description: "Newline-separated list of generated PDF file paths"
+        value: ${{ steps.results.outputs.pdf-files }}
+    total-warnings:
+        description: "Total number of LaTeX warnings across all documents"
+        value: ${{ steps.results.outputs.total-warnings }}
+    build-result:
+        description: "Overall build result (success/failure/partial)"
+        value: ${{ steps.results.outputs.build-result }}
+
+runs:
+    using: "composite"
+    steps:
+        - name: 🔍 Discover LaTeX documents
+          id: discover
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              echo "🔍 Discovering LaTeX main documents..."
+
+              MAIN_DOCS=$(mktemp)
+              EXCLUDE="${{ inputs.exclude-pattern }}"
+              FILE_PATTERN="${{ inputs.file-pattern }}"
+
+              if [ -n "$FILE_PATTERN" ]; then
+                # Use user-specified glob pattern
+                echo "📋 Using file pattern: $FILE_PATTERN"
+                # shellcheck disable=SC2086
+                for f in $FILE_PATTERN; do
+                  if [ -f "$f" ]; then
+                    echo "$f" >> "$MAIN_DOCS"
+                  fi
+                done
+              else
+                # Auto-discover: find all .tex files containing \documentclass
+                find . -name "*.tex" -type f ! -path "*/\.*" -exec grep -l '\\documentclass' {} \; \
+                  | sort >> "$MAIN_DOCS"
+              fi
+
+              # Apply exclude filter
+              if [ -n "$EXCLUDE" ]; then
+                FILTERED=$(mktemp)
+                grep -v -E "$EXCLUDE" "$MAIN_DOCS" > "$FILTERED" 2>/dev/null || true
+                mv "$FILTERED" "$MAIN_DOCS"
+              fi
+
+              DOC_COUNT=$(wc -l < "$MAIN_DOCS" | tr -d ' ')
+
+              if [ "$DOC_COUNT" -eq 0 ]; then
+                echo "⚠️  No main LaTeX documents found"
+                echo "doc-count=0" >> $GITHUB_OUTPUT
+                echo "doc-list=" >> $GITHUB_OUTPUT
+                rm -f "$MAIN_DOCS"
+                exit 0
+              fi
+
+              echo "📄 Found $DOC_COUNT main document(s):"
+              cat "$MAIN_DOCS" | sed 's/^/  📘 /'
+
+              {
+                echo "doc-list<<DOCEOF"
+                cat "$MAIN_DOCS"
+                echo "DOCEOF"
+              } >> $GITHUB_OUTPUT
+              echo "doc-count=$DOC_COUNT" >> $GITHUB_OUTPUT
+
+              rm -f "$MAIN_DOCS"
+
+        - name: 🔧 Prepare build configuration
+          id: config
+          if: steps.discover.outputs.doc-count != '0'
+          shell: bash
+          run: |
+              ENGINE="${{ inputs.engine }}"
+              INTERACTION="${{ inputs.interaction-mode }}"
+              HALT="${{ inputs.halt-on-error }}"
+              SHELL_ESCAPE="${{ inputs.shell-escape }}"
+              EXTRA="${{ inputs.extra-args }}"
+
+              # Build the base engine command
+              CMD="$ENGINE -interaction=$INTERACTION"
+
+              if [ "$HALT" = "true" ]; then
+                CMD="$CMD -halt-on-error"
+              fi
+
+              if [ "$SHELL_ESCAPE" = "true" ]; then
+                CMD="$CMD -shell-escape"
+              fi
+
+              # For xelatex/lualatex add synctex by default
+              if [ "$ENGINE" = "xelatex" ] || [ "$ENGINE" = "lualatex" ]; then
+                CMD="$CMD -synctex=1"
+              fi
+
+              if [ -n "$EXTRA" ]; then
+                CMD="$CMD $EXTRA"
+              fi
+
+              echo "engine-cmd=$CMD" >> $GITHUB_OUTPUT
+              echo "📋 Engine command: $CMD <file>"
+
+              # Validate compile passes
+              PASSES="${{ inputs.compile-passes }}"
+              if [ "$PASSES" -lt 2 ]; then
+                PASSES=2
+                echo "⚠️  Minimum compile passes is 2, adjusted"
+              elif [ "$PASSES" -gt 5 ]; then
+                PASSES=5
+                echo "⚠️  Maximum compile passes is 5, adjusted"
+              fi
+              echo "compile-passes=$PASSES" >> $GITHUB_OUTPUT
+
+              # latexmk engine flag
+              case "$ENGINE" in
+                pdflatex) echo "latexmk-engine=-pdf" >> $GITHUB_OUTPUT ;;
+                xelatex)  echo "latexmk-engine=-pdfxe" >> $GITHUB_OUTPUT ;;
+                lualatex) echo "latexmk-engine=-pdflua" >> $GITHUB_OUTPUT ;;
+                *)        echo "latexmk-engine=-pdf" >> $GITHUB_OUTPUT ;;
+              esac
+
+        - name: 📄 Compile documents (latexmk)
+          id: build-latexmk
+          if: inputs.latexmk == 'true' && steps.discover.outputs.doc-count != '0'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              if ! command -v latexmk &>/dev/null; then
+                echo "❌ latexmk not found. Install it via latex-setup action with install-latexmk: true"
+                exit 1
+              fi
+
+              ENGINE_FLAG="${{ steps.config.outputs.latexmk-engine }}"
+              EXTRA_LATEXMK="${{ inputs.latexmk-args }}"
+              INTERACTION="${{ inputs.interaction-mode }}"
+              HALT="${{ inputs.halt-on-error }}"
+              SHELL_ESCAPE="${{ inputs.shell-escape }}"
+              EXTRA_ENGINE="${{ inputs.extra-args }}"
+
+              # Build latexmk options
+              LATEXMK_OPTS="$ENGINE_FLAG -interaction=$INTERACTION"
+
+              ENGINE_OPTS=""
+              if [ "$HALT" = "true" ]; then
+                ENGINE_OPTS="$ENGINE_OPTS -halt-on-error"
+              fi
+              if [ "$SHELL_ESCAPE" = "true" ]; then
+                ENGINE_OPTS="$ENGINE_OPTS -shell-escape"
+              fi
+              if [ -n "$EXTRA_ENGINE" ]; then
+                ENGINE_OPTS="$ENGINE_OPTS $EXTRA_ENGINE"
+              fi
+
+              if [ -n "$ENGINE_OPTS" ]; then
+                LATEXMK_OPTS="$LATEXMK_OPTS -pdflatex=\"${{ inputs.engine }} $ENGINE_OPTS %O %S\""
+              fi
+
+              if [ -n "$EXTRA_LATEXMK" ]; then
+                LATEXMK_OPTS="$LATEXMK_OPTS $EXTRA_LATEXMK"
+              fi
+
+              SUCCESS=0
+              FAIL=0
+              TOTAL_WARNINGS=0
+              PDF_LIST=""
+
+              while IFS= read -r tex_file; do
+                [ -z "$tex_file" ] && continue
+
+                dir=$(dirname "$tex_file")
+                base=$(basename "$tex_file" .tex)
+
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "📝 Building (latexmk): $tex_file"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                cd "$dir" || continue
+
+                # shellcheck disable=SC2086
+                if latexmk $LATEXMK_OPTS "$base.tex" 2>&1; then
+                  if [ -f "$base.pdf" ]; then
+                    SIZE=$(du -h "$base.pdf" | cut -f1)
+                    echo "✅ Success: $base.pdf ($SIZE)"
+                    SUCCESS=$((SUCCESS + 1))
+                    PDF_LIST="${PDF_LIST}${dir}/${base}.pdf"$'\n'
+                  else
+                    echo "❌ Failed: PDF not generated"
+                    FAIL=$((FAIL + 1))
+                  fi
+                else
+                  echo "❌ Failed: latexmk returned an error"
+                  FAIL=$((FAIL + 1))
+
+                  if [ "${{ inputs.keep-log-on-failure }}" = "true" ] && [ -f "$base.log" ]; then
+                    echo ""
+                    echo "📋 Last 40 lines of $base.log:"
+                    tail -40 "$base.log"
+                    echo ""
+                  fi
+                fi
+
+                # Count warnings from log
+                if [ -f "$base.log" ]; then
+                  W=$(grep -c "^LaTeX Warning:" "$base.log" 2>/dev/null || true)
+                  TOTAL_WARNINGS=$((TOTAL_WARNINGS + ${W:-0}))
+                fi
+
+                # Clean auxiliary files if requested
+                if [ "${{ inputs.clean-aux }}" = "true" ]; then
+                  latexmk -c "$base.tex" 2>/dev/null || true
+                fi
+
+                cd - > /dev/null
+                echo ""
+              done <<< "${{ steps.discover.outputs.doc-list }}"
+
+              # Write outputs to temp files for the results step
+              echo "$SUCCESS" > /tmp/latex_build_success
+              echo "$FAIL" > /tmp/latex_build_fail
+              echo "$TOTAL_WARNINGS" > /tmp/latex_build_warnings
+              echo "$PDF_LIST" > /tmp/latex_build_pdfs
+
+        - name: 📄 Compile documents (multi-pass)
+          id: build-multipass
+          if: inputs.latexmk != 'true' && steps.discover.outputs.doc-count != '0'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              ENGINE_CMD="${{ steps.config.outputs.engine-cmd }}"
+              PASSES="${{ steps.config.outputs.compile-passes }}"
+              BIB_ENGINE="${{ inputs.bib-engine }}"
+
+              SUCCESS=0
+              FAIL=0
+              TOTAL_WARNINGS=0
+              PDF_LIST=""
+
+              while IFS= read -r tex_file; do
+                [ -z "$tex_file" ] && continue
+
+                dir=$(dirname "$tex_file")
+                base=$(basename "$tex_file" .tex)
+
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "📝 Building: $tex_file"
+                echo "   Engine: $ENGINE_CMD"
+                echo "   Passes: $PASSES"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                cd "$dir" || continue
+
+                BUILD_FAILED=false
+
+                # ── Detect bibliography engine ──────────────────────────────
+                DETECTED_BIB="none"
+                if [ "$BIB_ENGINE" = "auto" ]; then
+                  # Check the .tex file for biblatex (uses biber) vs natbib/bibtex
+                  if grep -q '\\usepackage.*{biblatex}' "$base.tex" 2>/dev/null || \
+                     grep -q '\\usepackage\[.*\]{biblatex}' "$base.tex" 2>/dev/null; then
+                    # Check if backend=bibtex is explicitly set
+                    if grep -q 'backend\s*=\s*bibtex' "$base.tex" 2>/dev/null; then
+                      DETECTED_BIB="bibtex"
+                    else
+                      DETECTED_BIB="biber"
+                    fi
+                  elif grep -q '\\bibliography{' "$base.tex" 2>/dev/null || \
+                       grep -q '\\bibliographystyle{' "$base.tex" 2>/dev/null; then
+                    DETECTED_BIB="bibtex"
+                  elif ls *.bib 1>/dev/null 2>&1; then
+                    # .bib files exist but no explicit command — check for \addbibresource
+                    if grep -q '\\addbibresource' "$base.tex" 2>/dev/null; then
+                      DETECTED_BIB="biber"
+                    else
+                      DETECTED_BIB="bibtex"
+                    fi
+                  fi
+                elif [ "$BIB_ENGINE" = "biber" ] || [ "$BIB_ENGINE" = "bibtex" ]; then
+                  # Only set if .bib files or bib commands exist
+                  if ls *.bib 1>/dev/null 2>&1 || \
+                     grep -q '\\bibliography{' "$base.tex" 2>/dev/null || \
+                     grep -q '\\addbibresource' "$base.tex" 2>/dev/null; then
+                    DETECTED_BIB="$BIB_ENGINE"
+                  fi
+                fi
+
+                if [ "$DETECTED_BIB" != "none" ]; then
+                  echo "📚 Bibliography engine: $DETECTED_BIB"
+                else
+                  echo "⏭  No bibliography detected"
+                fi
+
+                # ── Pass 1: Initial compilation ─────────────────────────────
+                echo ""
+                echo "  🔨 Pass 1/$PASSES: Initial compilation..."
+                if $ENGINE_CMD "$base.tex" > /dev/null 2>&1; then
+                  echo "  ✅ Pass 1/$PASSES: Complete"
+                else
+                  echo "  ❌ Pass 1/$PASSES: Compilation error"
+                  BUILD_FAILED=true
+
+                  if [ "${{ inputs.keep-log-on-failure }}" = "true" ] && [ -f "$base.log" ]; then
+                    echo ""
+                    echo "  📋 Errors from $base.log:"
+                    grep -A2 "^!" "$base.log" 2>/dev/null | head -30 || true
+                    echo ""
+                    echo "  📋 Last 20 lines of $base.log:"
+                    tail -20 "$base.log"
+                    echo ""
+                  fi
+
+                  FAIL=$((FAIL + 1))
+                  cd - > /dev/null
+                  echo ""
+                  continue
+                fi
+
+                # ── Bibliography pass ───────────────────────────────────────
+                if [ "$DETECTED_BIB" = "biber" ]; then
+                  if [ -f "$base.bcf" ]; then
+                    echo "  📚 Running biber..."
+                    if biber "$base" > /dev/null 2>&1; then
+                      echo "  ✅ biber: Bibliography processed"
+                    else
+                      echo "  ⚠️  biber: Failed (continuing without resolved citations)"
+                      # Show biber errors
+                      if [ -f "$base.blg" ]; then
+                        grep -i "error\|warn" "$base.blg" 2>/dev/null | head -10 || true
+                      fi
+                    fi
+                  else
+                    echo "  ⚠️  biber: No .bcf file generated — skipping"
+                  fi
+                elif [ "$DETECTED_BIB" = "bibtex" ]; then
+                  if [ -f "$base.aux" ]; then
+                    echo "  📚 Running bibtex..."
+                    if bibtex "$base" > /dev/null 2>&1; then
+                      echo "  ✅ bibtex: Bibliography processed"
+                    else
+                      echo "  ⚠️  bibtex: Failed (continuing without resolved citations)"
+                      if [ -f "$base.blg" ]; then
+                        grep -i "error\|warn" "$base.blg" 2>/dev/null | head -10 || true
+                      fi
+                    fi
+                  else
+                    echo "  ⚠️  bibtex: No .aux file generated — skipping"
+                  fi
+                fi
+
+                # ── Remaining passes ────────────────────────────────────────
+                CURRENT_PASS=2
+                while [ "$CURRENT_PASS" -le "$PASSES" ]; do
+                  echo "  🔨 Pass $CURRENT_PASS/$PASSES: Resolving references..."
+                  if $ENGINE_CMD "$base.tex" > /dev/null 2>&1; then
+                    echo "  ✅ Pass $CURRENT_PASS/$PASSES: Complete"
+                  else
+                    echo "  ❌ Pass $CURRENT_PASS/$PASSES: Compilation error"
+                    BUILD_FAILED=true
+
+                    if [ "${{ inputs.keep-log-on-failure }}" = "true" ] && [ -f "$base.log" ]; then
+                      echo ""
+                      echo "  📋 Errors from $base.log:"
+                      grep -A2 "^!" "$base.log" 2>/dev/null | head -30 || true
+                      echo ""
+                    fi
+
+                    break
+                  fi
+                  CURRENT_PASS=$((CURRENT_PASS + 1))
+                done
+
+                # ── Check result ────────────────────────────────────────────
+                if [ "$BUILD_FAILED" = "true" ]; then
+                  FAIL=$((FAIL + 1))
+                  cd - > /dev/null
+                  echo ""
+                  continue
+                fi
+
+                if [ -f "$base.pdf" ]; then
+                  SIZE=$(du -h "$base.pdf" | cut -f1)
+                  PAGES=$(pdfinfo "$base.pdf" 2>/dev/null | grep "^Pages:" | awk '{print $2}' || echo "?")
+                  echo "✅ Success: $base.pdf ($SIZE, $PAGES page(s))"
+                  SUCCESS=$((SUCCESS + 1))
+                  PDF_LIST="${PDF_LIST}${dir}/${base}.pdf"$'\n'
+                else
+                  echo "❌ Failed: PDF not generated despite no compilation errors"
+                  FAIL=$((FAIL + 1))
+                  cd - > /dev/null
+                  echo ""
+                  continue
+                fi
+
+                # ── Count warnings from log ─────────────────────────────────
+                if [ -f "$base.log" ]; then
+                  W_LATEX=$(grep -c "^LaTeX Warning:" "$base.log" 2>/dev/null || true)
+                  W_OVERFULL=$(grep -c "^Overfull" "$base.log" 2>/dev/null || true)
+                  W_UNDERFULL=$(grep -c "^Underfull" "$base.log" 2>/dev/null || true)
+                  W_TOTAL=$((${W_LATEX:-0} + ${W_OVERFULL:-0} + ${W_UNDERFULL:-0}))
+                  TOTAL_WARNINGS=$((TOTAL_WARNINGS + W_TOTAL))
+
+                  if [ "$W_TOTAL" -gt 0 ]; then
+                    echo "⚠️  Warnings: $W_LATEX LaTeX, $W_OVERFULL overfull, $W_UNDERFULL underfull"
+
+                    # Show specific rerun warnings
+                    RERUN=$(grep -c "Rerun to get" "$base.log" 2>/dev/null || true)
+                    if [ "${RERUN:-0}" -gt 0 ]; then
+                      echo "  ℹ️  Document may need additional passes ($RERUN 'Rerun' warnings)"
+                    fi
+
+                    # Show missing reference warnings
+                    MISSING_REFS=$(grep "^LaTeX Warning: Reference .* undefined" "$base.log" 2>/dev/null || true)
+                    if [ -n "$MISSING_REFS" ]; then
+                      echo "  ⚠️  Undefined references:"
+                      echo "$MISSING_REFS" | head -10 | sed 's/^/     /'
+                    fi
+
+                    MISSING_CITES=$(grep "^LaTeX Warning: Citation .* undefined" "$base.log" 2>/dev/null || true)
+                    if [ -n "$MISSING_CITES" ]; then
+                      echo "  ⚠️  Undefined citations:"
+                      echo "$MISSING_CITES" | head -10 | sed 's/^/     /'
+                    fi
+                  fi
+                fi
+
+                # ── Clean auxiliary files ────────────────────────────────────
+                if [ "${{ inputs.clean-aux }}" = "true" ]; then
+                  rm -f "$base.aux" "$base.log" "$base.out" "$base.toc" \
+                        "$base.lof" "$base.lot" "$base.nav" "$base.snm" \
+                        "$base.vrb" "$base.synctex.gz" "$base.fdb_latexmk" \
+                        "$base.fls" "$base.bbl" "$base.bcf" "$base.blg" \
+                        "$base.run.xml" "$base.idx" "$base.ilg" "$base.ind" \
+                        "$base.glg" "$base.gls" "$base.glo" "$base.xdy" \
+                        "$base.nlo" "$base.nls" 2>/dev/null || true
+                fi
+
+                cd - > /dev/null
+                echo ""
+              done <<< "${{ steps.discover.outputs.doc-list }}"
+
+              # Write outputs to temp files for the results step
+              echo "$SUCCESS" > /tmp/latex_build_success
+              echo "$FAIL" > /tmp/latex_build_fail
+              echo "$TOTAL_WARNINGS" > /tmp/latex_build_warnings
+              echo "$PDF_LIST" > /tmp/latex_build_pdfs
+
+        - name: 📦 Collect PDFs
+          id: collect
+          if: inputs.output-directory != '' && steps.discover.outputs.doc-count != '0'
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          run: |
+              OUTPUT_DIR="${{ inputs.output-directory }}"
+              mkdir -p "$OUTPUT_DIR"
+
+              echo "📦 Collecting PDFs to: $OUTPUT_DIR"
+
+              if [ -f /tmp/latex_build_pdfs ]; then
+                while IFS= read -r pdf; do
+                  [ -z "$pdf" ] && continue
+                  # Normalize the path (remove leading ./)
+                  pdf_clean=$(echo "$pdf" | sed 's|^\./||')
+                  if [ -f "$pdf_clean" ]; then
+                    cp "$pdf_clean" "$OUTPUT_DIR/"
+                    echo "  📄 $(basename "$pdf_clean")"
+                  fi
+                done < /tmp/latex_build_pdfs
+              fi
+
+              echo "✅ PDFs collected in $OUTPUT_DIR"
+
+        - name: 📊 Build Results
+          id: results
+          if: always()
+          shell: bash
+          run: |
+              SUCCESS=$(cat /tmp/latex_build_success 2>/dev/null || echo "0")
+              FAIL=$(cat /tmp/latex_build_fail 2>/dev/null || echo "0")
+              TOTAL_WARNINGS=$(cat /tmp/latex_build_warnings 2>/dev/null || echo "0")
+              PDF_FILES=$(cat /tmp/latex_build_pdfs 2>/dev/null || echo "")
+              DOC_COUNT="${{ steps.discover.outputs.doc-count }}"
+
+              echo "pdf-count=$SUCCESS" >> $GITHUB_OUTPUT
+              echo "fail-count=$FAIL" >> $GITHUB_OUTPUT
+              echo "total-warnings=$TOTAL_WARNINGS" >> $GITHUB_OUTPUT
+
+              {
+                echo "pdf-files<<PDFEOF"
+                echo "$PDF_FILES"
+                echo "PDFEOF"
+              } >> $GITHUB_OUTPUT
+
+              # Determine overall result
+              if [ "${DOC_COUNT:-0}" -eq 0 ]; then
+                echo "build-result=success" >> $GITHUB_OUTPUT
+              elif [ "$FAIL" -eq 0 ] && [ "$SUCCESS" -gt 0 ]; then
+                echo "build-result=success" >> $GITHUB_OUTPUT
+              elif [ "$SUCCESS" -gt 0 ] && [ "$FAIL" -gt 0 ]; then
+                echo "build-result=partial" >> $GITHUB_OUTPUT
+              else
+                echo "build-result=failure" >> $GITHUB_OUTPUT
+              fi
+
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📊 LaTeX Build Summary"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "  📄 Documents found:  ${DOC_COUNT:-0}"
+              echo "  ✅ Compiled:         $SUCCESS"
+              echo "  ❌ Failed:           $FAIL"
+              echo "  ⚠️  Total warnings:  $TOTAL_WARNINGS"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+              if [ -n "$PDF_FILES" ]; then
+                echo ""
+                echo "📦 Generated PDFs:"
+                echo "$PDF_FILES" | while IFS= read -r pdf; do
+                  [ -z "$pdf" ] && continue
+                  echo "  📄 $pdf"
+                done
+              fi
+
+              # Write step summary
+              {
+                echo "## 📄 LaTeX Build Results"
+                echo ""
+                echo "| Metric | Value |"
+                echo "|--------|-------|"
+                echo "| Documents found | ${DOC_COUNT:-0} |"
+                echo "| Successfully compiled | $SUCCESS |"
+                echo "| Failed | $FAIL |"
+                echo "| Total warnings | $TOTAL_WARNINGS |"
+                echo "| Engine | ${{ inputs.engine }} |"
+                if [ "${{ inputs.latexmk }}" = "true" ]; then
+                  echo "| Build method | latexmk |"
+                else
+                  echo "| Build method | multi-pass (${{ steps.config.outputs.compile-passes }} passes) |"
+                fi
+                echo ""
+                if [ -n "$PDF_FILES" ]; then
+                  echo "### Generated PDFs"
+                  echo ""
+                  echo "$PDF_FILES" | while IFS= read -r pdf; do
+                    [ -z "$pdf" ] && continue
+                    echo "- \`$pdf\`"
+                  done
+                fi
+              } >> $GITHUB_STEP_SUMMARY
+
+              # Clean up temp files
+              rm -f /tmp/latex_build_success /tmp/latex_build_fail \
+                    /tmp/latex_build_warnings /tmp/latex_build_pdfs
+
+              # ── Fail conditions ───────────────────────────────────────────
+
+              # Fail if any document failed to compile
+              if [ "$FAIL" -gt 0 ]; then
+                echo ""
+                echo "❌ $FAIL document(s) failed to compile"
+                exit 1
+              fi
+
+              # Fail if warnings exceed threshold
+              MAX_W="${{ inputs.max-warnings }}"
+              if [ "${MAX_W:-0}" -gt 0 ] && [ "$TOTAL_WARNINGS" -gt "$MAX_W" ]; then
+                echo ""
+                echo "❌ $TOTAL_WARNINGS warning(s) exceeds maximum of $MAX_W"
+                exit 1
+              fi
+
+              # Fail if any warnings exist and fail-on-warnings is set
+              if [ "${{ inputs.fail-on-warnings }}" = "true" ] && [ "$TOTAL_WARNINGS" -gt 0 ]; then
+                echo ""
+                echo "❌ $TOTAL_WARNINGS warning(s) found (fail-on-warnings is enabled)"
+                exit 1
+              fi

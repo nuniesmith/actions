@@ -1,0 +1,236 @@
+name: "LaTeX Setup"
+description: "Install and cache TeX Live with configurable package sets for LaTeX document compilation"
+author: "nuniesmith"
+
+branding:
+    icon: "book-open"
+    color: "blue"
+
+inputs:
+    scheme:
+        description: "TeX Live installation scheme (small, medium, full, custom)"
+        required: false
+        default: "custom"
+    extra-packages:
+        description: "Space-separated list of additional TeX Live packages to install via tlmgr"
+        required: false
+        default: ""
+    install-biber:
+        description: "Install biber for biblatex bibliography processing"
+        required: false
+        default: "true"
+    install-chktex:
+        description: "Install chktex for LaTeX linting"
+        required: false
+        default: "true"
+    install-latexmk:
+        description: "Install latexmk for automated build orchestration"
+        required: false
+        default: "true"
+    install-xindy:
+        description: "Install xindy for index processing (large dependency)"
+        required: false
+        default: "false"
+    cache-enabled:
+        description: "Enable caching of TeX Live installation"
+        required: false
+        default: "true"
+    cache-key-suffix:
+        description: "Suffix appended to the cache key for disambiguation"
+        required: false
+        default: ""
+
+outputs:
+    cache-hit:
+        description: "Whether the TeX Live cache was hit"
+        value: ${{ steps.texlive-cache.outputs.cache-hit }}
+    texlive-version:
+        description: "Installed TeX Live version string"
+        value: ${{ steps.verify.outputs.texlive-version }}
+    pdflatex-path:
+        description: "Path to the pdflatex binary"
+        value: ${{ steps.verify.outputs.pdflatex-path }}
+
+runs:
+    using: "composite"
+    steps:
+        - name: 🔑 Compute cache key
+          id: cache-key
+          shell: bash
+          run: |
+              # Build a deterministic key from the requested configuration
+              KEY_PARTS="texlive"
+              KEY_PARTS="${KEY_PARTS}-scheme-${{ inputs.scheme }}"
+              KEY_PARTS="${KEY_PARTS}-biber-${{ inputs.install-biber }}"
+              KEY_PARTS="${KEY_PARTS}-chktex-${{ inputs.install-chktex }}"
+              KEY_PARTS="${KEY_PARTS}-latexmk-${{ inputs.install-latexmk }}"
+              KEY_PARTS="${KEY_PARTS}-xindy-${{ inputs.install-xindy }}"
+
+              # Hash extra packages for the key
+              if [ -n "${{ inputs.extra-packages }}" ]; then
+                EXTRA_HASH=$(echo "${{ inputs.extra-packages }}" | sha256sum | cut -c1-12)
+                KEY_PARTS="${KEY_PARTS}-extra-${EXTRA_HASH}"
+              fi
+
+              SUFFIX="${{ inputs.cache-key-suffix }}"
+              if [ -n "$SUFFIX" ]; then
+                KEY_PARTS="${KEY_PARTS}-${SUFFIX}"
+              fi
+
+              echo "key=${{ runner.os }}-${KEY_PARTS}" >> $GITHUB_OUTPUT
+
+        - name: 📦 Cache TeX Live installation
+          id: texlive-cache
+          if: inputs.cache-enabled == 'true'
+          uses: actions/cache@v4
+          with:
+              path: |
+                  /usr/local/texlive
+                  ~/.texlive*
+                  /usr/share/texlive
+                  /usr/share/texmf
+              key: ${{ steps.cache-key.outputs.key }}
+              restore-keys: |
+                  ${{ runner.os }}-texlive-scheme-${{ inputs.scheme }}-
+
+        - name: 📥 Install TeX Live base
+          if: steps.texlive-cache.outputs.cache-hit != 'true'
+          shell: bash
+          run: |
+              echo "📦 Installing TeX Live (scheme: ${{ inputs.scheme }})..."
+              sudo apt-get update -qq
+
+              case "${{ inputs.scheme }}" in
+                small)
+                  sudo apt-get install -y -qq \
+                    texlive-latex-base \
+                    texlive-latex-recommended \
+                    texlive-fonts-recommended
+                  ;;
+                medium)
+                  sudo apt-get install -y -qq \
+                    texlive-latex-base \
+                    texlive-latex-recommended \
+                    texlive-latex-extra \
+                    texlive-fonts-recommended \
+                    texlive-fonts-extra
+                  ;;
+                full)
+                  sudo apt-get install -y -qq texlive-full
+                  ;;
+                custom|*)
+                  # Default custom set: good balance for academic papers
+                  sudo apt-get install -y -qq \
+                    texlive-latex-base \
+                    texlive-latex-extra \
+                    texlive-latex-recommended \
+                    texlive-fonts-recommended \
+                    texlive-fonts-extra \
+                    texlive-science \
+                    texlive-bibtex-extra \
+                    texlive-publishers \
+                    texlive-pictures \
+                    texlive-plain-generic \
+                    cm-super \
+                    lmodern
+                  ;;
+              esac
+
+              echo "✅ TeX Live base installation complete"
+
+        - name: 📥 Install biber
+          if: inputs.install-biber == 'true' && steps.texlive-cache.outputs.cache-hit != 'true'
+          shell: bash
+          run: |
+              sudo apt-get install -y -qq biber
+              echo "✅ biber installed: $(biber --version 2>/dev/null | head -1)"
+
+        - name: 📥 Install chktex
+          if: inputs.install-chktex == 'true' && steps.texlive-cache.outputs.cache-hit != 'true'
+          shell: bash
+          run: |
+              sudo apt-get install -y -qq chktex
+              echo "✅ chktex installed: $(chktex --version 2>/dev/null | head -1)"
+
+        - name: 📥 Install latexmk
+          if: inputs.install-latexmk == 'true' && steps.texlive-cache.outputs.cache-hit != 'true'
+          shell: bash
+          run: |
+              sudo apt-get install -y -qq latexmk
+              echo "✅ latexmk installed: $(latexmk --version 2>/dev/null | head -1)"
+
+        - name: 📥 Install xindy
+          if: inputs.install-xindy == 'true' && steps.texlive-cache.outputs.cache-hit != 'true'
+          shell: bash
+          run: |
+              sudo apt-get install -y -qq xindy
+              echo "✅ xindy installed"
+
+        - name: 📥 Install extra packages
+          if: inputs.extra-packages != '' && steps.texlive-cache.outputs.cache-hit != 'true'
+          shell: bash
+          run: |
+              echo "📦 Installing extra packages: ${{ inputs.extra-packages }}"
+              for pkg in ${{ inputs.extra-packages }}; do
+                echo "  → Installing: $pkg"
+                sudo apt-get install -y -qq "$pkg" 2>/dev/null || {
+                  echo "  ⚠️  apt package '$pkg' not found, trying tlmgr..."
+                  sudo tlmgr install "$pkg" 2>/dev/null || {
+                    echo "  ❌ Could not install '$pkg' via apt or tlmgr"
+                  }
+                }
+              done
+              echo "✅ Extra packages installed"
+
+        - name: ✅ Verify installation
+          id: verify
+          shell: bash
+          run: |
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📋 TeX Live Installation Summary"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+              # Verify pdflatex
+              if command -v pdflatex &>/dev/null; then
+                PDFLATEX_PATH=$(which pdflatex)
+                TEXLIVE_VERSION=$(pdflatex --version 2>/dev/null | head -1)
+                echo "✅ pdflatex: $PDFLATEX_PATH"
+                echo "   Version: $TEXLIVE_VERSION"
+                echo "pdflatex-path=$PDFLATEX_PATH" >> $GITHUB_OUTPUT
+                echo "texlive-version=$TEXLIVE_VERSION" >> $GITHUB_OUTPUT
+              else
+                echo "❌ pdflatex not found!"
+                exit 1
+              fi
+
+              # Check optional tools
+              for tool in biber chktex latexmk xelatex lualatex; do
+                if command -v "$tool" &>/dev/null; then
+                  echo "✅ $tool: $(which $tool)"
+                else
+                  echo "⏭  $tool: not installed"
+                fi
+              done
+
+              # Check kpsewhich for package resolution
+              if command -v kpsewhich &>/dev/null; then
+                echo ""
+                echo "📦 Key packages:"
+                for pkg in article.cls amsmath.sty hyperref.sty biblatex.sty geometry.sty; do
+                  FOUND=$(kpsewhich "$pkg" 2>/dev/null || true)
+                  if [ -n "$FOUND" ]; then
+                    echo "  ✅ $pkg"
+                  else
+                    echo "  ⏭  $pkg (not found)"
+                  fi
+                done
+              fi
+
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+              # Cache hit status
+              if [ "${{ steps.texlive-cache.outputs.cache-hit }}" = "true" ]; then
+                echo "📦 Installation restored from cache"
+              else
+                echo "📦 Fresh installation completed"
+              fi

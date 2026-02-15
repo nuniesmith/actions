@@ -1,0 +1,250 @@
+name: CI - LaTeX & Python
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        branches:
+            - main
+    workflow_dispatch:
+        inputs:
+            skip_tests:
+                description: "Skip Python tests"
+                required: false
+                type: boolean
+                default: false
+            skip_lint:
+                description: "Skip LaTeX linting"
+                required: false
+                type: boolean
+                default: false
+            latex_engine:
+                description: "LaTeX engine to use"
+                required: false
+                type: choice
+                options:
+                    - pdflatex
+                    - xelatex
+                    - lualatex
+                default: pdflatex
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: write
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    lint-latex:
+        name: ✨ Lint LaTeX
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        if: ${{ !inputs.skip_lint }}
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 📦 Setup TeX Live
+              uses: nuniesmith/actions/.github/actions/latex-setup@main
+              with:
+                  scheme: custom
+                  install-biber: "true"
+                  install-chktex: "true"
+                  install-latexmk: "false"
+                  cache-enabled: "true"
+
+            - name: ✨ Lint LaTeX files
+              uses: nuniesmith/actions/.github/actions/latex-lint@main
+              with:
+                  working-directory: "."
+                  run-chktex: "true"
+                  run-lacheck: "true"
+                  run-custom-checks: "true"
+                  chktex-warnings-as-errors: "false"
+                  # Suppress common noisy chktex warnings:
+                  #   1  = Command terminated with space
+                  #   24 = Delete this space to maintain correct pagereferences
+                  #   36 = Vertical rules in tables
+                  #   44 = User Regex (often false positives)
+                  chktex-nowarn: "1,24,36,44"
+                  check-encoding: "true"
+                  check-todos: "true"
+                  check-bibliography: "true"
+                  fail-on-warnings: "false"
+
+    test-python:
+        name: 🧪 Test Python (${{ matrix.python-version }})
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        if: ${{ !inputs.skip_tests }}
+        strategy:
+            fail-fast: false
+            matrix:
+                python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 🐍 Set up Python ${{ matrix.python-version }}
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ matrix.python-version }}
+                  cache: "pip"
+
+            - name: 📦 Install dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install -e ".[dev]"
+
+            - name: 🧪 Run tests with coverage
+              run: |
+                  pytest --cov=project_janus --cov-report=xml --cov-report=term
+
+            - name: 📊 Upload coverage to Codecov
+              if: matrix.python-version == '3.12'
+              uses: codecov/codecov-action@v5
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  files: ./coverage.xml
+                  flags: python-${{ matrix.python-version }}
+                  name: python-${{ matrix.python-version }}
+                  fail_ci_if_error: false
+                  verbose: true
+
+    build-latex:
+        name: 📄 Build LaTeX PDFs
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [lint-latex]
+        if: |
+            always() &&
+            (needs.lint-latex.result == 'success' || needs.lint-latex.result == 'skipped')
+        permissions:
+            contents: write
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 📦 Setup TeX Live
+              uses: nuniesmith/actions/.github/actions/latex-setup@main
+              with:
+                  scheme: custom
+                  install-biber: "true"
+                  install-chktex: "false"
+                  install-latexmk: "false"
+                  cache-enabled: "true"
+                  cache-key-suffix: "build"
+
+            - name: 🔨 Compile LaTeX documents
+              id: build
+              uses: nuniesmith/actions/.github/actions/latex-build@main
+              with:
+                  working-directory: "."
+                  engine: ${{ inputs.latex_engine || 'pdflatex' }}
+                  bib-engine: "auto"
+                  compile-passes: "3"
+                  interaction-mode: "nonstopmode"
+                  halt-on-error: "true"
+                  shell-escape: "false"
+                  clean-aux: "true"
+                  keep-log-on-failure: "true"
+                  fail-on-warnings: "false"
+
+            - name: 📦 List generated PDFs
+              run: |
+                  echo "📦 Generated PDFs:"
+                  find . -name "*.pdf" -type f ! -path "*/\.*" -exec ls -lh {} \;
+
+            - name: 📤 Upload PDF artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: latex-pdfs
+                  path: "**/*.pdf"
+                  retention-days: 90
+
+            - name: 📝 Commit PDFs to repository
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+              run: |
+                  git config --local user.email "github-actions[bot]@users.noreply.github.com"
+                  git config --local user.name "GitHub Actions"
+
+                  # Pull latest to avoid conflicts with concurrent runs
+                  git pull --rebase origin main || true
+
+                  # Add all PDFs
+                  find . -name "*.pdf" -type f ! -path "*/\.*" -exec git add -f {} \;
+
+                  # Commit only if there are staged changes
+                  if git diff --staged --quiet; then
+                    echo "ℹ️  No PDF changes to commit"
+                  else
+                    git commit -m "🤖 Auto-compile LaTeX PDFs [skip ci]" \
+                      -m "Built with ${{ inputs.latex_engine || 'pdflatex' }}" \
+                      -m "Commit: ${{ github.sha }}" \
+                      -m "PDFs compiled: ${{ steps.build.outputs.pdf-count }}"
+                    git push || echo "⚠️  Push failed — another commit may have landed"
+                  fi
+
+            - name: 📋 Build Summary
+              if: always()
+              run: |
+                  {
+                    echo "# 📄 LaTeX Build Results"
+                    echo ""
+                    echo "| Detail | Value |"
+                    echo "|--------|-------|"
+                    echo "| **Commit** | \`${{ github.sha }}\` |"
+                    echo "| **Branch** | \`${{ github.ref_name }}\` |"
+                    echo "| **Engine** | ${{ inputs.latex_engine || 'pdflatex' }} |"
+                    echo "| **PDFs built** | ${{ steps.build.outputs.pdf-count || '—' }} |"
+                    echo "| **Failures** | ${{ steps.build.outputs.fail-count || '—' }} |"
+                    echo "| **Warnings** | ${{ steps.build.outputs.total-warnings || '—' }} |"
+                    echo "| **Result** | ${{ steps.build.outputs.build-result || '—' }} |"
+                    echo ""
+                    echo "Download compiled PDFs from the **Artifacts** section above ⬆️"
+                  } >> $GITHUB_STEP_SUMMARY
+
+    ci-summary:
+        name: 📊 CI Summary
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        needs: [lint-latex, test-python, build-latex]
+        if: always()
+
+        steps:
+            - name: 📊 Generate summary
+              run: |
+                  {
+                    echo "# 🎉 CI Pipeline Summary"
+                    echo ""
+                    echo "| Job | Status |"
+                    echo "|-----|--------|"
+                    echo "| ✨ LaTeX Lint | \`${{ needs.lint-latex.result }}\` |"
+                    echo "| 🧪 Python Tests | \`${{ needs.test-python.result }}\` |"
+                    echo "| 📄 LaTeX Build | \`${{ needs.build-latex.result }}\` |"
+                    echo ""
+                    echo "**Commit:** \`${{ github.sha }}\`"
+                    echo "**Branch:** \`${{ github.ref_name }}\`"
+                    echo "**Triggered by:** \`${{ github.event_name }}\`"
+                  } >> $GITHUB_STEP_SUMMARY
+
+            - name: ❌ Fail if any job failed
+              if: |
+                  needs.lint-latex.result == 'failure' ||
+                  needs.test-python.result == 'failure' ||
+                  needs.build-latex.result == 'failure'
+              run: |
+                  echo "❌ One or more jobs failed:"
+                  echo "  LaTeX Lint:   ${{ needs.lint-latex.result }}"
+                  echo "  Python Tests: ${{ needs.test-python.result }}"
+                  echo "  LaTeX Build:  ${{ needs.build-latex.result }}"
+                  exit 1
