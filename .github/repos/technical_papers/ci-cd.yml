@@ -1,4 +1,4 @@
-name: CI - LaTeX & Python
+name: CI-CD - LaTeX & Python
 
 on:
     push:
