@@ -478,7 +478,7 @@ runs:
                 fi
 
                 # Check for trailing whitespace in critical environments
-                TRAILING=$(grep -n -E '[[:space:]]+$' "$tex_file" 2>/dev/null | wc -l | tr -d ' ')
+                TRAILING=$(grep -c -E '[[:space:]]+$' "$tex_file" 2>/dev/null || true)
                 if [ "${TRAILING:-0}" -gt 10 ]; then
                   echo "  ℹ️  $tex_file: $TRAILING line(s) with trailing whitespace"
                 fi
