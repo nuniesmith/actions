@@ -512,7 +512,8 @@ jobs:
                   github.ref == 'refs/heads/main' &&
                   inputs.skip_ssl != true &&
                   steps.ssh-key-setup.outputs.key_ready == 'true' &&
-                  steps.ssl-request.outcome == 'failure'
+                  steps.ssl-request.outcome == 'failure' &&
+                  steps.ssl-request.outputs.cert-source != 'volume'
               env:
                   DOMAIN: ${{ needs.setup.outputs.target_domain }}
                   SSH_HOST: ${{ steps.resolve-host.outputs.target_host }}
@@ -542,7 +543,7 @@ jobs:
                       -in /certs/live/${DOMAIN}/fullchain.pem \
                       -noout -subject -enddate -issuer 2>/dev/null" 2>/dev/null) || true
 
-                  if echo "$CERT_STATUS" | grep -qi "Let's Encrypt\|R3\|R10\|R11\|E5\|E6"; then
+                  if echo "$CERT_STATUS" | grep -qi "Let's Encrypt\|R3\|R10\|R11\|E5\|E6\|E1\|E2\|ISRG"; then
                     EXPIRY=$(echo "$CERT_STATUS" | grep "notAfter" | cut -d= -f2)
                     echo "✅ Found existing Let's Encrypt certificate in Docker volume"
                     echo "   Issuer: Let's Encrypt"
@@ -571,6 +572,7 @@ jobs:
                   github.ref == 'refs/heads/main' &&
                   inputs.skip_ssl != true &&
                   steps.ssl-request.outcome == 'failure' &&
+                  steps.ssl-request.outputs.cert-source != 'volume' &&
                   steps.ssl-fallback.outputs.use_existing != 'true'
               continue-on-error: true
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main

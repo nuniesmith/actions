@@ -88,10 +88,10 @@ inputs:
 
 outputs:
     cert-ready:
-        description: "Whether certificates were successfully generated"
+        description: "Whether certificates are available (generated or found in volume)"
         value: ${{ steps.certbot.outputs.cert_ready }}
     cert-type:
-        description: "Type of certificate generated (letsencrypt or self-signed)"
+        description: "Type of certificate (letsencrypt, self-signed, letsencrypt-cached, self-signed-cached)"
         value: ${{ steps.certbot.outputs.cert_type }}
     cert-path:
         description: "Path to the certificate directory"
@@ -99,9 +99,12 @@ outputs:
     expiry-date:
         description: "Certificate expiry date"
         value: ${{ steps.certbot.outputs.expiry_date }}
+    cert-source:
+        description: "Where the certificate came from (certbot, volume, self-signed)"
+        value: ${{ steps.certbot.outputs.cert_source }}
     deployed:
-        description: "Whether certificates were deployed to the server"
-        value: ${{ steps.deploy.outputs.deployed }}
+        description: "Whether certificates were deployed to the server (or already present in volume)"
+        value: ${{ steps.certbot.outputs.cert_source == 'volume' && 'true' || steps.deploy.outputs.deployed }}
 
 runs:
     using: "composite"
@@ -118,6 +121,12 @@ runs:
               USE_STAGING: ${{ inputs.staging }}
               FALLBACK_SELF_SIGNED: ${{ inputs.fallback-to-self-signed }}
               SELF_SIGNED_DAYS: ${{ inputs.self-signed-days }}
+              DEPLOY_TO_SERVER: ${{ inputs.deploy-to-server }}
+              SSH_HOST: ${{ inputs.ssh-host }}
+              SSH_PORT: ${{ inputs.ssh-port }}
+              SSH_USER: ${{ inputs.ssh-user }}
+              SSH_KEY: ${{ inputs.ssh-key }}
+              DOCKER_VOLUME: ${{ inputs.docker-volume-name }}
           run: |
               echo "🔐 Generating SSL certificates..."
 
@@ -169,6 +178,7 @@ runs:
                   echo "✅ Self-signed certificates generated successfully"
                   echo "cert_ready=true" >> $GITHUB_OUTPUT
                   echo "cert_type=self-signed" >> $GITHUB_OUTPUT
+                  echo "cert_source=self-signed" >> $GITHUB_OUTPUT
                   echo "cert_path=/tmp/letsencrypt/live/$DOMAIN" >> $GITHUB_OUTPUT
 
                   # Get expiry date
@@ -275,6 +285,7 @@ runs:
                 echo "✅ Let's Encrypt certificates obtained successfully"
                 echo "cert_ready=true" >> $GITHUB_OUTPUT
                 echo "cert_type=letsencrypt" >> $GITHUB_OUTPUT
+                echo "cert_source=certbot" >> $GITHUB_OUTPUT
                 echo "cert_path=/tmp/letsencrypt/live/$DOMAIN" >> $GITHUB_OUTPUT
 
                 # Get expiry date
@@ -287,7 +298,82 @@ runs:
               else
                 echo "⚠️ Let's Encrypt failed (exit code: $CERTBOT_EXIT)"
 
-                if [ "$FALLBACK_SELF_SIGNED" = "true" ]; then
+                # ── Check Docker volume on remote server for existing valid certs ──
+                VOLUME_CERT_FOUND=false
+                if [ "$DEPLOY_TO_SERVER" = "true" ] && [ -n "$SSH_HOST" ] && [ -n "$SSH_KEY" ] && [ -n "$DOCKER_VOLUME" ]; then
+                  echo ""
+                  echo "════════════════════════════════════════════════════════════"
+                  echo "🔍 Checking Docker volume '$DOCKER_VOLUME' on server for existing certificates..."
+                  echo "════════════════════════════════════════════════════════════"
+
+                  # Setup temporary SSH key for volume check
+                  mkdir -p ~/.ssh
+                  echo "$SSH_KEY" > ~/.ssh/vol_check_key
+                  chmod 600 ~/.ssh/vol_check_key
+                  ssh-keyscan -p "${SSH_PORT:-22}" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+                  VOL_CERT_INFO=$(ssh -i ~/.ssh/vol_check_key \
+                    -p "${SSH_PORT:-22}" \
+                    -o StrictHostKeyChecking=no \
+                    -o ConnectTimeout=15 \
+                    -o BatchMode=yes \
+                    "${SSH_USER:-actions}@${SSH_HOST}" \
+                    "docker run --rm -v ${DOCKER_VOLUME}:/certs:ro alpine/openssl x509 \
+                      -in /certs/live/${DOMAIN}/fullchain.pem \
+                      -noout -subject -enddate -issuer 2>/dev/null" 2>/dev/null) || true
+
+                  if [ -n "$VOL_CERT_INFO" ]; then
+                    echo "📦 Found certificate in Docker volume!"
+                    echo "$VOL_CERT_INFO"
+
+                    # Check if it's a Let's Encrypt cert
+                    VOL_ISSUER=$(echo "$VOL_CERT_INFO" | grep -i "issuer" || echo "")
+                    VOL_EXPIRY_RAW=$(echo "$VOL_CERT_INFO" | grep "notAfter" | cut -d= -f2)
+
+                    if echo "$VOL_ISSUER" | grep -qi "Let's Encrypt\|R3\|R10\|R11\|E5\|E6\|E1\|E2\|ISRG"; then
+                      VOL_TYPE="letsencrypt"
+                    else
+                      VOL_TYPE="self-signed"
+                    fi
+
+                    # Check if the cert is still valid (not expired)
+                    VOL_CHECKEND=$(ssh -i ~/.ssh/vol_check_key \
+                      -p "${SSH_PORT:-22}" \
+                      -o StrictHostKeyChecking=no \
+                      -o BatchMode=yes \
+                      "${SSH_USER:-actions}@${SSH_HOST}" \
+                      "docker run --rm -v ${DOCKER_VOLUME}:/certs:ro alpine/openssl x509 \
+                        -in /certs/live/${DOMAIN}/fullchain.pem \
+                        -noout -checkend 0 2>/dev/null && echo 'VALID' || echo 'EXPIRED'" 2>/dev/null) || true
+
+                    if echo "$VOL_CHECKEND" | grep -q "VALID"; then
+                      echo ""
+                      echo "✅ Valid ${VOL_TYPE} certificate found in Docker volume"
+                      echo "   Issuer:  $VOL_ISSUER"
+                      echo "   Expires: $VOL_EXPIRY_RAW"
+                      echo "   ⏭️  Skipping generation — existing cert in volume is still valid"
+                      echo ""
+                      echo "cert_ready=true" >> $GITHUB_OUTPUT
+                      echo "cert_type=${VOL_TYPE}-cached" >> $GITHUB_OUTPUT
+                      echo "cert_path=volume://${DOCKER_VOLUME}/live/${DOMAIN}" >> $GITHUB_OUTPUT
+                      echo "cert_source=volume" >> $GITHUB_OUTPUT
+                      echo "expiry_date=${VOL_EXPIRY_RAW}" >> $GITHUB_OUTPUT
+                      VOLUME_CERT_FOUND=true
+                    else
+                      echo "⚠️  Certificate in Docker volume is expired — cannot use as fallback"
+                    fi
+                  else
+                    echo "📦 No certificate found in Docker volume at live/${DOMAIN}/fullchain.pem"
+                  fi
+
+                  # Cleanup temp key
+                  rm -f ~/.ssh/vol_check_key
+                fi
+
+                if [ "$VOLUME_CERT_FOUND" = "true" ]; then
+                  echo "🎉 Using existing certificate from Docker volume — no new generation needed"
+                  exit 0
+                elif [ "$FALLBACK_SELF_SIGNED" = "true" ]; then
                   echo "📜 Falling back to self-signed certificates..."
                   generate_self_signed
                   exit $?
@@ -299,7 +385,7 @@ runs:
               fi
 
         - name: 📦 Package Certificates
-          if: steps.certbot.outputs.cert_ready == 'true'
+          if: steps.certbot.outputs.cert_ready == 'true' && steps.certbot.outputs.cert_source != 'volume'
           shell: bash
           env:
               DOMAIN: ${{ inputs.domain }}
@@ -322,7 +408,7 @@ runs:
 
         - name: 🚀 Deploy Certificates to Server
           id: deploy
-          if: steps.certbot.outputs.cert_ready == 'true' && inputs.deploy-to-server == 'true'
+          if: steps.certbot.outputs.cert_ready == 'true' && inputs.deploy-to-server == 'true' && steps.certbot.outputs.cert_source != 'volume'
           shell: bash
           env:
               SSH_KEY: ${{ inputs.ssh-key }}
@@ -487,11 +573,23 @@ runs:
               EXPIRY: ${{ steps.certbot.outputs.expiry_date }}
               DOCKER_VOLUME: ${{ inputs.docker-volume-name }}
           run: |
+              CERT_SOURCE="${{ steps.certbot.outputs.cert_source }}"
+
               echo "## 🔐 SSL Certificate Status" >> $GITHUB_STEP_SUMMARY
 
               if [ "$CERT_READY" == "true" ]; then
                 if [ "$CERT_TYPE" == "letsencrypt" ]; then
                   echo "✅ **Let's Encrypt** certificates generated for \`$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
+                elif [ "$CERT_TYPE" == "letsencrypt-cached" ]; then
+                  echo "✅ **Let's Encrypt** certificates found in Docker volume for \`$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "> **Note:** Certbot failed (likely rate limited), but valid Let's Encrypt certs already exist in volume \`$DOCKER_VOLUME\`." >> $GITHUB_STEP_SUMMARY
+                  echo "> No action needed — existing certs are still valid." >> $GITHUB_STEP_SUMMARY
+                elif [ "$CERT_TYPE" == "self-signed-cached" ]; then
+                  echo "⚠️ **Self-signed** certificates found in Docker volume for \`$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "> **Note:** Certbot failed and only self-signed certs exist in the volume." >> $GITHUB_STEP_SUMMARY
+                  echo "> Browsers will show a security warning. Real certs will be obtained on next successful run." >> $GITHUB_STEP_SUMMARY
                 else
                   echo "⚠️ **Self-signed** certificates generated for \`$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
                   echo "" >> $GITHUB_STEP_SUMMARY
@@ -502,7 +600,9 @@ runs:
                 echo "" >> $GITHUB_STEP_SUMMARY
                 echo "📅 **Expires:** $EXPIRY" >> $GITHUB_STEP_SUMMARY
 
-                if [ "$DEPLOYED" == "true" ]; then
+                if [ "$CERT_SOURCE" == "volume" ]; then
+                  echo "📦 **Source:** Existing certs in Docker volume \`$DOCKER_VOLUME\` (no deployment needed)" >> $GITHUB_STEP_SUMMARY
+                elif [ "$DEPLOYED" == "true" ]; then
                   echo "✅ **Deployed** to Docker volume: \`$DOCKER_VOLUME\`" >> $GITHUB_STEP_SUMMARY
                 elif [ "${{ inputs.deploy-to-server }}" == "true" ]; then
                   echo "❌ **Deployment failed**" >> $GITHUB_STEP_SUMMARY
@@ -514,6 +614,7 @@ runs:
                 echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
                 echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
                 echo "| Type | \`$CERT_TYPE\` |" >> $GITHUB_STEP_SUMMARY
+                echo "| Source | \`${CERT_SOURCE:-certbot}\` |" >> $GITHUB_STEP_SUMMARY
                 echo "| Domain | \`$DOMAIN\` |" >> $GITHUB_STEP_SUMMARY
                 echo "| Volume | \`$DOCKER_VOLUME\` |" >> $GITHUB_STEP_SUMMARY
               else
