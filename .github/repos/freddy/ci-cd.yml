@@ -46,6 +46,11 @@ on:
                 required: false
                 type: boolean
                 default: false
+            reset_nextcloud_db:
+                description: "Reset Nextcloud PostgreSQL database (fixes password authentication issues)"
+                required: false
+                type: boolean
+                default: false
     schedule:
         # Run SSL renewal check weekly on Sundays at 3am UTC
         - cron: "0 3 * * 0"
@@ -240,6 +245,7 @@ jobs:
 
             - name: 🔍 Check existing SSL certificates
               id: check-certs
+              continue-on-error: true
               run: |
                   echo "🔍 Checking existing SSL certificates..."
 
@@ -248,59 +254,68 @@ jobs:
                   echo "$SSH_KEY" > ~/.ssh/id_rsa
                   chmod 600 ~/.ssh/id_rsa
 
-                  NEEDS_RENEWAL="false"
-                  CERT_INFO=""
-
-                  CERT_CHECK=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p ${{ secrets.SSH_PORT || '22' }} \
-                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.FREDDY_TAILSCALE_IP }} << 'ENDSSH'
-
+                  # Create temporary script for remote execution
+                  cat > /tmp/check_certs.sh << 'SCRIPTEOF'
+                  #!/bin/bash
                   # Check if ssl-certs volume exists and has certificates
                   if docker volume inspect ssl-certs >/dev/null 2>&1; then
                     if docker run --rm -v ssl-certs:/certs:ro busybox:latest test -f /certs/live/7gram.xyz/fullchain.pem 2>/dev/null; then
                       # Get certificate expiry date
-                      EXPIRY_DATE=$(docker run --rm -v ssl-certs:/certs:ro alpine/openssl x509 -in /certs/live/7gram.xyz/fullchain.pem -noout -enddate 2>/dev/null | cut -d= -f2)
-                      EXPIRY_EPOCH=$(date -d "$EXPIRY_DATE" +%s 2>/dev/null || echo "0")
-                      CURRENT_EPOCH=$(date +%s)
-                      DAYS_UNTIL_EXPIRY=$(( ($EXPIRY_EPOCH - $CURRENT_EPOCH) / 86400 ))
+                      EXPIRY_DATE=$(docker run --rm -v ssl-certs:/certs:ro alpine/openssl x509 -in /certs/live/7gram.xyz/fullchain.pem -noout -enddate 2>/dev/null | cut -d= -f2 || echo "")
 
-                      # Get issuer to determine cert type
-                      ISSUER=$(docker run --rm -v ssl-certs:/certs:ro alpine/openssl x509 -in /certs/live/7gram.xyz/fullchain.pem -noout -issuer 2>/dev/null)
+                      if [ -n "$EXPIRY_DATE" ]; then
+                        EXPIRY_EPOCH=$(date -d "$EXPIRY_DATE" +%s 2>/dev/null || echo "0")
+                        CURRENT_EPOCH=$(date +%s)
+                        DAYS_UNTIL_EXPIRY=$(( ($EXPIRY_EPOCH - $CURRENT_EPOCH) / 86400 ))
 
-                      echo "CERT_EXISTS=true"
-                      echo "EXPIRY_DATE=$EXPIRY_DATE"
-                      echo "DAYS_UNTIL_EXPIRY=$DAYS_UNTIL_EXPIRY"
-                      echo "ISSUER=$ISSUER"
+                        # Get issuer to determine cert type
+                        ISSUER=$(docker run --rm -v ssl-certs:/certs:ro alpine/openssl x509 -in /certs/live/7gram.xyz/fullchain.pem -noout -issuer 2>/dev/null || echo "")
 
-                      # Renew if less than 30 days remaining
-                      if [ "$DAYS_UNTIL_EXPIRY" -lt 30 ]; then
-                        echo "NEEDS_RENEWAL=true"
-                      else
-                        echo "NEEDS_RENEWAL=false"
+                        echo "CERT_EXISTS=true"
+                        echo "EXPIRY_DATE=$EXPIRY_DATE"
+                        echo "DAYS_UNTIL_EXPIRY=$DAYS_UNTIL_EXPIRY"
+                        echo "ISSUER=$ISSUER"
+
+                        # Renew if less than 30 days remaining
+                        if [ "$DAYS_UNTIL_EXPIRY" -lt 30 ]; then
+                          echo "NEEDS_RENEWAL=true"
+                        else
+                          echo "NEEDS_RENEWAL=false"
+                        fi
+                        exit 0
                       fi
-                      exit 0
                     fi
                   fi
 
                   echo "CERT_EXISTS=false"
                   echo "NEEDS_RENEWAL=true"
-                  ENDSSH
-                  )
+                  exit 0
+                  SCRIPTEOF
 
-                  # Parse the output
-                  CERT_EXISTS=$(echo "$CERT_CHECK" | grep "CERT_EXISTS=" | cut -d= -f2)
-                  EXPIRY_DATE=$(echo "$CERT_CHECK" | grep "EXPIRY_DATE=" | cut -d= -f2-)
-                  DAYS_UNTIL_EXPIRY=$(echo "$CERT_CHECK" | grep "DAYS_UNTIL_EXPIRY=" | cut -d= -f2)
-                  ISSUER=$(echo "$CERT_CHECK" | grep "ISSUER=" | cut -d= -f2-)
-                  NEEDS_RENEWAL=$(echo "$CERT_CHECK" | grep "NEEDS_RENEWAL=" | cut -d= -f2)
+                  # Run script on remote server
+                  CERT_CHECK=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p ${{ secrets.SSH_PORT || '22' }} \
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.FREDDY_TAILSCALE_IP }} \
+                    'bash -s' < /tmp/check_certs.sh 2>/dev/null || echo "CERT_EXISTS=false
+                  NEEDS_RENEWAL=true")
+
+                  # Clean up temp file
+                  rm -f /tmp/check_certs.sh
+
+                  # Parse the output (use defaults if parsing fails)
+                  CERT_EXISTS=$(echo "$CERT_CHECK" | grep "CERT_EXISTS=" | cut -d= -f2 | head -1 || echo "false")
+                  EXPIRY_DATE=$(echo "$CERT_CHECK" | grep "EXPIRY_DATE=" | cut -d= -f2- | head -1 || echo "")
+                  DAYS_UNTIL_EXPIRY=$(echo "$CERT_CHECK" | grep "DAYS_UNTIL_EXPIRY=" | cut -d= -f2 | head -1 || echo "0")
+                  ISSUER=$(echo "$CERT_CHECK" | grep "ISSUER=" | cut -d= -f2- | head -1 || echo "")
+                  NEEDS_RENEWAL=$(echo "$CERT_CHECK" | grep "NEEDS_RENEWAL=" | cut -d= -f2 | head -1 || echo "true")
 
                   # Clean up SSH key
                   rm -f ~/.ssh/id_rsa
 
-                  # Set outputs
-                  echo "cert_exists=$CERT_EXISTS" >> $GITHUB_OUTPUT
-                  echo "needs_renewal=$NEEDS_RENEWAL" >> $GITHUB_OUTPUT
-                  echo "expiry_date=$EXPIRY_DATE" >> $GITHUB_OUTPUT
-                  echo "days_until_expiry=$DAYS_UNTIL_EXPIRY" >> $GITHUB_OUTPUT
+                  # Set outputs (always set, even if empty)
+                  echo "cert_exists=${CERT_EXISTS:-false}" >> $GITHUB_OUTPUT
+                  echo "needs_renewal=${NEEDS_RENEWAL:-true}" >> $GITHUB_OUTPUT
+                  echo "expiry_date=${EXPIRY_DATE:-unknown}" >> $GITHUB_OUTPUT
+                  echo "days_until_expiry=${DAYS_UNTIL_EXPIRY:-0}" >> $GITHUB_OUTPUT
 
                   # Display results
                   if [ "$CERT_EXISTS" = "true" ]; then
@@ -335,14 +350,51 @@ jobs:
                   propagation-seconds: 60
                   staging: ${{ inputs.use_staging_certs || false }}
                   fallback-to-self-signed: true
-                  deploy-to-server: true
-                  ssh-host: ${{ secrets.FREDDY_TAILSCALE_IP }}
-                  ssh-port: ${{ secrets.SSH_PORT || '22' }}
-                  ssh-user: ${{ secrets.SSH_USER || 'actions' }}
-                  ssh-key: ${{ secrets.SSH_KEY }}
-                  root-ssh-key: ${{ secrets.ROOT_SSH_KEY }}
-                  deploy-method: docker-volume
-                  docker-volume-name: ssl-certs
+                  deploy-to-server: false
+
+            - name: 📦 Deploy certificates to Docker volume
+              id: deploy-certs
+              if: steps.certbot.outcome == 'success'
+              run: |
+                  echo "📦 Deploying SSL certificates to Freddy server..."
+
+                  # Setup SSH key
+                  mkdir -p ~/.ssh
+                  echo "$SSH_KEY" > ~/.ssh/id_rsa
+                  chmod 600 ~/.ssh/id_rsa
+
+                  # Transfer certificate tarball to server
+                  echo "📤 Transferring certificates..."
+                  scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -P ${{ secrets.SSH_PORT || '22' }} \
+                    /tmp/ssl-certs.tar.gz \
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.FREDDY_TAILSCALE_IP }}:/tmp/
+
+                  # Create deployment script
+                  cat > /tmp/deploy_certs.sh << 'SCRIPTEOF'
+                  #!/bin/bash
+                  # Ensure ssl-certs volume exists
+                  docker volume inspect ssl-certs >/dev/null 2>&1 || docker volume create ssl-certs
+
+                  # Extract certificates into the volume and clean up in one step
+                  docker run --rm -v ssl-certs:/certs -v /tmp:/tmp busybox sh -c "cd /certs && tar -xzf /tmp/ssl-certs.tar.gz && ls -la /certs/live/7gram.xyz/ && rm -f /tmp/ssl-certs.tar.gz && echo 'Certificates deployed successfully'"
+
+                  echo "✅ Certificates deployed to ssl-certs Docker volume"
+                  SCRIPTEOF
+
+                  # Deploy to Docker volume on server
+                  echo "🔐 Extracting certificates to Docker volume..."
+                  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p ${{ secrets.SSH_PORT || '22' }} \
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.FREDDY_TAILSCALE_IP }} \
+                    'bash -s' < /tmp/deploy_certs.sh
+
+                  # Clean up SSH key and local files
+                  rm -f ~/.ssh/id_rsa
+                  rm -f /tmp/ssl-certs.tar.gz
+                  rm -f /tmp/deploy_certs.sh
+
+                  echo "✅ SSL certificate deployment complete"
+              env:
+                  SSH_KEY: ${{ secrets.SSH_KEY }}
 
             - name: ✅ Verify SSL certificates in Docker volume
               if: steps.certbot.outcome == 'success' || steps.check-certs.outputs.cert_exists == 'true'
@@ -435,22 +487,9 @@ jobs:
                       # Create project directory if it doesn't exist
                       echo "📁 Ensuring project directory exists..."
                       mkdir -p $HOME/${{ env.PROJECT_PATH }}
-
-                      # Stop existing services to release file locks
-                      echo "🛑 Stopping existing services..."
-                      if [ -d "$HOME/${{ env.PROJECT_PATH }}" ]; then
-                        cd $HOME/${{ env.PROJECT_PATH }}
-                        ./run.sh stop 2>/dev/null || docker compose down 2>/dev/null || true
-                        cd ~
-                      fi
-
-                      # Note: SSL certificate cleanup is handled by the
-                      # force_ssl_regen workflow input. We don't remove certificates
-                      # here to preserve fresh certs from the SSL generation step.
-
-                      # Handle git repository setup
                       cd $HOME/${{ env.PROJECT_PATH }}
 
+                      # Handle git repository setup early (needed for run.sh)
                       if [ -d .git ] && git status >/dev/null 2>&1; then
                         echo "📥 Updating existing repository..."
                         git fetch origin
@@ -470,6 +509,123 @@ jobs:
 
                       # Ensure run.sh is executable
                       chmod +x ./run.sh 2>/dev/null || true
+
+                      echo "🔐 Setting up .env file..."
+
+                      # Try run.sh first (primary method)
+                      ENV_CREATED=false
+                      if [ -f ./run.sh ]; then
+                        echo "   ▶ Running: bash ./run.sh setup-env"
+                        bash ./run.sh setup-env 2>&1 || true
+                        if [ -f .env ] && [ -s .env ]; then
+                          echo "   ✅ .env exists after run.sh ($(wc -l < .env) lines)"
+                          ENV_CREATED=true
+                        fi
+                      fi
+
+                      # Fallback: create .env directly
+                      if [ "$ENV_CREATED" != "true" ]; then
+                        echo "   🔄 Fallback: Creating .env directly..."
+                        GEN_PASS() { openssl rand -base64 24 2>/dev/null | tr -d '/+=' | head -c 16 || cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1; }
+                        GEN_SECRET() { openssl rand -hex 16 2>/dev/null || cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1; }
+
+                        cat > .env << 'ENVEOF'
+                      # Freddy Home Server - Auto-generated by CI/CD fallback
+                      ENVEOF
+                        # Generate with variable expansion
+                        cat >> .env << ENVEOF
+                      TZ=${{ secrets.TZ || 'America/Toronto' }}
+                      PUID=${{ secrets.PUID || '1000' }}
+                      PGID=${{ secrets.PGID || '1000' }}
+                      PHOTOPRISM_ADMIN_PASSWORD=$(GEN_PASS)
+                      PHOTOPRISM_DB_NAME=photoprism
+                      PHOTOPRISM_DB_USER=photoprism
+                      PHOTOPRISM_DB_PASSWORD=$(GEN_PASS)
+                      NEXTCLOUD_DB_NAME=nextcloud
+                      NEXTCLOUD_DB_USER=nextcloud
+                      NEXTCLOUD_DB_PASSWORD=$(GEN_PASS)
+                      NEXTCLOUD_ADMIN_USER=admin
+                      NEXTCLOUD_ADMIN_PASSWORD=$(GEN_PASS)
+                      SULLIVAN_TAILSCALE_IP=${{ secrets.SULLIVAN_TAILSCALE_IP || '100.87.125.19' }}
+                      MEDIA_PATH_AUDIOBOOKS=${{ secrets.MEDIA_PATH_AUDIOBOOKS || '/media/audiobooks' }}
+                      ENVEOF
+                        sed -i 's/^                      //' .env
+                        echo "   ✅ Fallback .env created ($(wc -l < .env) lines)"
+                      fi
+
+                      # Verify critical keys
+                      MISSING_KEYS=0
+                      for key in TZ PHOTOPRISM_ADMIN_PASSWORD NEXTCLOUD_ADMIN_PASSWORD; do
+                        grep -q "^${key}=" .env 2>/dev/null || MISSING_KEYS=$((MISSING_KEYS + 1))
+                      done
+                      if [ "$MISSING_KEYS" -gt 2 ]; then
+                        echo "   ❌ Too many critical keys missing ($MISSING_KEYS)"
+                        exit 1
+                      fi
+                      echo "   ✅ .env verification passed ($(grep -c '^[A-Z_]' .env 2>/dev/null || echo '?') keys)"
+
+                      # Inject secrets from GitHub Actions (if provided)
+                      echo "🔐 Injecting secrets from GitHub Actions..."
+                      if [ -n "${{ secrets.PHOTOPRISM_ADMIN_PASSWORD }}" ]; then
+                        sed -i "s/^PHOTOPRISM_ADMIN_PASSWORD=.*/PHOTOPRISM_ADMIN_PASSWORD=${{ secrets.PHOTOPRISM_ADMIN_PASSWORD }}/" .env
+                      fi
+                      if [ -n "${{ secrets.PHOTOPRISM_DB_PASSWORD }}" ]; then
+                        sed -i "s/^PHOTOPRISM_DB_PASSWORD=.*/PHOTOPRISM_DB_PASSWORD=${{ secrets.PHOTOPRISM_DB_PASSWORD }}/" .env
+                      fi
+                      if [ -n "${{ secrets.NEXTCLOUD_DB_PASSWORD }}" ]; then
+                        sed -i "s/^NEXTCLOUD_DB_PASSWORD=.*/NEXTCLOUD_DB_PASSWORD=${{ secrets.NEXTCLOUD_DB_PASSWORD }}/" .env
+                      fi
+                      if [ -n "${{ secrets.NEXTCLOUD_ADMIN_USER }}" ]; then
+                        sed -i "s/^NEXTCLOUD_ADMIN_USER=.*/NEXTCLOUD_ADMIN_USER=${{ secrets.NEXTCLOUD_ADMIN_USER }}/" .env
+                      fi
+                      if [ -n "${{ secrets.NEXTCLOUD_ADMIN_PASSWORD }}" ]; then
+                        sed -i "s/^NEXTCLOUD_ADMIN_PASSWORD=.*/NEXTCLOUD_ADMIN_PASSWORD=${{ secrets.NEXTCLOUD_ADMIN_PASSWORD }}/" .env
+                      fi
+                      echo "   ✅ Secrets injected"
+
+                      chmod 600 .env
+                      echo ""
+
+                      # Ensure all bind-mount directories for Docker volumes exist
+                      # Docker will NOT auto-create these for local driver bind mounts
+                      # Uses a busybox container to create dirs as root (no sudo needed)
+                      echo "📁 Ensuring volume mount directories exist..."
+                      docker run --rm -v /mnt/1tb:/mnt busybox sh -c "\
+                        mkdir -p \
+                          /mnt/photos \
+                          /mnt/photoprism/storage \
+                          /mnt/photoprism/postgres \
+                          /mnt/nextcloud/html \
+                          /mnt/nextcloud/data \
+                          /mnt/nextcloud/postgres \
+                          /mnt/homeassistant \
+                        && chown -R 33:33 /mnt/nextcloud/html /mnt/nextcloud/data \
+                        && echo '  ✅ Volume directories ready'"
+
+                      # Reset Nextcloud PostgreSQL database if requested
+                      # This fixes password authentication issues when credentials don't match existing database
+                      if [ "${{ inputs.reset_nextcloud_db }}" = "true" ]; then
+                        echo "🔄 Resetting Nextcloud PostgreSQL database..."
+                        echo "   ⚠️  This will DELETE all Nextcloud database data!"
+                        echo "   (Fixes password mismatch issues)"
+                        docker stop nextcloud nextcloud-cron nextcloud-postgres 2>/dev/null || true
+                        docker rm nextcloud nextcloud-cron nextcloud-postgres 2>/dev/null || true
+                        docker run --rm -v /mnt/1tb:/mnt busybox sh -c "\
+                          rm -rf /mnt/nextcloud/postgres/* \
+                          && echo '  ✅ Nextcloud PostgreSQL data reset (will reinitialize with current credentials)'"
+                      fi
+
+                      # Stop existing services to release file locks
+                      echo "🛑 Stopping existing services..."
+                      if [ -d "$HOME/${{ env.PROJECT_PATH }}" ]; then
+                        cd $HOME/${{ env.PROJECT_PATH }}
+                        ./run.sh stop 2>/dev/null || docker compose down 2>/dev/null || true
+                        cd ~
+                      fi
+
+                      # Note: SSL certificate cleanup is handled by the
+                      # force_ssl_regen workflow input. We don't remove certificates
+                      # here to preserve fresh certs from the SSL generation step.
 
                       # Verify SSL certificates are ready in Docker volume
                       echo "🔍 Checking for SSL certificates in Docker volume..."
