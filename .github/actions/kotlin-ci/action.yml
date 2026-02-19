@@ -239,7 +239,7 @@ runs:
 
         - name: 📊 Publish JUnit report
           if: always() && inputs.run-tests == 'true'
-          uses: mikepenz/action-junit-report@v4
+          uses: mikepenz/action-junit-report@v5
           with:
               report_paths: "${{ inputs.working-directory }}/**/build/test-results/**/TEST-*.xml"
               check_name: "Kotlin/KMP Test Report"

@@ -30,6 +30,10 @@ inputs:
         description: "SSH connection timeout in seconds"
         required: false
         default: "30"
+    command-timeout:
+        description: "Timeout in seconds for remote commands (0 = no timeout)"
+        required: false
+        default: "0"
     use-tailscale-ssh:
         description: "Try Tailscale SSH first before regular SSH"
         required: false
@@ -137,6 +141,20 @@ inputs:
         description: "Prune unused Docker resources after deploy"
         required: false
         default: "true"
+
+    # ── Env Generation ──────────────────────────────────────────────────────
+    env-setup-command:
+        description: "Command to generate or update the .env file on the server (runs in project-path). If empty, no .env setup is performed by the action."
+        required: false
+        default: ""
+    env-inject-secrets:
+        description: |
+            Newline-separated KEY=VALUE pairs to inject/override in the .env file after env-setup-command runs.
+            Example:
+              DISCORD_WEBHOOK_GENERAL=https://discord.com/api/webhooks/...
+              KRAKEN_API_KEY=abc123
+        required: false
+        default: ""
 
     # ── Env Files (legacy) ──────────────────────────────────────────────────
     env-files:
@@ -337,13 +355,20 @@ runs:
               POST_DEPLOY_COMMAND: ${{ inputs.post-deploy-command }}
               # Cleanup
               DOCKER_PRUNE: ${{ inputs.docker-prune }}
+              # Timeout
+              CMD_TIMEOUT: ${{ inputs.command-timeout }}
+              # Env generation
+              ENV_SETUP_COMMAND: ${{ inputs.env-setup-command }}
+              ENV_INJECT_SECRETS: ${{ inputs.env-inject-secrets }}
               # Legacy
               ENV_FILES: ${{ inputs.env-files }}
           run: |
               set -euo pipefail
 
               # ── SSH execution helper ──────────────────────────────────────
-              # Wraps commands with retry logic and proper error handling.
+              # Wraps commands with retry logic, optional timeout, and proper
+              # error handling.  The command is piped via stdin to bash -s so
+              # multi-line scripts work correctly.
               # Usage: ssh_exec "command" [retries] [delay]
               ssh_exec() {
                 local cmd="$1"
@@ -352,24 +377,30 @@ runs:
                 local attempt=0
                 local exit_code=0
 
+                # Build optional timeout prefix for the SSH call
+                local timeout_prefix=""
+                if [ "${CMD_TIMEOUT:-0}" -gt 0 ] 2>/dev/null; then
+                  timeout_prefix="timeout ${CMD_TIMEOUT}"
+                fi
+
                 while [ $attempt -lt $max_retries ]; do
                   attempt=$((attempt + 1))
                   exit_code=0
 
-                  # Pipe the command via stdin (bash -s) to avoid all quoting issues
-                  # with single/double quotes inside the command string.
+                  # Pipe the command via stdin (bash -s) to avoid all quoting
+                  # issues with single/double quotes inside the command string.
                   case "$SSH_METHOD" in
                     tailscale)
-                      printf '%s' "$cmd" | tailscale ssh ${SSH_USER}@${SSH_HOST} "bash -s" || exit_code=$?
+                      printf '%s' "$cmd" | $timeout_prefix tailscale ssh ${SSH_USER}@${SSH_HOST} "bash -s" || exit_code=$?
                       ;;
                     key)
-                      printf '%s' "$cmd" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                      printf '%s' "$cmd" | $timeout_prefix ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                           -o ServerAliveInterval=15 -o ServerAliveCountMax=6 \
                           -p ${SSH_PORT} -i ~/.ssh/deploy_key \
                           ${SSH_USER}@${SSH_HOST} "bash -s" || exit_code=$?
                       ;;
                     password)
-                      printf '%s' "$cmd" | sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
+                      printf '%s' "$cmd" | $timeout_prefix sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
                           -o UserKnownHostsFile=/dev/null \
                           -o ServerAliveInterval=15 -o ServerAliveCountMax=6 \
                           -p ${SSH_PORT} \
@@ -379,6 +410,11 @@ runs:
 
                   if [ $exit_code -eq 0 ]; then
                     return 0
+                  fi
+
+                  # Exit code 124 = timeout killed the process
+                  if [ $exit_code -eq 124 ]; then
+                    echo "  ⏱️  Command timed out after ${CMD_TIMEOUT}s"
                   fi
 
                   if [ $attempt -lt $max_retries ]; then
@@ -453,7 +489,8 @@ runs:
                 echo "════════════════════════════════════════════════════════════"
                 echo "⚙️  PHASE 1: Pre-Deploy"
                 echo "════════════════════════════════════════════════════════════"
-                ssh_exec "cd '${PROJECT_PATH}' 2>/dev/null || cd ~ && ${PRE_DEPLOY_COMMAND}"
+                ssh_exec "cd '${PROJECT_PATH}' 2>/dev/null || cd ~
+              ${PRE_DEPLOY_COMMAND}"
               fi
 
               # ── Phase 2: Git pull ─────────────────────────────────────────
@@ -484,6 +521,48 @@ runs:
                 done || echo "  (No env files to create or JSON parsing skipped)"
               fi
 
+              # ── Phase 3b: .env generation via env-setup-command ───────────
+              if [ -n "${ENV_SETUP_COMMAND}" ]; then
+                echo ""
+                echo "════════════════════════════════════════════════════════════"
+                echo "📝 PHASE 3b: .env Generation"
+                echo "════════════════════════════════════════════════════════════"
+                ssh_exec "cd '${PROJECT_PATH}' || { echo 'FATAL: cannot cd to ${PROJECT_PATH}'; exit 1; }
+              ${ENV_SETUP_COMMAND}"
+              fi
+
+              # ── Phase 3c: Inject secrets into .env ────────────────────────
+              if [ -n "${ENV_INJECT_SECRETS}" ]; then
+                echo ""
+                echo "🔐 Injecting secrets into .env..."
+                # Build a remote script that injects each KEY=VALUE into .env
+                INJECT_SCRIPT="cd '${PROJECT_PATH}' || exit 1
+              if [ ! -f .env ]; then
+                echo '  ⚠️  No .env file found — creating one'
+                touch .env
+                chmod 600 .env
+              fi
+              "
+                while IFS= read -r line; do
+                  # Skip empty lines and comments
+                  [ -z "$line" ] && continue
+                  [[ "$line" == \#* ]] && continue
+                  KEY="${line%%=*}"
+                  VAL="${line#*=}"
+                  if [ -n "$KEY" ]; then
+                    INJECT_SCRIPT="${INJECT_SCRIPT}
+              if grep -q \"^${KEY}=\" .env 2>/dev/null; then
+                sed -i \"s|^${KEY}=.*|${KEY}=${VAL}|\" .env
+              else
+                echo '${KEY}=${VAL}' >> .env
+              fi"
+                  fi
+                done <<< "$ENV_INJECT_SECRETS"
+                INJECT_SCRIPT="${INJECT_SCRIPT}
+              echo '  ✅ Secrets injected into .env'"
+                ssh_exec "$INJECT_SCRIPT"
+              fi
+
               # ── Phase 4: Deploy ───────────────────────────────────────────
               echo ""
               echo "════════════════════════════════════════════════════════════"
@@ -493,7 +572,8 @@ runs:
               # If a custom deploy command is provided, it overrides everything
               if [ -n "${DEPLOY_COMMAND}" ]; then
                 echo "⚙️  Running custom deploy command..."
-                ssh_exec "cd '${PROJECT_PATH}' && ${DEPLOY_COMMAND}"
+                ssh_exec "cd '${PROJECT_PATH}' || { echo 'FATAL: cannot cd to ${PROJECT_PATH}'; exit 1; }
+              ${DEPLOY_COMMAND}"
                 echo "build_strategy=custom" >> $GITHUB_OUTPUT
                 echo "services=custom" >> $GITHUB_OUTPUT
 
@@ -502,10 +582,13 @@ runs:
                 # Pull pre-built images from registry, then start services.
                 echo "🐳 Strategy: Pull from DockerHub"
 
-                # Docker login on remote
+                # Docker login on remote — base64-encode the password to avoid
+                # shell expansion issues with special characters (', $, `, \).
+                # The password is decoded on the remote side and piped to docker login.
                 if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
                   echo "🔑 Logging into Docker registry (${DOCKER_REGISTRY})..."
-                  ssh_exec "echo '${DOCKER_PASSWORD}' | docker login -u '${DOCKER_USERNAME}' --password-stdin '${DOCKER_REGISTRY}'" 2 5
+                  DOCKER_PASS_B64=$(printf '%s' "${DOCKER_PASSWORD}" | base64 -w0)
+                  ssh_exec "echo '${DOCKER_PASS_B64}' | base64 -d | docker login -u '${DOCKER_USERNAME}' --password-stdin '${DOCKER_REGISTRY}'" 2 5
                 fi
 
                 # Stop app services (keep infra running)
@@ -541,10 +624,12 @@ runs:
                 # Build images directly on the server from source.
                 echo "🔨 Strategy: Build on server"
 
-                # Docker login (may be needed for base images)
+                # Docker login (may be needed for base images) — base64-encode
+                # the password to avoid shell expansion issues.
                 if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
                   echo "🔑 Logging into Docker registry (${DOCKER_REGISTRY})..."
-                  ssh_exec "echo '${DOCKER_PASSWORD}' | docker login -u '${DOCKER_USERNAME}' --password-stdin '${DOCKER_REGISTRY}'" 2 5
+                  DOCKER_PASS_B64=$(printf '%s' "${DOCKER_PASSWORD}" | base64 -w0)
+                  ssh_exec "echo '${DOCKER_PASS_B64}' | base64 -d | docker login -u '${DOCKER_USERNAME}' --password-stdin '${DOCKER_REGISTRY}'" 2 5
                 fi
 
                 # Stop app services (keep infra running)
@@ -609,7 +694,8 @@ runs:
                 echo "════════════════════════════════════════════════════════════"
                 echo "⚙️  PHASE 7: Post-Deploy"
                 echo "════════════════════════════════════════════════════════════"
-                ssh_exec "cd '${PROJECT_PATH}' && ${POST_DEPLOY_COMMAND}"
+                ssh_exec "cd '${PROJECT_PATH}' || { echo 'FATAL: cannot cd to ${PROJECT_PATH}'; exit 1; }
+              ${POST_DEPLOY_COMMAND}"
               fi
 
               echo ""
@@ -621,6 +707,12 @@ runs:
         # ─────────────────────────────────────────────────────────────────────
         # SUMMARY
         # ─────────────────────────────────────────────────────────────────────
+        - name: 🧹 Cleanup SSH keys
+          if: always()
+          shell: bash
+          run: |
+              rm -f ~/.ssh/deploy_key ~/.ssh/config 2>/dev/null || true
+
         - name: 📊 Deployment Summary
           if: always()
           shell: bash

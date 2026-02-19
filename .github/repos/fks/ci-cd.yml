@@ -4,24 +4,40 @@
 # Streamlined pipeline using reusable composite actions from nuniesmith/actions.
 #
 # Pipeline Flow:
-# 1. Setup - Determine environment, build strategy, target host
-# 2. Tests - Rust & KMP (skippable)
-# 3. Docker Build & Push - Multi-service matrix build (dockerhub strategy only)
-# 4. Deploy - Tailscale → DNS → SSL → SSH Deploy → Health Checks
-# 5. Summary - Pipeline results
+#   1. Setup     — Determine environment, build strategy, test eligibility
+#   2. Lint      — rustfmt + clippy (fast gate, blocks all test jobs)
+#   3. Tests     — 4 parallel test groups split by domain:
+#                  ├─ Core & Libraries   (~680 tests)  — foundational crates
+#                  ├─ Neuromorphic       (~5200 tests) — brain-region modules
+#                  ├─ Services           (~2100 tests) — forward, execution, data, etc.
+#                  └─ Trading & ML       (~1900 tests) — strategies, backtest, ML, audit
+#   4. KMP Tests — Kotlin Multiplatform (separate runner)
+#   5. Docker    — Multi-service matrix build (gated by tests)
+#   6. Deploy    — Tailscale → DNS → SSL → SSH Deploy → Health Checks
+#   7. Summary   — Pipeline results
 #
 # Build Strategies:
-# - server-build: Build Docker images directly on the prod server (default)
-# - dockerhub:    Build in CI, push to DockerHub, pull on server
+#   - server-build: Build Docker images directly on the prod server
+#   - dockerhub:    Build in CI, push to DockerHub, pull on server (default)
 #
 # Required Secrets:
-# - PROD_TAILSCALE_IP, PROD_SSH_KEY, PROD_SSH_USER, PROD_SSH_PORT
-# - PROD_ROOT_SSH_KEY (root SSH key for SSL cert deployment)
-# - TAILSCALE_OAUTH_CLIENT_ID, TAILSCALE_OAUTH_SECRET
-# - DOCKER_USERNAME, DOCKER_TOKEN
-# - CLOUDFLARE_API_KEY, CLOUDFLARE_ZONE_ID
-# - SSL_EMAIL
-# - DISCORD_WEBHOOK_ACTIONS (optional)
+#   - PROD_TAILSCALE_IP, PROD_SSH_KEY, PROD_SSH_USER, PROD_SSH_PORT
+#   - PROD_ROOT_SSH_KEY (root SSH key for SSL cert deployment)
+#   - STAGING_TAILSCALE_IP (optional — falls back to PROD_TAILSCALE_IP)
+#   - TAILSCALE_OAUTH_CLIENT_ID, TAILSCALE_OAUTH_SECRET
+#   - DOCKER_USERNAME, DOCKER_TOKEN
+#   - DOCKER_IMAGE_NAME (optional, default: nuniesmith/fks)
+#   - CLOUDFLARE_API_KEY, CLOUDFLARE_ZONE_ID
+#   - SSL_EMAIL
+#   - SSL_VOLUME_NAME (optional, default: fks_ssl_certs)
+#   - PROD_DOMAIN (optional, default: fkstrading.xyz)
+#   - STAGING_DOMAIN (optional, default: staging.fkstrading.xyz)
+#   - DISCORD_WEBHOOK_ACTIONS (optional — deployment notifications)
+#   - DISCORD_WEBHOOK_GENERAL (optional — injected into .env for alertmanager)
+#   - DISCORD_WEBHOOK_URL, DISCORD_BOT_TOKEN (optional — injected into .env)
+#   - KRAKEN_API_KEY, KRAKEN_API_SECRET (optional — injected into .env)
+#   - BYBIT_API_KEY, BYBIT_API_SECRET (optional — injected into .env)
+#   - BINANCE_API_KEY, BINANCE_API_SECRET (optional — injected into .env)
 # =============================================================================
 
 name: 🚀 CI/CD Pipeline
@@ -48,7 +64,7 @@ on:
                 type: boolean
                 default: false
             skip_tests:
-                description: "Skip all Rust tests including ML/Backward crates (faster deploys)"
+                description: "Skip all Rust tests (faster deploys)"
                 required: false
                 type: boolean
                 default: false
@@ -81,9 +97,10 @@ env:
     RUST_VERSION: "1.92.0"
     CARGO_TERM_COLOR: always
     REGISTRY: docker.io
-    IMAGE_NAME: nuniesmith/fks
-    DOMAIN: fkstrading.xyz
-    STAGING_DOMAIN: staging.fkstrading.xyz
+    IMAGE_NAME: ${{ secrets.DOCKER_IMAGE_NAME || 'nuniesmith/fks' }}
+    DOMAIN: ${{ secrets.PROD_DOMAIN || 'fkstrading.xyz' }}
+    STAGING_DOMAIN: ${{ secrets.STAGING_DOMAIN || 'staging.fkstrading.xyz' }}
+    SSL_VOLUME_NAME: ${{ secrets.SSL_VOLUME_NAME || 'fks_ssl_certs' }}
 
 concurrency:
     group: ${{ github.workflow }}-${{ github.ref }}
@@ -107,9 +124,6 @@ jobs:
             build_strategy: ${{ steps.determine-env.outputs.build_strategy }}
             should_deploy: ${{ steps.determine-env.outputs.should_deploy }}
             should_test: ${{ steps.determine-env.outputs.should_test }}
-            # NOTE: target_host is NOT passed cross-job (GitHub Actions drops it).
-            # Instead, the deploy job resolves the host IP directly from secrets
-            # via the 'resolve-host' step. See STAGE 4.
         steps:
             - name: 🎯 Determine deployment environment
               id: determine-env
@@ -165,12 +179,9 @@ jobs:
                   fi
 
                   # ── Determine build strategy ───────────────────────────────
-                  # Default to dockerhub (aligned with workflow_dispatch default)
                   STRATEGY="${INPUT_STRATEGY:-dockerhub}"
 
                   # ── Determine deploy eligibility ───────────────────────────
-                  # Centralize the "should we deploy?" decision here so downstream
-                  # jobs use a simple boolean instead of re-evaluating conditions.
                   SHOULD_DEPLOY="false"
                   if [ "$INPUT_SKIP_DEPLOY" != "true" ]; then
                     if [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -181,8 +192,13 @@ jobs:
                   fi
 
                   # ── Determine test eligibility ─────────────────────────────
-                  # Tests disabled — focusing on getting deployment working
-                  SHOULD_TEST="false"
+                  # Tests run by default. Skip only when explicitly requested
+                  # via workflow_dispatch input.
+                  if [ "$INPUT_SKIP_TESTS" = "true" ]; then
+                    SHOULD_TEST="false"
+                  else
+                    SHOULD_TEST="true"
+                  fi
 
                   # ── Debug output ───────────────────────────────────────────
                   echo "🎯 Environment:    $ENV"
@@ -228,22 +244,19 @@ jobs:
                   EOF
 
     # =========================================================================
-    # STAGE 2: TESTS
+    # STAGE 2a: LINT (fast gate — blocks all test jobs)
     # =========================================================================
-    test-rust:
-        name: 🦀 Rust Tests (disabled)
+    test-lint:
+        name: 🧹 Lint & Format
         runs-on: ubuntu-latest
-        timeout-minutes: 60
+        timeout-minutes: 20
         needs: [setup]
-        if: false # Tests disabled — focusing on deployment
-        env:
-            # Reduce build parallelism to avoid OOM on CI runners
-            CARGO_BUILD_JOBS: 4
+        if: needs.setup.outputs.should_test == 'true'
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
-            - name: 🦀 Run Rust CI
+            - name: 🦀 Run Lint Checks
               uses: nuniesmith/actions/.github/actions/rust-ci@main
               with:
                   toolchain: ${{ env.RUST_VERSION }}
@@ -251,18 +264,485 @@ jobs:
                   install-protobuf: "true"
                   run-fmt: "true"
                   run-clippy: "true"
-                  run-tests: "true"
+                  run-tests: "false"
                   run-build: "false"
                   workspace: "true"
                   all-features: "false"
                   clippy-args: "--all-targets"
 
+    # =========================================================================
+    # STAGE 2b: TESTS (4 parallel groups, gated by lint)
+    # =========================================================================
+    #
+    # Test groups are split by domain to maximize parallelism on CI runners.
+    # Each group compiles only its packages, keeping memory and time bounded.
+    #
+    # Group           │ Packages                                    │ ~Tests
+    # ────────────────┼─────────────────────────────────────────────┼────────
+    # core            │ Core libs, utilities, small crates          │   ~680
+    # neuromorphic    │ janus-neuromorphic (brain regions)          │  ~5200
+    # services        │ forward, execution, data, gateway, etc.    │  ~2100
+    # trading         │ strategies, ML, backtest, regime, audit     │  ~1900
+    # =========================================================================
+
+    test-core:
+        name: 🧱 Tests — Core & Libraries
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: [setup, test-lint]
+        if: needs.setup.outputs.should_test == 'true'
+        env:
+            CARGO_BUILD_JOBS: 4
+            CARGO_INCREMENTAL: 0
+            RUSTFLAGS: "-D warnings"
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+
+            - name: 📦 Install protobuf compiler
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+
+            - name: 🗄️ Cargo cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-cargo-core-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-core-
+                      ${{ runner.os }}-cargo-
+
+            - name: 📦 Install cargo-nextest
+              uses: taiki-e/install-action@nextest
+
+            - name: 🧪 Run core & library tests
+              run: |
+                  echo "::group::Running core & library tests"
+                  cargo nextest run --profile ci \
+                    -p janus-core \
+                    -p common \
+                    -p fks-proto \
+                    -p janus-health \
+                    -p janus-indicators \
+                    -p janus-models \
+                    -p janus-compliance \
+                    -p janus-gap-detection \
+                    -p janus-rate-limiter \
+                    -p janus-questdb-writer \
+                    -p janus-bybit-client \
+                    -p logic \
+                    -p memory \
+                    -p training \
+                    -p janus-data-quality \
+                    -p janus-dsp \
+                    -p janus-ltn \
+                    -p janus-risk \
+                    -p janus-exchanges \
+                    -p apalis-redis \
+                    --color always
+                  echo "::endgroup::"
+
+            - name: 📊 Publish Test Report — Core & Libraries
+              uses: mikepenz/action-junit-report@v5
+              if: always()
+              with:
+                  check_name: "🧱 Rust — Core & Libraries"
+                  report_paths: "target/nextest/ci/junit.xml"
+                  include_passed: true
+                  detailed_summary: true
+                  fail_on_failure: false
+
+            - name: 📤 Upload JUnit XML
+              uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: junit-core
+                  path: target/nextest/ci/junit.xml
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    test-neuro-core:
+        name: 🧠 Tests — Neuromorphic (Core)
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        needs: [setup, test-lint]
+        if: needs.setup.outputs.should_test == 'true'
+        env:
+            CARGO_BUILD_JOBS: 4
+            CARGO_INCREMENTAL: 0
+            RUSTFLAGS: "-D warnings"
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+
+            - name: 📦 Install protobuf compiler
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+
+            - name: 🗄️ Cargo cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-cargo-neuro-core-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-neuro-core-
+                      ${{ runner.os }}-cargo-neuro-
+                      ${{ runner.os }}-cargo-
+
+            - name: 📦 Install cargo-nextest
+              uses: taiki-e/install-action@nextest
+
+            - name: 🧪 Run neuromorphic tests (excluding ViViT)
+              run: |
+                  echo "::group::Running neuromorphic core tests (~5100 tests)"
+                  cargo nextest run --profile ci \
+                    -p janus-neuromorphic \
+                    -E 'not test(~visual_cortex::vivit)' \
+                    --color always
+                  echo "::endgroup::"
+
+            - name: 📊 Publish Test Report — Neuromorphic (Core)
+              uses: mikepenz/action-junit-report@v5
+              if: always()
+              with:
+                  check_name: "🧠 Rust — Neuromorphic (Core)"
+                  report_paths: "target/nextest/ci/junit.xml"
+                  include_passed: true
+                  detailed_summary: true
+                  fail_on_failure: false
+
+            - name: 📤 Upload JUnit XML
+              uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: junit-neuro-core
+                  path: target/nextest/ci/junit.xml
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    test-neuro-vivit:
+        name: 🧠 Tests — Neuromorphic (ViViT)
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: [setup, test-lint]
+        if: needs.setup.outputs.should_test == 'true'
+        env:
+            CARGO_BUILD_JOBS: 4
+            CARGO_INCREMENTAL: 0
+            RUSTFLAGS: "-D warnings"
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+
+            - name: 📦 Install protobuf compiler
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+
+            - name: 🗄️ Cargo cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-cargo-neuro-vivit-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-neuro-vivit-
+                      ${{ runner.os }}-cargo-neuro-
+                      ${{ runner.os }}-cargo-
+
+            - name: 📦 Install cargo-nextest
+              uses: taiki-e/install-action@nextest
+
+            - name: 🧪 Run ViViT tests (ci-heavy profile — extended timeouts)
+              run: |
+                  echo "::group::Running ViViT visual cortex tests"
+                  cargo nextest run --profile ci-heavy \
+                    -p janus-neuromorphic \
+                    -E 'test(~visual_cortex::vivit)' \
+                    --run-ignored all \
+                    --color always
+                  echo "::endgroup::"
+
+            - name: 📊 Publish Test Report — Neuromorphic (ViViT)
+              uses: mikepenz/action-junit-report@v5
+              if: always()
+              with:
+                  check_name: "🧠 Rust — Neuromorphic (ViViT)"
+                  report_paths: "target/nextest/ci-heavy/junit-heavy.xml"
+                  include_passed: true
+                  detailed_summary: true
+                  fail_on_failure: false
+
+            - name: 📤 Upload JUnit XML
+              uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: junit-neuro-vivit
+                  path: target/nextest/ci-heavy/junit-heavy.xml
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    test-services:
+        name: ⚙️ Tests — Services
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: [setup, test-lint]
+        if: needs.setup.outputs.should_test == 'true'
+        env:
+            CARGO_BUILD_JOBS: 4
+            CARGO_INCREMENTAL: 0
+            RUSTFLAGS: "-D warnings"
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+
+            - name: 📦 Install protobuf compiler
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+
+            - name: 🗄️ Cargo cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-cargo-svc-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-svc-
+                      ${{ runner.os }}-cargo-
+
+            - name: 📦 Install cargo-nextest
+              uses: taiki-e/install-action@nextest
+
+            - name: 🧪 Run service tests
+              run: |
+                  echo "::group::Running service tests"
+                  cargo nextest run --profile ci \
+                    -p janus-forward \
+                    -p janus-execution \
+                    -p janus-data \
+                    -p janus-gateway \
+                    -p janus-api \
+                    -p janus-backward \
+                    -p janus-cns-service \
+                    -p janus-optimizer-service \
+                    -p janus-registry-lib \
+                    -p janus-registry-service \
+                    --color always
+                  echo "::endgroup::"
+
+            - name: 📊 Publish Test Report — Services
+              uses: mikepenz/action-junit-report@v5
+              if: always()
+              with:
+                  check_name: "⚙️ Rust — Services"
+                  report_paths: "target/nextest/ci/junit.xml"
+                  include_passed: true
+                  detailed_summary: true
+                  fail_on_failure: false
+
+            - name: 📤 Upload JUnit XML
+              uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: junit-services
+                  path: target/nextest/ci/junit.xml
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    test-trading:
+        name: 📈 Tests — Trading & ML (Janus)
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: [setup, test-lint]
+        if: needs.setup.outputs.should_test == 'true'
+        env:
+            CARGO_BUILD_JOBS: 4
+            CARGO_INCREMENTAL: 0
+            RUSTFLAGS: "-D warnings"
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+
+            - name: 📦 Install protobuf compiler
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+
+            - name: 🗄️ Cargo cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-cargo-trading-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-trading-
+                      ${{ runner.os }}-cargo-
+
+            - name: 📦 Install cargo-nextest
+              uses: taiki-e/install-action@nextest
+
+            - name: 🧪 Run trading & ML tests
+              run: |
+                  echo "::group::Running trading & ML tests (Janus)"
+                  cargo nextest run --profile ci \
+                    -p janus-strategies \
+                    -p janus-cns \
+                    -p janus-ml \
+                    -p janus-regime \
+                    -p janus-optimizer \
+                    -p janus-backtest \
+                    -p janus-lob \
+                    --color always
+                  echo "::endgroup::"
+
+            - name: 📊 Publish Test Report — Trading & ML
+              uses: mikepenz/action-junit-report@v5
+              if: always()
+              with:
+                  check_name: "📈 Rust — Trading & ML (Janus)"
+                  report_paths: "target/nextest/ci/junit.xml"
+                  include_passed: true
+                  detailed_summary: true
+                  fail_on_failure: false
+
+            - name: 📤 Upload JUnit XML
+              uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: junit-trading
+                  path: target/nextest/ci/junit.xml
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    # ── fks-audit (independent of Janus) ─────────────────────────────────
+
+    test-audit:
+        name: 🔍 Tests — Audit (fks-audit)
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [setup, test-lint]
+        if: needs.setup.outputs.should_test == 'true'
+        env:
+            CARGO_BUILD_JOBS: 4
+            CARGO_INCREMENTAL: 0
+            RUSTFLAGS: "-D warnings"
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+
+            - name: 📦 Install protobuf compiler
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+
+            - name: 🗄️ Cargo cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-audit-
+                      ${{ runner.os }}-cargo-
+
+            - name: 📦 Install cargo-nextest
+              uses: taiki-e/install-action@nextest
+
+            - name: 🧪 Run audit tests
+              run: |
+                  echo "::group::Running fks-audit tests"
+                  cargo nextest run --profile ci \
+                    -p fks-audit \
+                    --color always
+                  echo "::endgroup::"
+
+            - name: 📊 Publish Test Report — Audit
+              uses: mikepenz/action-junit-report@v5
+              if: always()
+              with:
+                  check_name: "🔍 Rust — Audit (fks-audit)"
+                  report_paths: "target/nextest/ci/junit.xml"
+                  include_passed: true
+                  detailed_summary: true
+                  fail_on_failure: false
+
+            - name: 📤 Upload JUnit XML
+              uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: junit-audit
+                  path: target/nextest/ci/junit.xml
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    # =========================================================================
+    # STAGE 2c: KMP TESTS
+    # =========================================================================
     test-kmp:
-        name: 📱 KMP Tests (disabled)
+        name: 📱 KMP Tests
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs: [setup]
-        if: false # Tests disabled — focusing on deployment
+        if: needs.setup.outputs.should_test == 'true'
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -279,16 +759,142 @@ jobs:
                   upload-test-results: "true"
 
     # =========================================================================
-    # STAGE 3: DOCKER BUILD (only for dockerhub strategy)
+    # STAGE 2d: INTEGRATION TESTS (with service containers)
+    # =========================================================================
+    #
+    # These tests require real infrastructure (Redis, QuestDB) and are marked
+    # #[ignore] in the source. We run them here with --run-ignored ignored-only
+    # so they execute against the service containers below.
+    # =========================================================================
+    test-integration:
+        name: 🔗 Tests — Integration (DB)
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs: [setup, test-lint]
+        if: needs.setup.outputs.should_test == 'true'
+        services:
+            redis:
+                image: redis:7-alpine
+                ports:
+                    - 6379:6379
+                options: >-
+                    --health-cmd "redis-cli ping"
+                    --health-interval 10s
+                    --health-timeout 5s
+                    --health-retries 5
+            questdb:
+                image: questdb/questdb:9.3.2
+                ports:
+                    - 9000:9000
+                    - 9009:9009
+                options: >-
+                    --health-cmd "curl -sf http://localhost:9000/exec?query=SELECT%201 || exit 1"
+                    --health-interval 10s
+                    --health-timeout 5s
+                    --health-retries 15
+                    --health-start-period 30s
+        env:
+            CARGO_BUILD_JOBS: 4
+            CARGO_INCREMENTAL: 0
+            RUSTFLAGS: "-D warnings"
+            QUESTDB_HOST: localhost
+            QUESTDB_ILP_PORT: 9009
+            REDIS_URL: "redis://localhost:6379"
+            RUN_INTEGRATION_TESTS: "1"
+            KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+            KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+
+            - name: 📦 Install protobuf compiler
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+
+            - name: 🗄️ Cargo cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-cargo-integ-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-integ-
+                      ${{ runner.os }}-cargo-
+
+            - name: 📦 Install cargo-nextest
+              uses: taiki-e/install-action@nextest
+
+            - name: 🧪 Run integration tests (ignored tests with DB + Kraken services)
+              run: |
+                  echo "::group::Running integration tests against Redis + QuestDB + Kraken"
+                  cargo nextest run --profile ci \
+                    --run-ignored ignored-only \
+                    -p janus-data \
+                    -p janus-rate-limiter \
+                    -p apalis-redis \
+                    -p janus-execution \
+                    --color always
+                  echo "::endgroup::"
+
+            - name: 📊 Publish Test Report — Integration
+              uses: mikepenz/action-junit-report@v5
+              if: always()
+              with:
+                  check_name: "🔗 Rust — Integration (DB + Kraken)"
+                  report_paths: "target/nextest/ci/junit.xml"
+                  include_passed: true
+                  detailed_summary: true
+                  fail_on_failure: false
+
+            - name: 📤 Upload JUnit XML
+              uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: junit-integration
+                  path: target/nextest/ci/junit.xml
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    # =========================================================================
+    # STAGE 3: DOCKER BUILD (gated by tests — only runs after all tests pass)
     # =========================================================================
     docker-build:
         name: 🐳 Docker (${{ matrix.service.name }})
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup]
+        needs:
+            [
+                setup,
+                test-lint,
+                test-core,
+                test-neuro-core,
+                test-neuro-vivit,
+                test-services,
+                test-trading,
+                test-audit,
+                test-integration,
+            ]
         if: |
             always() &&
             needs.setup.result == 'success' &&
+            (needs.test-lint.result == 'success' || needs.test-lint.result == 'skipped') &&
+            (needs.test-core.result == 'success' || needs.test-core.result == 'skipped') &&
+            (needs.test-neuro-core.result == 'success' || needs.test-neuro-core.result == 'skipped') &&
+            (needs.test-neuro-vivit.result == 'success' || needs.test-neuro-vivit.result == 'skipped') &&
+            (needs.test-services.result == 'success' || needs.test-services.result == 'skipped') &&
+            (needs.test-trading.result == 'success' || needs.test-trading.result == 'skipped') &&
+            (needs.test-audit.result == 'success' || needs.test-audit.result == 'skipped') &&
+            (needs.test-integration.result == 'success' || needs.test-integration.result == 'skipped') &&
             needs.setup.outputs.build_strategy == 'dockerhub' &&
             needs.setup.outputs.should_deploy == 'true'
         strategy:
@@ -315,6 +921,10 @@ jobs:
                       dockerfile: infrastructure/docker/services/nginx/Dockerfile
                       target: production
                       build_args: ""
+                    - name: redis
+                      dockerfile: infrastructure/docker/services/redis/Dockerfile
+                      target: production
+                      build_args: ""
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
@@ -339,15 +949,43 @@ jobs:
     # =========================================================================
     # STAGE 4: DEPLOY
     # =========================================================================
+    # Deploy is gated on:
+    #   - setup succeeded
+    #   - Docker build succeeded (or was skipped for server-build strategy)
+    #   - ALL test groups passed (or were skipped via skip_tests input)
+    #
+    # This ensures we never deploy code that fails tests unless the operator
+    # explicitly chose to skip them.
+    # =========================================================================
     deploy:
         name: 🚀 Deploy to ${{ needs.setup.outputs.deploy_env }}
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        needs: [setup, docker-build]
+        needs:
+            [
+                setup,
+                docker-build,
+                test-lint,
+                test-core,
+                test-neuro-core,
+                test-neuro-vivit,
+                test-services,
+                test-trading,
+                test-audit,
+                test-integration,
+            ]
         if: |
             always() &&
             needs.setup.result == 'success' &&
             (needs.docker-build.result == 'success' || needs.docker-build.result == 'skipped') &&
+            (needs.test-lint.result == 'success' || needs.test-lint.result == 'skipped') &&
+            (needs.test-core.result == 'success' || needs.test-core.result == 'skipped') &&
+            (needs.test-neuro-core.result == 'success' || needs.test-neuro-core.result == 'skipped') &&
+            (needs.test-neuro-vivit.result == 'success' || needs.test-neuro-vivit.result == 'skipped') &&
+            (needs.test-services.result == 'success' || needs.test-services.result == 'skipped') &&
+            (needs.test-trading.result == 'success' || needs.test-trading.result == 'skipped') &&
+            (needs.test-audit.result == 'success' || needs.test-audit.result == 'skipped') &&
+            (needs.test-integration.result == 'success' || needs.test-integration.result == 'skipped') &&
             needs.setup.outputs.should_deploy == 'true'
         environment:
             name: ${{ needs.setup.outputs.deploy_env }}
@@ -355,8 +993,8 @@ jobs:
         outputs:
             deployed: ${{ steps.deploy.outputs.deployed }}
             build_strategy_used: ${{ steps.deploy.outputs.build-strategy-used }}
-            ssl_cert_type: ${{ steps.ssl-request.outputs.cert-type || steps.ssl-fallback.outputs.cert_type || steps.ssl-self-signed.outputs.cert-type || '' }}
-            ssl_deployed: ${{ steps.ssl-request.outputs.deployed || steps.ssl-self-signed.outputs.deployed || steps.ssl-fallback.outputs.use_existing || '' }}
+            ssl_cert_type: ${{ steps.ssl-check.outputs.cert-type || steps.ssl-request.outputs.cert-type || steps.ssl-fallback.outputs.cert_type || steps.ssl-self-signed.outputs.cert-type || '' }}
+            ssl_deployed: ${{ steps.ssl-request.outputs.deployed || steps.ssl-self-signed.outputs.deployed || steps.ssl-fallback.outputs.use_existing || steps.ssl-check.outputs.skip-generation || '' }}
             http_health: ${{ steps.health-checks.outputs.healthy }}
         steps:
             - name: 📥 Checkout code
@@ -473,8 +1111,8 @@ jobs:
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   domain: ${{ needs.setup.outputs.target_domain }}
-                  docker-volume-name: fks_ssl_certs
-                  renewal-threshold-days: "27"
+                  docker-volume-name: ${{ env.SSL_VOLUME_NAME }}
+                  renewal-threshold-percent: "70"
 
             # -----------------------------------------------------------------
             # SSL CERTIFICATE GENERATION (Phase 1: Try Certbot — only if needed)
@@ -484,6 +1122,7 @@ jobs:
               if: |
                   github.ref == 'refs/heads/main' &&
                   inputs.skip_ssl != true &&
+                  steps.ssh-key-setup.outputs.key_ready == 'true' &&
                   steps.ssl-check.outputs.skip-generation != 'true'
               continue-on-error: true
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
@@ -499,21 +1138,21 @@ jobs:
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   root-ssh-key: ${{ secrets.PROD_ROOT_SSH_KEY }}
-                  docker-volume-name: "fks_ssl_certs"
+                  docker-volume-name: ${{ env.SSL_VOLUME_NAME }}
                   docker-username: ${{ secrets.DOCKER_USERNAME }}
                   docker-token: ${{ secrets.DOCKER_TOKEN }}
 
             # -----------------------------------------------------------------
-            # SSL FALLBACK (Phase 2: Rate limited? Use existing LE certs if valid)
+            # SSL FALLBACK — Use existing certs if Certbot failed (rate limit, etc.)
             # -----------------------------------------------------------------
-            - name: 🔍 SSL Fallback — Use Existing Certs if Rate Limited
+            - name: 🔍 SSL Fallback — Use Existing Certs if Certbot Failed
               id: ssl-fallback
               if: |
                   github.ref == 'refs/heads/main' &&
                   inputs.skip_ssl != true &&
-                  steps.ssh-key-setup.outputs.key_ready == 'true' &&
                   steps.ssl-request.outcome == 'failure' &&
-                  steps.ssl-request.outputs.cert-source != 'volume'
+                  steps.ssl-check.outputs.cert-exists == 'true' &&
+                  steps.ssh-key-setup.outputs.key_ready == 'true'
               env:
                   DOMAIN: ${{ needs.setup.outputs.target_domain }}
                   SSH_HOST: ${{ steps.resolve-host.outputs.target_host }}
@@ -523,57 +1162,51 @@ jobs:
                   PRECHECK_DAYS: ${{ steps.ssl-check.outputs.days-remaining }}
                   PRECHECK_SOURCE: ${{ steps.ssl-check.outputs.cert-source }}
               run: |
-                  echo "⚠️ Certbot failed (likely rate limit). Evaluating existing certificates..."
+                  echo "🔍 SSL Certbot failed — checking if existing volume certs are still usable..."
+                  echo ""
+                  echo "📋 Pre-check results from volume inspection:"
+                  echo "   Cert type:       $PRECHECK_CERT_TYPE"
+                  echo "   Days remaining:  $PRECHECK_DAYS"
+                  echo "   Source:          $PRECHECK_SOURCE"
 
-                  # If the pre-check already found a valid LE cert, use it
-                  if [ "$PRECHECK_CERT_TYPE" = "letsencrypt" ] && [ "${PRECHECK_DAYS:-0}" -gt 0 ]; then
-                    echo "✅ Pre-check found a valid Let's Encrypt cert with $PRECHECK_DAYS days remaining"
-                    echo "   Using existing certificate despite rate limit"
-                    echo "cert_type=letsencrypt-cached" >> "$GITHUB_OUTPUT"
-                    echo "use_existing=true" >> "$GITHUB_OUTPUT"
-                    exit 0
-                  fi
+                  SSH_CMD="ssh -i ~/.ssh/deploy_key -p $SSH_PORT -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST"
 
-                  # Otherwise, re-check the Docker volume directly
-                  CERT_STATUS=$(ssh -o StrictHostKeyChecking=no \
-                    -p "$SSH_PORT" \
-                    -i ~/.ssh/deploy_key \
-                    "${SSH_USER}@${SSH_HOST}" \
-                    "docker run --rm -v fks_ssl_certs:/certs:ro alpine/openssl x509 \
-                      -in /certs/live/${DOMAIN}/fullchain.pem \
-                      -noout -subject -enddate -issuer 2>/dev/null" 2>/dev/null) || true
+                  # Re-verify certs are actually in the volume right now
+                  VERIFY=$($SSH_CMD "docker run --rm -v ${{ env.SSL_VOLUME_NAME }}:/certs:ro busybox:1.37 sh -c '
+                    test -f /certs/live/$DOMAIN/fullchain.pem && test -f /certs/live/$DOMAIN/privkey.pem && echo ok || echo missing
+                  '" 2>/dev/null || echo "error")
 
-                  if echo "$CERT_STATUS" | grep -qi "Let's Encrypt\|R3\|R10\|R11\|E5\|E6\|E1\|E2\|ISRG"; then
-                    EXPIRY=$(echo "$CERT_STATUS" | grep "notAfter" | cut -d= -f2)
-                    echo "✅ Found existing Let's Encrypt certificate in Docker volume"
-                    echo "   Issuer: Let's Encrypt"
-                    echo "   Expires: $EXPIRY"
-                    echo "cert_type=letsencrypt-cached" >> "$GITHUB_OUTPUT"
-                    echo "use_existing=true" >> "$GITHUB_OUTPUT"
-                  elif echo "$CERT_STATUS" | grep -qi "notAfter"; then
-                    EXPIRY=$(echo "$CERT_STATUS" | grep "notAfter" | cut -d= -f2)
-                    echo "⚠️  Found non-LE certificate in volume (self-signed or other)"
-                    echo "   Expires: $EXPIRY"
-                    echo "   Will use as fallback until rate limit resets"
-                    echo "cert_type=self-signed-cached" >> "$GITHUB_OUTPUT"
-                    echo "use_existing=true" >> "$GITHUB_OUTPUT"
+                  if [ "$VERIFY" = "ok" ]; then
+                    if [ "$PRECHECK_CERT_TYPE" = "letsencrypt" ] || [ "$PRECHECK_CERT_TYPE" = "self-signed" ]; then
+                      echo ""
+                      echo "✅ Existing $PRECHECK_CERT_TYPE certificate verified in Docker volume ($PRECHECK_DAYS days remaining)"
+                      echo "   Using existing certs — Certbot renewal will be retried next deploy"
+                      echo "cert_type=$PRECHECK_CERT_TYPE" >> "$GITHUB_OUTPUT"
+                      echo "use_existing=true" >> "$GITHUB_OUTPUT"
+                    else
+                      echo ""
+                      echo "⚠️ Certs exist but type is '$PRECHECK_CERT_TYPE' — using them as fallback anyway"
+                      echo "cert_type=$PRECHECK_CERT_TYPE" >> "$GITHUB_OUTPUT"
+                      echo "use_existing=true" >> "$GITHUB_OUTPUT"
+                    fi
                   else
-                    echo "❌ No valid certs found in volume — will generate self-signed as last resort"
-                    echo "cert_type=" >> "$GITHUB_OUTPUT"
+                    echo "❌ Certificate files NOT found in Docker volume (verify: $VERIFY)"
+                    echo "   Will need self-signed fallback"
                     echo "use_existing=false" >> "$GITHUB_OUTPUT"
                   fi
 
             # -----------------------------------------------------------------
-            # SSL LAST RESORT (Phase 3: Self-signed only if nothing else works)
+            # SSL SELF-SIGNED (last resort)
             # -----------------------------------------------------------------
             - name: 🔒 Generate Self-Signed Certificates (last resort)
               id: ssl-self-signed
               if: |
                   github.ref == 'refs/heads/main' &&
                   inputs.skip_ssl != true &&
-                  steps.ssl-request.outcome == 'failure' &&
-                  steps.ssl-request.outputs.cert-source != 'volume' &&
-                  steps.ssl-fallback.outputs.use_existing != 'true'
+                  steps.ssl-check.outputs.skip-generation != 'true' &&
+                  steps.ssl-request.outcome != 'success' &&
+                  steps.ssl-fallback.outputs.use_existing != 'true' &&
+                  steps.ssh-key-setup.outputs.key_ready == 'true'
               continue-on-error: true
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
               with:
@@ -589,12 +1222,12 @@ jobs:
                   ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   root-ssh-key: ${{ secrets.PROD_ROOT_SSH_KEY }}
-                  docker-volume-name: "fks_ssl_certs"
+                  docker-volume-name: ${{ env.SSL_VOLUME_NAME }}
                   docker-username: ${{ secrets.DOCKER_USERNAME }}
                   docker-token: ${{ secrets.DOCKER_TOKEN }}
 
             # -----------------------------------------------------------------
-            # DEPLOYMENT
+            # DEPLOY
             # -----------------------------------------------------------------
             - name: 🚀 Deploy via SSH
               id: deploy
@@ -607,6 +1240,7 @@ jobs:
                   ssh-key: ${{ secrets.PROD_SSH_KEY }}
                   ssh-retries: "3"
                   ssh-retry-delay: "10"
+                  command-timeout: "600"
 
                   # ── Project ───────────────────────────────────────────────
                   project-path: ~/fks
@@ -641,115 +1275,186 @@ jobs:
                       echo "════════════════════════════════════════════════════════════"
                       echo "📋 PRE-DEPLOY: ${{ needs.setup.outputs.deploy_env }}"
                       echo "════════════════════════════════════════════════════════════"
-                      echo "🖥️  Host: $(hostname) | $(date)"
+                      echo "🖥️  Host: $(hostname) | $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                      echo "👤 User: $(whoami) | HOME=$HOME"
+                      echo "📁 PWD:  $(pwd)"
                       echo "💾 Disk: $(df -h / | tail -1 | awk '{print $4}') free"
 
+                      # .env status
+                      echo ""
+                      if [ -f .env ]; then
+                        echo "📄 .env exists ($(wc -l < .env) lines, $(grep -c '^[A-Z]' .env 2>/dev/null || echo '?') keys)"
+                      else
+                        echo "📄 No .env — will be created during deploy"
+                      fi
+
                       # Ensure all Docker volumes exist
+                      echo ""
                       echo "📦 Creating Docker volumes..."
-                      for vol in fks_ssl_certs fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions fks_nginx_logs; do
+                      for vol in ${{ env.SSL_VOLUME_NAME }} fks_certbot_www fks_postgres_data fks_questdb_data fks_redis_data fks_grafana_data fks_prometheus_data fks_loki_data fks_alertmanager_data fks_optimizer_data fks_promtail_positions fks_nginx_logs; do
                         docker volume create $vol 2>/dev/null || true
                       done
                       echo "✅ Docker volumes ready"
 
                   # ── Deploy (custom commands that run AFTER strategy build) ─
+                  # ── .env Generation ───────────────────────────────────────
+                  # Use the new env-setup-command to run run.sh or fallback
+                  env-setup-command: |
+                      echo "🔐 Setting up .env file..."
+
+                      # Try run.sh first (primary method)
+                      ENV_CREATED=false
+                      if [ -f ./run.sh ]; then
+                        echo "   ▶ Running: bash ./run.sh setup-env"
+                        bash ./run.sh setup-env 2>&1 || true
+                        if [ -f .env ] && [ -s .env ]; then
+                          echo "   ✅ .env exists after run.sh ($(wc -l < .env) lines)"
+                          ENV_CREATED=true
+                        fi
+                      fi
+
+                      # Fallback: create .env directly
+                      if [ "$ENV_CREATED" != "true" ]; then
+                        echo "   🔄 Fallback: Creating .env directly..."
+                        GEN_PASS() { openssl rand -base64 24 2>/dev/null | tr -d '/+=' | head -c 16 || cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1; }
+                        GEN_SECRET() { openssl rand -hex 16 2>/dev/null || cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1; }
+                        GEN_LONG() { openssl rand -base64 96 2>/dev/null | tr -d "=+/\n" | cut -c1-64 || cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 64 | head -n 1; }
+
+                        cat > .env << 'ENVEOF'
+                      # FKS Trading System - Auto-generated by CI/CD fallback
+                      ENVEOF
+                        # Generate with variable expansion
+                        cat >> .env << ENVEOF
+                      POSTGRES_PASSWORD=$(GEN_PASS)
+                      POSTGRES_DB=fks
+                      POSTGRES_USER=fks_user
+                      QUESTDB_PASSWORD=$(GEN_PASS)
+                      QUESTDB_USER=admin
+                      REDIS_PASSWORD=$(GEN_PASS)
+                      GRAFANA_PASSWORD=$(GEN_PASS)
+                      GRAFANA_USER=admin
+                      GF_SECURITY_SECRET_KEY=$(GEN_SECRET)
+                      GATEWAY_SECRET_KEY=$(GEN_SECRET)
+                      GATEWAY_JWT_SECRET=$(GEN_SECRET)
+                      API_KEY=$(GEN_SECRET)
+                      AUTHELIA_JWT_SECRET=$(GEN_LONG)
+                      AUTHELIA_SESSION_SECRET=$(GEN_LONG)
+                      AUTHELIA_STORAGE_ENCRYPTION_KEY=$(GEN_LONG)
+                      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET=$(GEN_LONG)
+                      AUTHELIA_POSTGRES_PASSWORD=$(GEN_SECRET)
+                      AUTHELIA_POSTGRES_DB=authelia
+                      AUTHELIA_POSTGRES_USER=authelia
+                      DATA_SERVICE_JWT_SECRET=$(GEN_SECRET)
+                      DATA_SERVICE_JWT_EXPIRY=86400
+                      ENVIRONMENT=production
+                      LOG_LEVEL=info
+                      RUST_LOG=info
+                      RUST_BACKTRACE=1
+                      SSL_EMAIL=${{ secrets.SSL_EMAIL }}
+                      SSL_DOMAIN=${{ needs.setup.outputs.target_domain }}
+                      SSL_STAGING=false
+                      DISCORD_WEBHOOK_URL=
+                      DISCORD_BOT_TOKEN=
+                      DISCORD_NOTIFICATIONS_ENABLED=false
+                      DISCORD_NOTIFY_ON_SIGNAL=true
+                      DISCORD_NOTIFY_ON_FILL=true
+                      DISCORD_NOTIFY_ON_ERROR=true
+                      DISCORD_WEBHOOK_GENERAL=
+                      BYBIT_API_KEY=
+                      BYBIT_API_SECRET=
+                      BYBIT_TESTNET=true
+                      BINANCE_API_KEY=
+                      BINANCE_API_SECRET=
+                      KRAKEN_API_KEY=
+                      KRAKEN_API_SECRET=
+                      REAL_ORDERS_ENABLED=false
+                      ENABLE_EXECUTION=true
+                      EXECUTION_ENDPOINT=http://localhost:50052
+                      ENVEOF
+                        sed -i 's/^                      //' .env
+                        echo "   ✅ Fallback .env created ($(wc -l < .env) lines)"
+                      fi
+
+                      # Verify critical keys
+                      MISSING_KEYS=0
+                      for key in POSTGRES_PASSWORD POSTGRES_DB REDIS_PASSWORD ENABLE_EXECUTION; do
+                        grep -q "^${key}=" .env 2>/dev/null || MISSING_KEYS=$((MISSING_KEYS + 1))
+                      done
+                      if [ "$MISSING_KEYS" -gt 2 ]; then
+                        echo "   ❌ Too many critical keys missing ($MISSING_KEYS)"
+                        exit 1
+                      fi
+                      echo "   ✅ .env verification passed ($(grep -c '^[A-Z]' .env 2>/dev/null || echo '?') keys)"
+
+                  # ── Inject CI secrets into .env ───────────────────────────
+                  env-inject-secrets: |
+                      DISCORD_WEBHOOK_GENERAL=${{ secrets.DISCORD_WEBHOOK_GENERAL }}
+                      KRAKEN_API_KEY=${{ secrets.KRAKEN_API_KEY }}
+                      KRAKEN_API_SECRET=${{ secrets.KRAKEN_API_SECRET }}
+                      BYBIT_API_KEY=${{ secrets.BYBIT_API_KEY }}
+                      BYBIT_API_SECRET=${{ secrets.BYBIT_API_SECRET }}
+                      BINANCE_API_KEY=${{ secrets.BINANCE_API_KEY }}
+                      BINANCE_API_SECRET=${{ secrets.BINANCE_API_SECRET }}
+                      DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}
+                      DISCORD_BOT_TOKEN=${{ secrets.DISCORD_BOT_TOKEN }}
+
+                  # ── Deploy (runs after env setup, uses built-in strategy) ─
                   deploy-command: |
                       echo "════════════════════════════════════════════════════════════"
                       echo "🚀 DEPLOYING: ${{ needs.setup.outputs.deploy_env }}"
                       echo "   Strategy:  ${{ needs.setup.outputs.build_strategy }}"
+                      echo "   Directory: $(pwd)"
+                      echo "   Date:      $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
                       echo "════════════════════════════════════════════════════════════"
 
-                      # ── 1. Docker login ───────────────────────────────────
-                      echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin docker.io || true
-
-                      # ── 2. Generate secrets & .env file ───────────────────
-                      echo "🔐 Setting up .env file..."
-                      bash ./run.sh setup-env
-
-                      # Inject CI-managed secrets into .env
-                      DISCORD_GENERAL='${{ secrets.DISCORD_WEBHOOK_GENERAL }}'
-                      if [ -n "$DISCORD_GENERAL" ]; then
-                        if grep -q "^DISCORD_WEBHOOK_GENERAL=" .env 2>/dev/null; then
-                          sed -i "s|^DISCORD_WEBHOOK_GENERAL=.*|DISCORD_WEBHOOK_GENERAL=${DISCORD_GENERAL}|" .env
-                        else
-                          echo "DISCORD_WEBHOOK_GENERAL=${DISCORD_GENERAL}" >> .env
-                        fi
-                        echo "✅ DISCORD_WEBHOOK_GENERAL set from GitHub secret"
-                      else
-                        echo "⚠️  DISCORD_WEBHOOK_GENERAL secret not configured — alertmanager notifications will be disabled"
-                      fi
-
-                      # Source environment for subsequent commands
+                      # Source .env for template generation
                       set -a && source .env && set +a
 
-                      # ── 3. Generate config files from templates ───────────
+                      # Generate config files from templates
                       TMPL="infrastructure/monitoring/alertmanager/alertmanager.yml.tmpl"
                       DEST="infrastructure/monitoring/alertmanager/alertmanager.yml"
                       if [ -f "$TMPL" ]; then
-                        echo "🔧 Generating alertmanager.yml from template..."
                         cp "$TMPL" "$DEST"
-                        echo "✅ alertmanager.yml generated (webhook routed via discord bridge container)"
-                      else
-                        echo "⚠️  alertmanager template not found at $TMPL"
+                        echo "✅ alertmanager.yml generated"
                       fi
 
-                      # ── 4. Build compose command ──────────────────────────
+                      # Build compose command
                       COMPOSE_CMD="docker compose -p fks --env-file .env -f infrastructure/compose/docker-compose.yml -f infrastructure/compose/docker-compose.prod.yml"
 
-                      # ── 5. Stop app services (keep infra running) ─────────
+                      # Stop app services (keep infra running)
                       APP_SERVICES="janus audit web authelia nginx"
-                      echo "🛑 Stopping app services: $APP_SERVICES"
+                      echo "🛑 Stopping app services..."
                       $COMPOSE_CMD stop $APP_SERVICES 2>/dev/null || true
                       $COMPOSE_CMD rm -f $APP_SERVICES 2>/dev/null || true
                       docker container prune -f --filter "label=com.docker.compose.project=fks" 2>/dev/null || true
 
-                      # ── 6. Build or pull based on strategy ────────────────
+                      # Build or pull
                       STRATEGY="${{ needs.setup.outputs.build_strategy }}"
-
                       if [ "$STRATEGY" = "dockerhub" ]; then
-                        echo "📥 Pulling pre-built images from DockerHub..."
-                        $COMPOSE_CMD pull $APP_SERVICES 2>&1 || {
-                          echo "⚠️  Pull failed — falling back to server build"
-                          STRATEGY="server-build"
-                        }
+                        echo "📥 Pulling from DockerHub..."
+                        $COMPOSE_CMD pull $APP_SERVICES 2>&1 || { echo "⚠️ Falling back to server build"; STRATEGY="server-build"; }
                       fi
-
                       if [ "$STRATEGY" = "server-build" ]; then
-                        echo "🔨 Building app images on server..."
+                        echo "🔨 Building on server..."
                         $COMPOSE_CMD build --parallel $APP_SERVICES 2>&1
-                        echo "✅ App images built"
                       fi
 
-                      # ── 7. Ensure infra services are running ──────────────
-                      echo "🔧 Ensuring infrastructure services are running..."
+                      # Ensure infra is running
+                      echo "🔧 Starting infrastructure..."
                       $COMPOSE_CMD up -d --no-recreate redis postgres questdb prometheus grafana alertmanager-discord-bridge alertmanager 2>&1
+                      docker kill --signal=HUP fks_alertmanager 2>/dev/null || true
 
-                      # Reload alertmanager config
-                      echo "🔄 Reloading alertmanager config..."
-                      if docker kill --signal=HUP fks_alertmanager 2>/dev/null; then
-                        echo "✅ Alertmanager config reloaded (via SIGHUP)"
-                      else
-                        echo "⚠️  Could not reload alertmanager — will use config from startup"
-                      fi
-
-                      # ── 8. Wait for Redis health ──────────────────────────
-                      echo "⏳ Waiting for Redis to be healthy..."
+                      # Wait for Redis
+                      echo "⏳ Waiting for Redis..."
                       for i in $(seq 1 30); do
-                        if $COMPOSE_CMD exec -T redis redis-cli --no-auth-warning -a "${REDIS_PASSWORD:-}" ping < /dev/null 2>/dev/null | grep -q PONG; then
-                          echo "✅ Redis is healthy"
-                          break
-                        fi
-                        echo "  Waiting for Redis... ($i/30)"
+                        $COMPOSE_CMD exec -T redis redis-cli --no-auth-warning -a "${REDIS_PASSWORD:-}" ping < /dev/null 2>/dev/null | grep -q PONG && break
                         sleep 2
                       done
 
-                      # ── 9. Start all services ────────────────────────────
+                      # Start everything
                       echo "🚀 Starting all services..."
                       $COMPOSE_CMD up -d 2>&1
-
                       sleep 30
-
-                      echo ""
-                      echo "📊 Container Status:"
                       docker ps -a --filter "name=fks" --format "table {{.Names}}\t{{.Status}}" | head -20
 
                   # ── Post-Deploy ───────────────────────────────────────────
@@ -758,31 +1463,20 @@ jobs:
                       echo "🧹 POST-DEPLOY"
                       echo "════════════════════════════════════════════════════════════"
 
-                      # Check if SSL certs exist in volume and nginx is using them
-                      DOMAIN="${{ needs.setup.outputs.target_domain }}"
-                      if docker run --rm -v fks_ssl_certs:/certs:ro busybox test -f "/certs/live/$DOMAIN/fullchain.pem" 2>/dev/null; then
-                        echo "✅ SSL certificates found in Docker volume"
+                      # Verify .env
+                      [ -f .env ] && echo "✅ .env persisted ($(wc -l < .env) lines)" || echo "❌ .env missing!"
 
-                        # Restart nginx to pick up certs
-                        if docker ps -q -f name=fks_nginx | grep -q .; then
-                          echo "🔄 Restarting nginx to apply SSL certificates..."
-                          docker restart fks_nginx
-                          sleep 5
-                        fi
+                      # Restart nginx if SSL certs exist
+                      DOMAIN="${{ needs.setup.outputs.target_domain }}"
+                      if docker run --rm -v ${{ env.SSL_VOLUME_NAME }}:/certs:ro busybox:1.37 test -f "/certs/live/$DOMAIN/fullchain.pem" 2>/dev/null; then
+                        echo "✅ SSL certs found — restarting nginx"
+                        docker restart fks_nginx 2>/dev/null && sleep 5 || true
                       else
-                        echo "⚠️ No SSL certificates in volume — nginx using self-signed fallback"
-                        echo "   Run './run.sh ssl-init' to get Let's Encrypt certificates"
+                        echo "⚠️ No SSL certs in volume — nginx using fallback"
                       fi
 
-                      # Cleanup old images
-                      docker image prune -f --filter "until=24h" 2>/dev/null || true
-
                       echo ""
-                      echo "🌐 Access URLs:"
-                      echo "   Main:       https://${{ needs.setup.outputs.target_domain }}"
-                      echo "   Grafana:    https://${{ needs.setup.outputs.target_domain }}/grafana"
-                      echo "   Prometheus: https://${{ needs.setup.outputs.target_domain }}/prometheus"
-                      echo ""
+                      echo "🌐 https://${{ needs.setup.outputs.target_domain }}"
                       echo "✅ Deployment complete!"
 
             # -----------------------------------------------------------------
@@ -813,7 +1507,7 @@ jobs:
                   initial-delay: "30"
                   retry-count: "3"
                   retry-delay: "10"
-                  fail-on-unhealthy: "false"
+                  fail-on-unhealthy: "true"
 
             # -----------------------------------------------------------------
             # NOTIFICATION
@@ -844,31 +1538,285 @@ jobs:
         name: 📊 Pipeline Summary
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        needs: [setup, docker-build, deploy]
+        needs:
+            [
+                setup,
+                test-lint,
+                test-core,
+                test-neuro-core,
+                test-neuro-vivit,
+                test-services,
+                test-trading,
+                test-audit,
+                test-integration,
+                test-kmp,
+                docker-build,
+                deploy,
+            ]
         if: always()
         steps:
-            - name: 📊 Generate summary
+            - name: 📥 Download all JUnit artifacts
+              uses: actions/download-artifact@v4
+              if: always()
+              with:
+                  pattern: junit-*
+                  path: test-reports/
+
+            - name: 📊 Generate unified test summary
+              if: always()
               run: |
+                  # ── Helper: map job result to emoji ────────────────────────
+                  status_icon() {
+                    case "$1" in
+                      success)  echo "✅" ;;
+                      failure)  echo "❌" ;;
+                      skipped)  echo "⏭️" ;;
+                      cancelled) echo "🚫" ;;
+                      *)        echo "❓" ;;
+                    esac
+                  }
+
+                  # ── Collect job results ────────────────────────────────────
+                  LINT_RESULT="${{ needs.test-lint.result }}"
+                  CORE_RESULT="${{ needs.test-core.result }}"
+                  NEURO_CORE_RESULT="${{ needs.test-neuro-core.result }}"
+                  NEURO_VIVIT_RESULT="${{ needs.test-neuro-vivit.result }}"
+                  SVC_RESULT="${{ needs.test-services.result }}"
+                  TRADE_RESULT="${{ needs.test-trading.result }}"
+                  AUDIT_RESULT="${{ needs.test-audit.result }}"
+                  INTEG_RESULT="${{ needs.test-integration.result }}"
+                  KMP_RESULT="${{ needs.test-kmp.result }}"
+                  DOCKER_RESULT="${{ needs.docker-build.result }}"
+                  DEPLOY_RESULT="${{ needs.deploy.result }}"
+
+                  # ── Count failures for hero banner ─────────────────────────
+                  FAILED_JOBS=""
+                  FAIL_COUNT=0
+                  for pair in \
+                    "test-lint:🧹 Lint:$LINT_RESULT" \
+                    "test-core:🧱 Core:$CORE_RESULT" \
+                    "test-neuro-core:🧠 Neuro:$NEURO_CORE_RESULT" \
+                    "test-neuro-vivit:🧠 ViViT:$NEURO_VIVIT_RESULT" \
+                    "test-services:⚙️ Services:$SVC_RESULT" \
+                    "test-trading:📈 Trading:$TRADE_RESULT" \
+                    "test-audit:🔍 Audit:$AUDIT_RESULT" \
+                    "test-integration:🔗 Integration:$INTEG_RESULT" \
+                    "test-kmp:📱 KMP:$KMP_RESULT" \
+                    "docker-build:🐳 Docker:$DOCKER_RESULT" \
+                    "deploy:🚀 Deploy:$DEPLOY_RESULT"; do
+                    JOB_NAME="${pair%%:*}"
+                    REST="${pair#*:}"
+                    LABEL="${REST%%:*}"
+                    RESULT="${REST##*:}"
+                    if [ "$RESULT" = "failure" ]; then
+                      FAIL_COUNT=$((FAIL_COUNT + 1))
+                      FAILED_JOBS="${FAILED_JOBS}\n- **${LABEL}**"
+                    fi
+                  done
+
+                  # ── Parse JUnit XML files for test counts ──────────────────
+                  python3 << 'PYEOF' > /tmp/test-counts.txt
+                  import xml.etree.ElementTree as ET
+                  import os, glob, sys, json
+
+                  LABELS = {
+                      "junit-core":        "🧱 Core & Libraries",
+                      "junit-neuro-core":  "🧠 Neuromorphic (Core)",
+                      "junit-neuro-vivit": "🧠 Neuromorphic (ViViT)",
+                      "junit-services":    "⚙️ Services",
+                      "junit-trading":     "📈 Trading & ML",
+                      "junit-audit":       "🔍 Audit",
+                      "junit-integration": "🔗 Integration (DB)",
+                  }
+
+                  ORDER = list(LABELS.keys())
+                  base = "test-reports"
+                  totals = {"tests": 0, "passed": 0, "failed": 0, "skipped": 0, "time": 0.0}
+                  rows = []
+                  failed_tests = []
+
+                  for key in ORDER:
+                      artifact_dir = os.path.join(base, key)
+                      xmls = glob.glob(os.path.join(artifact_dir, "**", "*.xml"), recursive=True)
+                      if not xmls:
+                          rows.append((LABELS[key], "-", "-", "-", "-", "-"))
+                          continue
+                      tests = failures = errors = skipped = 0
+                      time_s = 0.0
+                      for xf in xmls:
+                          try:
+                              tree = ET.parse(xf)
+                              root = tree.getroot()
+                              suites = root.findall(".//testsuite")
+                              if not suites and root.tag == "testsuite":
+                                  suites = [root]
+                              for ts in suites:
+                                  tests    += int(ts.get("tests", 0))
+                                  failures += int(ts.get("failures", 0))
+                                  errors   += int(ts.get("errors", 0))
+                                  skipped  += int(ts.get("skipped", 0))
+                                  time_s   += float(ts.get("time", 0))
+                                  # Collect names of failed test cases
+                                  for tc in ts.findall("testcase"):
+                                      if tc.find("failure") is not None or tc.find("error") is not None:
+                                          name = tc.get("name", "unknown")
+                                          cls  = tc.get("classname", "")
+                                          fqn  = f"{cls}::{name}" if cls else name
+                                          failed_tests.append({"group": LABELS[key], "test": fqn})
+                          except Exception as e:
+                              print(f"WARN: Failed to parse {xf}: {e}", file=sys.stderr)
+
+                      passed = tests - failures - errors - skipped
+                      totals["tests"]   += tests
+                      totals["passed"]  += passed
+                      totals["failed"]  += failures + errors
+                      totals["skipped"] += skipped
+                      totals["time"]    += time_s
+
+                      mins = int(time_s) // 60
+                      secs = time_s - mins * 60
+                      time_fmt = f"{mins}m {secs:.1f}s" if mins else f"{secs:.1f}s"
+
+                      pass_str = f"✅ {passed}" if passed else "0"
+                      fail_str = f"❌ {failures + errors}" if (failures + errors) else "0"
+                      skip_str = f"⏭️ {skipped}" if skipped else "0"
+
+                      rows.append((LABELS[key], str(tests), pass_str, fail_str, skip_str, time_fmt))
+
+                  # Totals
+                  t = totals
+                  t_mins = int(t["time"]) // 60
+                  t_secs = t["time"] - t_mins * 60
+                  t_time = f"{t_mins}m {t_secs:.1f}s" if t_mins else f"{t_secs:.1f}s"
+                  t_pass = f"✅ {t['passed']}" if t["passed"] else "0"
+                  t_fail = f"❌ {t['failed']}" if t["failed"] else "0"
+                  t_skip = f"⏭️ {t['skipped']}" if t["skipped"] else "0"
+
+                  for r in rows:
+                      print("|".join(r))
+                  print("---TOTALS---")
+                  print("|".join([
+                      "**TOTAL**",
+                      f"**{t['tests']}**",
+                      f"**{t_pass}**",
+                      f"**{t_fail}**",
+                      f"**{t_skip}**",
+                      f"**{t_time}**",
+                  ]))
+                  print("---META---")
+                  print(json.dumps({
+                      "total": t["tests"],
+                      "passed": t["passed"],
+                      "failed": t["failed"],
+                      "skipped": t["skipped"],
+                      "time": t_time,
+                      "failed_tests": failed_tests[:20],
+                  }))
+                  PYEOF
+
+                  # ── Read parsed counts ─────────────────────────────────────
+                  TEST_ROWS=""
+                  TOTAL_ROW=""
+                  META_JSON=""
+                  section="rows"
+                  while IFS= read -r line; do
+                    if [ "$line" = "---TOTALS---" ]; then
+                      section="totals"
+                      continue
+                    fi
+                    if [ "$line" = "---META---" ]; then
+                      section="meta"
+                      continue
+                    fi
+                    case "$section" in
+                      rows)
+                        TEST_ROWS="${TEST_ROWS}| $(echo "$line" | sed 's/|/ | /g') |
+                  "
+                        ;;
+                      totals)
+                        TOTAL_ROW="| $(echo "$line" | sed 's/|/ | /g') |"
+                        ;;
+                      meta)
+                        META_JSON="$line"
+                        ;;
+                    esac
+                  done < /tmp/test-counts.txt
+
+                  # ── Extract totals from JSON for hero banner ───────────────
+                  TOTAL_TESTS=$(echo "$META_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['total'])" 2>/dev/null || echo "0")
+                  TOTAL_PASSED=$(echo "$META_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['passed'])" 2>/dev/null || echo "0")
+                  TOTAL_FAILED=$(echo "$META_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['failed'])" 2>/dev/null || echo "0")
+                  TOTAL_SKIPPED=$(echo "$META_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['skipped'])" 2>/dev/null || echo "0")
+                  TOTAL_TIME=$(echo "$META_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['time'])" 2>/dev/null || echo "?")
+
+                  # ── Build failed test list (if any) ────────────────────────
+                  FAILED_TEST_LIST=""
+                  if [ "$TOTAL_FAILED" -gt 0 ] 2>/dev/null; then
+                    FAILED_TEST_LIST=$(echo "$META_JSON" | python3 -c "
+                  import sys, json
+                  d = json.load(sys.stdin)
+                  ft = d.get('failed_tests', [])
+                  if ft:
+                      print()
+                      print('<details><summary>🔍 Failed tests (' + str(len(ft)) + ')</summary>')
+                      print()
+                      for t in ft:
+                          print('- \`' + t['test'] + '\` — ' + t['group'])
+                      print()
+                      print('</details>')
+                  " 2>/dev/null || echo "")
+                  fi
+
+                  # ── Determine overall verdict ──────────────────────────────
+                  if [ "$FAIL_COUNT" -gt 0 ]; then
+                    VERDICT="❌ FAILED"
+                    VERDICT_COLOR="red"
+                    VERDICT_NOTE="${FAIL_COUNT} job(s) failed"
+                  elif [ "$TOTAL_FAILED" -gt 0 ] 2>/dev/null; then
+                    VERDICT="⚠️ TESTS FAILED"
+                    VERDICT_COLOR="orange"
+                    VERDICT_NOTE="${TOTAL_FAILED} test(s) failed"
+                  else
+                    VERDICT="✅ ALL PASSED"
+                    VERDICT_COLOR="green"
+                    VERDICT_NOTE="All systems go"
+                  fi
+
+                  # ── Write summary ──────────────────────────────────────────
                   cat >> $GITHUB_STEP_SUMMARY << EOF
-                  # 🚀 FKS CI/CD Pipeline Summary
 
-                  ## Environment
-                  | Property | Value |
-                  |----------|-------|
-                  | Target | \`${{ needs.setup.outputs.deploy_env }}\` |
-                  | Domain | \`${{ needs.setup.outputs.target_domain }}\` |
-                  | Build Strategy | \`${{ needs.setup.outputs.build_strategy }}\` |
-                  | Branch | \`${{ github.ref_name }}\` |
+                  # ${VERDICT}  —  FKS Pipeline \`#${{ github.run_number }}\`
 
-                  ## Jobs
-                  | Job | Status |
-                  |-----|--------|
-                  | 🦀 Rust Tests | disabled |
-                  | 📱 KMP Tests | disabled |
-                  | 🐳 Docker Build | ${{ needs.docker-build.result || 'skipped' }} |
-                  | 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |
+                  > **${TOTAL_TESTS}** tests | **${TOTAL_PASSED}** passed | **${TOTAL_FAILED}** failed | **${TOTAL_SKIPPED}** skipped | ⏱️ ${TOTAL_TIME}
+                  >
+                  > \`${{ github.ref_name }}\` → \`${{ needs.setup.outputs.deploy_env }}\` | Actor: \`${{ github.actor }}\`
 
-                  ## Docker Images
+                  ---
+
+                  ## At a Glance
+
+                  | | Job | Result | | Job | Result |
+                  |--|-----|--------|-|-----|--------|
+                  | 🧹 | Lint | $(status_icon "$LINT_RESULT") $LINT_RESULT | 📈 | Trading & ML | $(status_icon "$TRADE_RESULT") $TRADE_RESULT |
+                  | 🧱 | Core | $(status_icon "$CORE_RESULT") $CORE_RESULT | 🔍 | Audit | $(status_icon "$AUDIT_RESULT") $AUDIT_RESULT |
+                  | 🧠 | Neuro (Core) | $(status_icon "$NEURO_CORE_RESULT") $NEURO_CORE_RESULT | 🔗 | Integration | $(status_icon "$INTEG_RESULT") $INTEG_RESULT |
+                  | 🧠 | Neuro (ViViT) | $(status_icon "$NEURO_VIVIT_RESULT") $NEURO_VIVIT_RESULT | 📱 | KMP | $(status_icon "$KMP_RESULT") $KMP_RESULT |
+                  | ⚙️ | Services | $(status_icon "$SVC_RESULT") $SVC_RESULT | 🐳 | Docker | $(status_icon "$DOCKER_RESULT") $DOCKER_RESULT |
+                  | | | | 🚀 | Deploy | $(status_icon "$DEPLOY_RESULT") $DEPLOY_RESULT |
+                  ${FAILED_TEST_LIST}
+
+                  ---
+
+                  <details><summary><strong>🧪 Test Breakdown by Group</strong></summary>
+
+                  | Group | Total | Passed | Failed | Skipped | Duration |
+                  |-------|------:|-------:|-------:|--------:|---------:|
+                  ${TEST_ROWS}${TOTAL_ROW}
+
+                  </details>
+
+                  <details><summary><strong>🐳 Docker Images</strong></summary>
+
                   | Image | Tag |
                   |-------|-----|
                   | janus | \`janus-${{ github.sha }}\` |
@@ -877,19 +1825,46 @@ jobs:
                   | authelia | \`authelia-${{ github.sha }}\` |
                   | nginx | \`nginx-${{ github.sha }}\` |
 
-                  ## Details
+                  </details>
+
+                  <details><summary><strong>⚙️ Environment & Deploy Details</strong></summary>
+
                   | Property | Value |
                   |----------|-------|
-                  | Build Strategy | ${{ needs.setup.outputs.build_strategy }} |
+                  | Target | \`${{ needs.setup.outputs.deploy_env }}\` |
+                  | Domain | \`${{ needs.setup.outputs.target_domain }}\` |
+                  | Build Strategy | \`${{ needs.setup.outputs.build_strategy }}\` |
+                  | Tests Enabled | \`${{ needs.setup.outputs.should_test }}\` |
                   | SSL Certificate | ${{ needs.deploy.outputs.ssl_cert_type || 'N/A' }} |
                   | Health Check | ${{ needs.deploy.outputs.http_health == 'true' && '✅ Healthy' || '⚠️ Check logs' }} |
 
-                  ---
-                  **Actor:** \`${{ github.actor }}\` | **Run:** \`#${{ github.run_number }}\`
+                  </details>
                   EOF
 
             - name: ❌ Fail on critical errors
-              if: needs.docker-build.result == 'failure' || needs.deploy.result == 'failure'
+              if: |
+                  needs.test-lint.result == 'failure' ||
+                  needs.test-core.result == 'failure' ||
+                  needs.test-neuro-core.result == 'failure' ||
+                  needs.test-neuro-vivit.result == 'failure' ||
+                  needs.test-services.result == 'failure' ||
+                  needs.test-trading.result == 'failure' ||
+                  needs.test-audit.result == 'failure' ||
+                  needs.test-integration.result == 'failure' ||
+                  needs.docker-build.result == 'failure' ||
+                  needs.deploy.result == 'failure'
               run: |
-                  echo "❌ Pipeline failed"
+                  echo "❌ Pipeline failed — check individual job logs above"
+                  echo ""
+                  echo "Failed jobs:"
+                  [ "${{ needs.test-lint.result }}" = "failure" ] && echo "  - 🧹 Lint & Format"
+                  [ "${{ needs.test-core.result }}" = "failure" ] && echo "  - 🧱 Core & Libraries"
+                  [ "${{ needs.test-neuro-core.result }}" = "failure" ] && echo "  - 🧠 Neuromorphic (Core)"
+                  [ "${{ needs.test-neuro-vivit.result }}" = "failure" ] && echo "  - 🧠 Neuromorphic (ViViT)"
+                  [ "${{ needs.test-services.result }}" = "failure" ] && echo "  - ⚙️ Services"
+                  [ "${{ needs.test-trading.result }}" = "failure" ] && echo "  - 📈 Trading & ML (Janus)"
+                  [ "${{ needs.test-audit.result }}" = "failure" ] && echo "  - 🔍 Audit (fks-audit)"
+                  [ "${{ needs.test-integration.result }}" = "failure" ] && echo "  - 🔗 Integration (DB)"
+                  [ "${{ needs.docker-build.result }}" = "failure" ] && echo "  - 🐳 Docker Build"
+                  [ "${{ needs.deploy.result }}" = "failure" ] && echo "  - 🚀 Deploy"
                   exit 1

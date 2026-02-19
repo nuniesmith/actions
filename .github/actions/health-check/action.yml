@@ -200,9 +200,9 @@ runs:
               # Function to run docker commands (local or remote)
               docker_cmd() {
                 if [ "$SSH_READY" = "true" ] && [ -n "$SSH_HOST" ]; then
-                  ssh -i ~/.ssh/health_check_key ${SSH_USER}@${SSH_HOST} "$1"
+                  printf '%s' "$1" | ssh -i ~/.ssh/health_check_key ${SSH_USER}@${SSH_HOST} "bash -s"
                 else
-                  eval "$1"
+                  bash -c "$1"
                 fi
               }
 
@@ -280,12 +280,13 @@ runs:
                 echo "Attempt $i/$RETRY_COUNT"
 
                 if [ "$SSH_READY" = "true" ] && [ -n "$SSH_HOST" ]; then
-                  if ssh -i ~/.ssh/health_check_key ${SSH_USER}@${SSH_HOST} "$CUSTOM_CMD"; then
+                  # Pipe through bash -s so multi-line commands work correctly
+                  if printf '%s' "$CUSTOM_CMD" | ssh -i ~/.ssh/health_check_key ${SSH_USER}@${SSH_HOST} "bash -s"; then
                     SUCCESS=true
                     break
                   fi
                 else
-                  if eval "$CUSTOM_CMD"; then
+                  if bash -c "$CUSTOM_CMD"; then
                     SUCCESS=true
                     break
                   fi

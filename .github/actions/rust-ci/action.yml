@@ -165,6 +165,9 @@ outputs:
     buf-lint-result:
         description: "Result of buf lint (success/failure/skipped)"
         value: ${{ steps.buf-lint.outputs.result || 'skipped' }}
+    clippy-sarif-file:
+        description: "Path to clippy SARIF file (if generated)"
+        value: ${{ steps.clippy-sarif.outputs.sarif_file || '' }}
 
 runs:
     using: "composite"
@@ -226,16 +229,25 @@ runs:
                   ${{ runner.os }}-cargo-registry-${{ inputs.cache-key-suffix }}-
                   ${{ runner.os }}-cargo-registry-
 
+        - name: 📦 Compute feature hash
+          id: feature-hash
+          shell: bash
+          run: |
+              # Build a stable string from feature inputs to include in cache key
+              FEATURE_STRING="${{ inputs.all-features }}|${{ inputs.features }}|${{ inputs.no-default-features }}"
+              FEATURE_HASH=$(echo -n "$FEATURE_STRING" | sha256sum | cut -c1-8)
+              echo "hash=$FEATURE_HASH" >> $GITHUB_OUTPUT
+
         - name: 📦 Cache cargo build
           uses: actions/cache@v4
           with:
               path: |
                   target/
                   ${{ inputs.working-directory }}/target/
-              key: ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-${{ inputs.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+              key: ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-${{ inputs.toolchain }}-feat${{ steps.feature-hash.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}
               restore-keys: |
+                  ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-${{ inputs.toolchain }}-feat${{ steps.feature-hash.outputs.hash }}-
                   ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-${{ inputs.toolchain }}-
-                  ${{ runner.os }}-cargo-build-${{ inputs.cache-key-suffix }}-
 
         - name: 🔧 Prepare flags
           id: flags
@@ -345,6 +357,43 @@ runs:
                 echo "result=failure" >> $GITHUB_OUTPUT
                 exit 1
               fi
+
+        - name: 📎 Generate clippy SARIF output
+          id: clippy-sarif
+          if: inputs.run-clippy == 'true' && always()
+          shell: bash
+          working-directory: ${{ inputs.working-directory }}
+          continue-on-error: true
+          run: |
+              echo "📄 Generating clippy SARIF report..."
+              # Install clippy-sarif and sarif-fmt if not already present
+              if ! command -v clippy-sarif &>/dev/null; then
+                cargo install clippy-sarif sarif-fmt --quiet 2>/dev/null || {
+                  echo "⚠️ Could not install clippy-sarif — skipping SARIF generation"
+                  exit 0
+                }
+              fi
+              SARIF_DIR="${{ inputs.working-directory == '.' && '.' || inputs.working-directory }}"
+              SARIF_FILE="${SARIF_DIR}/clippy-results.sarif"
+              cargo clippy ${{ steps.flags.outputs.package_flags }} ${{ steps.flags.outputs.feature_flags }} \
+                --message-format=json ${{ inputs.clippy-args }} 2>/dev/null \
+                | clippy-sarif > "$SARIF_FILE" 2>/dev/null || true
+              if [ -s "$SARIF_FILE" ]; then
+                echo "✅ SARIF report generated: $SARIF_FILE"
+                echo "sarif_file=$SARIF_FILE" >> $GITHUB_OUTPUT
+              else
+                echo "⚠️ SARIF report empty or failed — skipping"
+                rm -f "$SARIF_FILE"
+              fi
+
+        - name: 📤 Upload clippy SARIF to GitHub Security tab
+          if: inputs.run-clippy == 'true' && steps.clippy-sarif.outputs.sarif_file != '' && always()
+          uses: github/codeql-action/upload-sarif@v3
+          continue-on-error: true
+          with:
+              sarif_file: ${{ steps.clippy-sarif.outputs.sarif_file }}
+              category: clippy
+              wait-for-processing: false
 
         - name: 📎 Skip clippy
           if: inputs.run-clippy != 'true'
@@ -467,8 +516,26 @@ runs:
               fi
 
         - name: 📋 Summary
+          if: always()
           shell: bash
           run: |
+              # Helper: map step result to emoji
+              result_icon() {
+                case "$1" in
+                  success)  echo "✅ Passed" ;;
+                  failure)  echo "❌ Failed" ;;
+                  skipped)  echo "⏭️ Skipped" ;;
+                  *)        echo "❓ Unknown" ;;
+                esac
+              }
+
+              # Resolve actual results from step outputs
+              FMT_RESULT="${{ steps.fmt.outputs.result || steps.fmt-skip.outputs.result || 'skipped' }}"
+              CLIPPY_RESULT="${{ steps.clippy.outputs.result || steps.clippy-skip.outputs.result || 'skipped' }}"
+              TEST_RESULT="${{ steps.test.outputs.result || steps.test-combined.outputs.result || steps.test-skip.outputs.result || 'skipped' }}"
+              BUILD_RESULT="${{ steps.build.outputs.result || steps.build-skip.outputs.result || 'skipped' }}"
+              BUF_RESULT="${{ steps.buf-lint.outputs.result || 'skipped' }}"
+
               cat >> $GITHUB_STEP_SUMMARY << EOF
               ## 🦀 Rust CI Summary
 
@@ -478,36 +545,31 @@ runs:
               EOF
 
               if [ "${{ inputs.run-buf-lint }}" = "true" ]; then
-                echo "| Proto Lint (buf) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+                echo "| Proto Lint (buf) | $(result_icon "$BUF_RESULT") |" >> $GITHUB_STEP_SUMMARY
               fi
 
-              if [ "${{ inputs.run-fmt }}" = "true" ]; then
-                echo "| Format (rustfmt) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "| Format (rustfmt) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-              fi
-
-              if [ "${{ inputs.run-clippy }}" = "true" ]; then
-                echo "| Lints (clippy) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "| Lints (clippy) | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-              fi
-
-              if [ "${{ inputs.run-tests }}" = "true" ]; then
-                echo "| Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "| Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-              fi
+              echo "| Format (rustfmt) | $(result_icon "$FMT_RESULT") |" >> $GITHUB_STEP_SUMMARY
+              echo "| Lints (clippy) | $(result_icon "$CLIPPY_RESULT") |" >> $GITHUB_STEP_SUMMARY
+              echo "| Tests | $(result_icon "$TEST_RESULT") |" >> $GITHUB_STEP_SUMMARY
 
               if [ "${{ inputs.run-build }}" = "true" ]; then
                 MODE="${{ inputs.build-release == 'true' && 'release' || 'debug' }}"
-                echo "| Build ($MODE) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+                echo "| Build ($MODE) | $(result_icon "$BUILD_RESULT") |" >> $GITHUB_STEP_SUMMARY
               else
                 echo "| Build | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
               fi
 
               if [ "${{ inputs.coverage }}" = "true" ]; then
-                echo "| Coverage | ✅ Generated |" >> $GITHUB_STEP_SUMMARY
+                COVERAGE_FILE="${{ steps.coverage.outputs.coverage_file }}"
+                if [ -n "$COVERAGE_FILE" ]; then
+                  echo "| Coverage | ✅ Generated |" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "| Coverage | ⚠️ Not generated |" >> $GITHUB_STEP_SUMMARY
+                fi
+              fi
+
+              if [ "${{ steps.clippy-sarif.outputs.sarif_file }}" != "" ]; then
+                echo "| SARIF Report | ✅ Uploaded |" >> $GITHUB_STEP_SUMMARY
               fi
 
               # Show workspace info if applicable

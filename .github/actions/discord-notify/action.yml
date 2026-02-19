@@ -1,175 +1,198 @@
-name: 'Discord Notification'
-description: 'Send rich embed notifications to Discord webhook'
-author: 'nuniesmith'
+name: "Discord Notification"
+description: "Send rich embed notifications to Discord webhook"
+author: "nuniesmith"
 
 branding:
-  icon: 'message-circle'
-  color: 'purple'
+    icon: "message-circle"
+    color: "purple"
 
 inputs:
-  webhook-url:
-    description: 'Discord webhook URL'
-    required: true
-  title:
-    description: 'Embed title'
-    required: true
-  description:
-    description: 'Embed description'
-    required: false
-    default: ''
-  color:
-    description: 'Embed color (success=3066993, failure=15158332, info=3447003, warning=16776960)'
-    required: false
-    default: '3447003'
-  status:
-    description: 'Status type: success, failure, info, warning, started'
-    required: false
-    default: 'info'
-  fields:
-    description: 'JSON array of field objects [{name, value, inline}]'
-    required: false
-    default: '[]'
-  footer:
-    description: 'Footer text'
-    required: false
-    default: ''
-  include-timestamp:
-    description: 'Include timestamp in embed'
-    required: false
-    default: 'true'
-  include-repo-info:
-    description: 'Include repository, branch, and commit info'
-    required: false
-    default: 'false'
+    webhook-url:
+        description: "Discord webhook URL"
+        required: true
+    title:
+        description: "Embed title"
+        required: true
+    description:
+        description: "Embed description"
+        required: false
+        default: ""
+    color:
+        description: "Embed color (success=3066993, failure=15158332, info=3447003, warning=16776960)"
+        required: false
+        default: "3447003"
+    status:
+        description: "Status type: success, failure, info, warning, started"
+        required: false
+        default: "info"
+    fields:
+        description: "JSON array of field objects [{name, value, inline}]"
+        required: false
+        default: "[]"
+    footer:
+        description: "Footer text"
+        required: false
+        default: ""
+    include-timestamp:
+        description: "Include timestamp in embed"
+        required: false
+        default: "true"
+    include-repo-info:
+        description: "Include repository, branch, and commit info"
+        required: false
+        default: "false"
 
 outputs:
-  sent:
-    description: 'Whether the notification was sent successfully'
-    value: ${{ steps.send.outputs.sent }}
+    sent:
+        description: "Whether the notification was sent successfully"
+        value: ${{ steps.send.outputs.sent }}
 
 runs:
-  using: 'composite'
-  steps:
-    - name: Determine color from status
-      id: color
-      shell: bash
-      run: |
-        STATUS="${{ inputs.status }}"
-        COLOR="${{ inputs.color }}"
+    using: "composite"
+    steps:
+        - name: Determine color from status
+          id: color
+          shell: bash
+          run: |
+              STATUS="${{ inputs.status }}"
+              COLOR="${{ inputs.color }}"
 
-        # If color is default and status is set, use status color
-        if [ "$COLOR" = "3447003" ]; then
-          case "$STATUS" in
-            success)
-              COLOR="3066993"  # Green
-              ;;
-            failure)
-              COLOR="15158332"  # Red
-              ;;
-            warning)
-              COLOR="16776960"  # Yellow
-              ;;
-            started)
-              COLOR="3447003"  # Blue
-              ;;
-            info)
-              COLOR="3447003"  # Blue
-              ;;
-          esac
-        fi
+              # If color is default and status is set, use status color
+              if [ "$COLOR" = "3447003" ]; then
+                case "$STATUS" in
+                  success)
+                    COLOR="3066993"  # Green
+                    ;;
+                  failure)
+                    COLOR="15158332"  # Red
+                    ;;
+                  warning)
+                    COLOR="16776960"  # Yellow
+                    ;;
+                  started)
+                    COLOR="3447003"  # Blue
+                    ;;
+                  info)
+                    COLOR="3447003"  # Blue
+                    ;;
+                esac
+              fi
 
-        echo "color=$COLOR" >> $GITHUB_OUTPUT
+              echo "color=$COLOR" >> $GITHUB_OUTPUT
 
-    - name: Build and send notification
-      id: send
-      shell: bash
-      env:
-        WEBHOOK_URL: ${{ inputs.webhook-url }}
-        TITLE: ${{ inputs.title }}
-        DESCRIPTION: ${{ inputs.description }}
-        COLOR: ${{ steps.color.outputs.color }}
-        FIELDS: ${{ inputs.fields }}
-        FOOTER: ${{ inputs.footer }}
-        INCLUDE_TIMESTAMP: ${{ inputs.include-timestamp }}
-        INCLUDE_REPO_INFO: ${{ inputs.include-repo-info }}
-      run: |
-        if [ -z "$WEBHOOK_URL" ]; then
-          echo "No webhook URL provided, skipping notification"
-          echo "sent=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
+        - name: Build and send notification
+          id: send
+          shell: bash
+          env:
+              WEBHOOK_URL: ${{ inputs.webhook-url }}
+              TITLE: ${{ inputs.title }}
+              DESCRIPTION: ${{ inputs.description }}
+              COLOR: ${{ steps.color.outputs.color }}
+              FIELDS: ${{ inputs.fields }}
+              FOOTER: ${{ inputs.footer }}
+              INCLUDE_TIMESTAMP: ${{ inputs.include-timestamp }}
+              INCLUDE_REPO_INFO: ${{ inputs.include-repo-info }}
+              GITHUB_REPO: ${{ github.repository }}
+              GITHUB_REF_NAME: ${{ github.ref_name }}
+              GITHUB_SHA_FULL: ${{ github.sha }}
+          run: |
+              if [ -z "$WEBHOOK_URL" ]; then
+                echo "No webhook URL provided, skipping notification"
+                echo "sent=false" >> $GITHUB_OUTPUT
+                exit 0
+              fi
 
-        # Start building the embed
-        TIMESTAMP=""
-        if [ "$INCLUDE_TIMESTAMP" = "true" ]; then
-          TIMESTAMP=", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\""
-        fi
+              # ── Build the embed object safely using jq ──────────────────────
+              # jq handles all JSON escaping of title, description, footer, etc.
+              # so special characters like ", \, newlines won't break the payload.
 
-        # Build footer
-        FOOTER_JSON=""
-        if [ -n "$FOOTER" ]; then
-          FOOTER_JSON=", \"footer\": {\"text\": \"$FOOTER\"}"
-        fi
+              SHORT_SHA="${GITHUB_SHA_FULL:0:7}"
 
-        # Build repo info fields
-        REPO_FIELDS=""
-        if [ "$INCLUDE_REPO_INFO" = "true" ]; then
-          REPO_FIELDS="[
-            {\"name\": \"Repository\", \"value\": \"${{ github.repository }}\", \"inline\": true},
-            {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"inline\": true},
-            {\"name\": \"Commit\", \"value\": \"[\`${GITHUB_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})\", \"inline\": true}
-          ]"
-        fi
+              # Start with the base embed: title + color
+              EMBED=$(jq -n \
+                --arg title "$TITLE" \
+                --argjson color "${COLOR:-3447003}" \
+                '{title: $title, color: $color}')
 
-        # Merge custom fields with repo fields
-        if [ -n "$REPO_FIELDS" ] && [ "$FIELDS" != "[]" ]; then
-          # Remove brackets and merge
-          REPO_FIELDS_INNER=$(echo "$REPO_FIELDS" | sed 's/^\[//' | sed 's/\]$//')
-          FIELDS_INNER=$(echo "$FIELDS" | sed 's/^\[//' | sed 's/\]$//')
-          FINAL_FIELDS="[$REPO_FIELDS_INNER, $FIELDS_INNER]"
-        elif [ -n "$REPO_FIELDS" ]; then
-          FINAL_FIELDS="$REPO_FIELDS"
-        else
-          FINAL_FIELDS="$FIELDS"
-        fi
+              # Add description if provided
+              if [ -n "$DESCRIPTION" ]; then
+                EMBED=$(echo "$EMBED" | jq --arg desc "$DESCRIPTION" '. + {description: $desc}')
+              fi
 
-        # Build fields JSON
-        FIELDS_JSON=""
-        if [ "$FINAL_FIELDS" != "[]" ]; then
-          FIELDS_JSON=", \"fields\": $FINAL_FIELDS"
-        fi
+              # Add timestamp if requested
+              if [ "$INCLUDE_TIMESTAMP" = "true" ]; then
+                TS=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+                EMBED=$(echo "$EMBED" | jq --arg ts "$TS" '. + {timestamp: $ts}')
+              fi
 
-        # Build description JSON
-        DESC_JSON=""
-        if [ -n "$DESCRIPTION" ]; then
-          DESC_JSON=", \"description\": \"$DESCRIPTION\""
-        fi
+              # Add footer if provided
+              if [ -n "$FOOTER" ]; then
+                EMBED=$(echo "$EMBED" | jq --arg ft "$FOOTER" '. + {footer: {text: $ft}}')
+              fi
 
-        # Build the payload
-        PAYLOAD=$(cat <<EOF
-        {
-          "embeds": [{
-            "title": "$TITLE"
-            $DESC_JSON
-            , "color": $COLOR
-            $FIELDS_JSON
-            $FOOTER_JSON
-            $TIMESTAMP
-          }]
-        }
-        EOF
-        )
+              # Build repo info fields array
+              REPO_FIELDS_JSON="[]"
+              if [ "$INCLUDE_REPO_INFO" = "true" ]; then
+                REPO_FIELDS_JSON=$(jq -n \
+                  --arg repo "$GITHUB_REPO" \
+                  --arg branch "$GITHUB_REF_NAME" \
+                  --arg commit_text "[\`${SHORT_SHA}\`](https://github.com/${GITHUB_REPO}/commit/${GITHUB_SHA_FULL})" \
+                  '[
+                    {name: "Repository", value: $repo, inline: true},
+                    {name: "Branch", value: $branch, inline: true},
+                    {name: "Commit", value: $commit_text, inline: true}
+                  ]')
+              fi
 
-        # Send the notification
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-          -H "Content-Type: application/json" \
-          -d "$PAYLOAD" \
-          "$WEBHOOK_URL")
+              # Merge repo fields with custom fields
+              if [ "$FIELDS" != "[]" ] && [ -n "$FIELDS" ]; then
+                CUSTOM_FIELDS=$(echo "$FIELDS" | jq -c '.' 2>/dev/null || echo "[]")
+              else
+                CUSTOM_FIELDS="[]"
+              fi
 
-        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-          echo "✅ Discord notification sent successfully"
-          echo "sent=true" >> $GITHUB_OUTPUT
-        else
-          echo "⚠️ Discord notification failed with HTTP $HTTP_CODE"
-          echo "sent=false" >> $GITHUB_OUTPUT
-        fi
+              FINAL_FIELDS=$(jq -n \
+                --argjson repo "$REPO_FIELDS_JSON" \
+                --argjson custom "$CUSTOM_FIELDS" \
+                '$repo + $custom')
+
+              # Only add fields if non-empty
+              if [ "$(echo "$FINAL_FIELDS" | jq 'length')" -gt 0 ]; then
+                EMBED=$(echo "$EMBED" | jq --argjson fields "$FINAL_FIELDS" '. + {fields: $fields}')
+              fi
+
+              # Wrap in the Discord payload structure
+              PAYLOAD=$(jq -n --argjson embed "$EMBED" '{embeds: [$embed]}')
+
+              # ── Send with retry on 429 (rate limit) ────────────────────────
+              MAX_ATTEMPTS=3
+              for attempt in $(seq 1 $MAX_ATTEMPTS); do
+                RESPONSE=$(curl -s -w "\n%{http_code}" \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" \
+                  "$WEBHOOK_URL")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "✅ Discord notification sent successfully"
+                  echo "sent=true" >> $GITHUB_OUTPUT
+                  exit 0
+                elif [ "$HTTP_CODE" = "429" ]; then
+                  # Rate limited — extract retry_after from response
+                  RETRY_AFTER=$(echo "$BODY" | jq -r '.retry_after // 2' 2>/dev/null || echo "2")
+                  # Discord returns retry_after in seconds (can be float)
+                  WAIT_SECS=$(echo "$RETRY_AFTER" | awk '{print int($1 + 1)}')
+                  echo "⏳ Rate limited (429). Waiting ${WAIT_SECS}s before retry ${attempt}/${MAX_ATTEMPTS}..."
+                  sleep "$WAIT_SECS"
+                else
+                  echo "⚠️ Discord notification failed with HTTP $HTTP_CODE (attempt ${attempt}/${MAX_ATTEMPTS})"
+                  if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+                    sleep 2
+                  fi
+                fi
+              done
+
+              echo "❌ Discord notification failed after ${MAX_ATTEMPTS} attempts"
+              echo "sent=false" >> $GITHUB_OUTPUT

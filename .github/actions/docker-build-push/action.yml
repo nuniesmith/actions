@@ -31,7 +31,7 @@ inputs:
     platforms:
         description: "Target platforms (comma-separated)"
         required: false
-        default: "linux/amd64,linux/arm64"
+        default: "linux/amd64"
     push:
         description: "Push image to registry"
         required: false
@@ -121,7 +121,7 @@ runs:
 
         - name: 🏗️ Build and push Docker image
           id: build
-          uses: docker/build-push-action@v5
+          uses: docker/build-push-action@v6
           with:
               context: ${{ inputs.context }}
               file: ${{ inputs.dockerfile }}

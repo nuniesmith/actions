@@ -166,8 +166,9 @@ runs:
                 echo ""
                 echo "📋 Processing additional records..."
 
-                # Parse JSON array and iterate
-                echo "$ADDITIONAL" | jq -c '.[]' | while read -r record; do
+                # Parse JSON array and iterate — use process substitution
+                # to avoid a subshell so RECORDS_UPDATED increments persist.
+                while read -r record; do
                   NAME=$(echo "$record" | jq -r '.name')
                   CONTENT=$(echo "$record" | jq -r '.content // "${{ inputs.record-content }}"')
                   TYPE=$(echo "$record" | jq -r '.type // "${{ inputs.record-type }}"')
@@ -177,7 +178,7 @@ runs:
                   if [ -n "$NAME" ] && [ "$NAME" != "null" ]; then
                     update_dns_record "$NAME" "$CONTENT" "$TYPE" "$REC_TTL" "$REC_PROXIED"
                   fi
-                done
+                done < <(echo "$ADDITIONAL" | jq -c '.[]')
               fi
 
               echo ""

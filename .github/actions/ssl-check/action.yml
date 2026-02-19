@@ -45,34 +45,44 @@ inputs:
         required: false
         default: "true"
     renewal-threshold-days:
-        description: "Days before expiry to consider renewal needed (LE certs are 90 days; 27 = 70/30 overlap rule)"
+        description: "Days before expiry to consider renewal needed (LE certs are 90 days; 27 = 70/30 overlap rule). Ignored if renewal-threshold-percent > 0."
         required: false
         default: "27"
+    renewal-threshold-percent:
+        description: "Percentage of certificate lifetime elapsed before renewal (e.g., 70 = renew after 70% of lifetime). Takes priority over renewal-threshold-days when > 0."
+        required: false
+        default: "70"
 
 outputs:
     cert-exists:
-        description: "Whether a valid certificate was found in any location"
+        description: "Whether any valid SSL certificate exists"
         value: ${{ steps.select.outputs.cert_exists }}
     cert-type:
-        description: "Certificate type (letsencrypt, self-signed, none, unknown)"
+        description: "Type of certificate (letsencrypt, self-signed, none)"
         value: ${{ steps.select.outputs.cert_type }}
     days-remaining:
-        description: "Days until certificate expiry"
+        description: "Days until certificate expires"
         value: ${{ steps.select.outputs.days_remaining }}
+    total-days:
+        description: "Total certificate lifetime in days"
+        value: ${{ steps.select.outputs.total_days }}
+    pct-used:
+        description: "Percentage of certificate lifetime elapsed"
+        value: ${{ steps.select.outputs.pct_used }}
     expiry-date:
-        description: "Certificate expiry date string"
+        description: "Certificate expiry date"
         value: ${{ steps.select.outputs.expiry_date }}
     needs-renewal:
         description: "Whether the certificate needs renewal"
         value: ${{ steps.select.outputs.needs_renewal }}
     skip-generation:
-        description: "Whether SSL generation should be skipped (valid LE cert exists above threshold)"
+        description: "Whether SSL generation can be skipped (valid cert exists)"
         value: ${{ steps.select.outputs.skip_generation }}
     issuer:
         description: "Certificate issuer"
         value: ${{ steps.select.outputs.issuer }}
     cert-source:
-        description: "Which location had the best certificate (docker-volume, host-filesystem, none)"
+        description: "Source of the best certificate (docker-volume, host-filesystem, none)"
         value: ${{ steps.select.outputs.cert_source }}
 
 runs:
@@ -123,26 +133,69 @@ runs:
                 echo "vol_exists=false"   >> $GITHUB_OUTPUT
                 echo "vol_type=unknown"   >> $GITHUB_OUTPUT
                 echo "vol_days=0"         >> $GITHUB_OUTPUT
+                echo "vol_total_days=0"   >> $GITHUB_OUTPUT
+                echo "vol_pct_used=100"   >> $GITHUB_OUTPUT
                 echo "vol_expiry="        >> $GITHUB_OUTPUT
                 echo "vol_issuer=unknown" >> $GITHUB_OUTPUT
                 exit 0
               fi
 
-              # Read cert metadata from inside the volume via a disposable container
-              VOLUME_CERT=$(ssh -i ~/.ssh/ssl_check_key \
+              # ── Single SSH call to get ALL cert metadata ───────────────
+              # This avoids the latency and fragility of multiple SSH calls.
+              # The remote script outputs a structured KEY:VALUE format.
+              CERT_INFO=$(ssh -i ~/.ssh/ssl_check_key \
                 -p "$SSH_PORT" \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=yes \
                 "$SSH_USER@$SSH_HOST" \
-                "docker run --rm -v ${VOLUME_NAME}:/certs:ro alpine/openssl x509 \
-                  -in /certs/${VOLUME_CERT_PATH} \
-                  -noout -subject -enddate -issuer -checkend 0 2>/dev/null" 2>/dev/null) || true
+                "docker run --rm -v ${VOLUME_NAME}:/certs:ro alpine/openssl:3.3.2 sh -c '
+                  CERT=/certs/${VOLUME_CERT_PATH}
+                  if [ ! -f \"\$CERT\" ]; then
+                    echo \"EXISTS:false\"
+                    exit 0
+                  fi
+                  echo \"EXISTS:true\"
 
-              if [ -z "$VOLUME_CERT" ]; then
+                  # Get issuer
+                  ISSUER=\$(openssl x509 -issuer -noout -in \$CERT 2>/dev/null || echo \"unknown\")
+                  echo \"ISSUER:\$ISSUER\"
+
+                  # Get dates
+                  END_DATE=\$(openssl x509 -enddate -noout -in \$CERT 2>/dev/null | cut -d= -f2)
+                  START_DATE=\$(openssl x509 -startdate -noout -in \$CERT 2>/dev/null | cut -d= -f2)
+                  echo \"END_DATE:\$END_DATE\"
+
+                  # Calculate epochs and derived values
+                  END_EPOCH=\$(date -d \"\$END_DATE\" +%s 2>/dev/null || echo 0)
+                  START_EPOCH=\$(date -d \"\$START_DATE\" +%s 2>/dev/null || echo 0)
+                  NOW_EPOCH=\$(date +%s)
+
+                  REMAINING=\$((END_EPOCH - NOW_EPOCH))
+                  TOTAL=\$((END_EPOCH - START_EPOCH))
+                  DAYS_REMAINING=\$((REMAINING / 86400))
+                  TOTAL_DAYS=\$((TOTAL / 86400))
+
+                  if [ \$TOTAL -gt 0 ]; then
+                    PCT_USED=\$(( (NOW_EPOCH - START_EPOCH) * 100 / TOTAL ))
+                  else
+                    PCT_USED=100
+                  fi
+
+                  echo \"DAYS:\$DAYS_REMAINING\"
+                  echo \"TOTAL_DAYS:\$TOTAL_DAYS\"
+                  echo \"PCT_USED:\$PCT_USED\"
+                '" 2>/dev/null) || true
+
+              # ── Parse structured output ────────────────────────────────
+              VOL_EXISTS=$(echo "$CERT_INFO" | grep -o 'EXISTS:[^ ]*' | cut -d: -f2)
+
+              if [ "$VOL_EXISTS" != "true" ] || [ -z "$CERT_INFO" ]; then
                 echo "   ❌ No certificate found in Docker volume"
                 echo "vol_exists=false"   >> $GITHUB_OUTPUT
                 echo "vol_type=none"      >> $GITHUB_OUTPUT
                 echo "vol_days=0"         >> $GITHUB_OUTPUT
+                echo "vol_total_days=0"   >> $GITHUB_OUTPUT
+                echo "vol_pct_used=100"   >> $GITHUB_OUTPUT
                 echo "vol_expiry="        >> $GITHUB_OUTPUT
                 echo "vol_issuer=none"    >> $GITHUB_OUTPUT
                 exit 0
@@ -150,9 +203,17 @@ runs:
 
               echo "vol_exists=true" >> $GITHUB_OUTPUT
 
-              # ── Parse issuer ───────────────────────────────────────────
-              VOL_ISSUER=$(echo "$VOLUME_CERT" | grep -i "issuer" || echo "unknown")
+              VOL_ISSUER=$(echo "$CERT_INFO" | grep 'ISSUER:' | cut -d: -f2-)
+              VOL_EXPIRY=$(echo "$CERT_INFO" | grep 'END_DATE:' | cut -d: -f2-)
+              VOL_DAYS=$(echo "$CERT_INFO" | grep -o 'DAYS:[^ ]*' | cut -d: -f2)
+              VOL_TOTAL_DAYS=$(echo "$CERT_INFO" | grep -o 'TOTAL_DAYS:[^ ]*' | cut -d: -f2)
+              VOL_PCT_USED=$(echo "$CERT_INFO" | grep -o 'PCT_USED:[^ ]*' | cut -d: -f2)
+
               echo "vol_issuer=$VOL_ISSUER" >> $GITHUB_OUTPUT
+              echo "vol_expiry=$VOL_EXPIRY" >> $GITHUB_OUTPUT
+              echo "vol_days=${VOL_DAYS:-0}" >> $GITHUB_OUTPUT
+              echo "vol_total_days=${VOL_TOTAL_DAYS:-0}" >> $GITHUB_OUTPUT
+              echo "vol_pct_used=${VOL_PCT_USED:-100}" >> $GITHUB_OUTPUT
 
               if echo "$VOL_ISSUER" | grep -qi "Let's Encrypt\|R3\|R10\|R11\|E5\|E6\|E1\|E2\|ISRG"; then
                 VOL_TYPE="letsencrypt"
@@ -161,43 +222,19 @@ runs:
               fi
               echo "vol_type=$VOL_TYPE" >> $GITHUB_OUTPUT
 
-              # ── Parse expiry ───────────────────────────────────────────
-              VOL_EXPIRY=$(echo "$VOLUME_CERT" | grep "notAfter" | cut -d= -f2)
-              echo "vol_expiry=$VOL_EXPIRY" >> $GITHUB_OUTPUT
-
-              if [ -n "$VOL_EXPIRY" ]; then
-                VOL_EXPIRY_EPOCH=$(ssh -i ~/.ssh/ssl_check_key \
-                  -p "$SSH_PORT" \
-                  -o StrictHostKeyChecking=no \
-                  -o BatchMode=yes \
-                  "$SSH_USER@$SSH_HOST" \
-                  "docker run --rm -v ${VOLUME_NAME}:/certs:ro alpine/openssl x509 \
-                    -in /certs/${VOLUME_CERT_PATH} \
-                    -noout -enddate 2>/dev/null \
-                    | cut -d= -f2 \
-                    | xargs -I{} date -d '{}' +%s 2>/dev/null || echo 0" 2>/dev/null) || true
-                NOW_EPOCH=$(date +%s)
-                if [ -n "$VOL_EXPIRY_EPOCH" ] && [ "$VOL_EXPIRY_EPOCH" -gt 0 ] 2>/dev/null; then
-                  VOL_DAYS=$(( (VOL_EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
-                else
-                  VOL_DAYS=0
-                fi
-              else
-                VOL_DAYS=0
-              fi
-              echo "vol_days=$VOL_DAYS" >> $GITHUB_OUTPUT
-
               # ── Log ────────────────────────────────────────────────────
-              echo "   Type:           $VOL_TYPE"
-              echo "   Expires:        $VOL_EXPIRY"
-              echo "   Days remaining: $VOL_DAYS"
+              echo "   Type:            $VOL_TYPE"
+              echo "   Expires:         $VOL_EXPIRY"
+              echo "   Days remaining:  ${VOL_DAYS:-0}"
+              echo "   Total lifetime:  ${VOL_TOTAL_DAYS:-0} days"
+              echo "   Lifetime used:   ${VOL_PCT_USED:-?}%"
 
-              if [ "$VOL_TYPE" = "letsencrypt" ] && [ "$VOL_DAYS" -gt "$RENEWAL_THRESHOLD" ]; then
-                echo "   ✅ Certificate is healthy ($VOL_DAYS days > $RENEWAL_THRESHOLD threshold)"
-              elif [ "$VOL_TYPE" = "letsencrypt" ] && [ "$VOL_DAYS" -gt 0 ]; then
-                echo "   ⚠️  Certificate approaching expiry ($VOL_DAYS days ≤ $RENEWAL_THRESHOLD threshold)"
-              elif [ "$VOL_TYPE" = "self-signed" ] && [ "$VOL_DAYS" -gt 0 ]; then
-                echo "   ℹ️  Self-signed cert found ($VOL_DAYS days remaining)"
+              if [ "$VOL_TYPE" = "letsencrypt" ] && [ "${VOL_DAYS:-0}" -gt "$RENEWAL_THRESHOLD" ]; then
+                echo "   ✅ Certificate is healthy (${VOL_DAYS} days > $RENEWAL_THRESHOLD threshold)"
+              elif [ "$VOL_TYPE" = "letsencrypt" ] && [ "${VOL_DAYS:-0}" -gt 0 ]; then
+                echo "   ⚠️  Certificate approaching expiry (${VOL_DAYS} days ≤ $RENEWAL_THRESHOLD threshold)"
+              elif [ "$VOL_TYPE" = "self-signed" ] && [ "${VOL_DAYS:-0}" -gt 0 ]; then
+                echo "   ℹ️  Self-signed cert found (${VOL_DAYS} days remaining)"
               else
                 echo "   ❌ Certificate is expired or invalid"
               fi
@@ -232,25 +269,64 @@ runs:
                 echo "host_exists=false"   >> $GITHUB_OUTPUT
                 echo "host_type=unknown"   >> $GITHUB_OUTPUT
                 echo "host_days=0"         >> $GITHUB_OUTPUT
+                echo "host_total_days=0"   >> $GITHUB_OUTPUT
+                echo "host_pct_used=100"   >> $GITHUB_OUTPUT
                 echo "host_expiry="        >> $GITHUB_OUTPUT
                 echo "host_issuer=unknown" >> $GITHUB_OUTPUT
                 exit 0
               fi
 
-              HOST_CERT=$(ssh -i ~/.ssh/ssl_check_key \
+              # ── Single SSH call to get ALL cert metadata ───────────────
+              CERT_INFO=$(ssh -i ~/.ssh/ssl_check_key \
                 -p "$SSH_PORT" \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=yes \
                 "$SSH_USER@$SSH_HOST" \
-                "$SUDO_CMD openssl x509 \
-                  -in $HOST_CERT_PATH \
-                  -noout -subject -enddate -issuer 2>/dev/null || echo ''" 2>/dev/null) || true
+                "$SUDO_CMD sh -c '
+                  CERT=\"$HOST_CERT_PATH\"
+                  if [ ! -f \"\$CERT\" ]; then
+                    echo \"EXISTS:false\"
+                    exit 0
+                  fi
+                  echo \"EXISTS:true\"
 
-              if [ -z "$HOST_CERT" ]; then
+                  ISSUER=\$(openssl x509 -issuer -noout -in \$CERT 2>/dev/null || echo \"unknown\")
+                  echo \"ISSUER:\$ISSUER\"
+
+                  END_DATE=\$(openssl x509 -enddate -noout -in \$CERT 2>/dev/null | cut -d= -f2)
+                  START_DATE=\$(openssl x509 -startdate -noout -in \$CERT 2>/dev/null | cut -d= -f2)
+                  echo \"END_DATE:\$END_DATE\"
+
+                  END_EPOCH=\$(date -d \"\$END_DATE\" +%s 2>/dev/null || echo 0)
+                  START_EPOCH=\$(date -d \"\$START_DATE\" +%s 2>/dev/null || echo 0)
+                  NOW_EPOCH=\$(date +%s)
+
+                  REMAINING=\$((END_EPOCH - NOW_EPOCH))
+                  TOTAL=\$((END_EPOCH - START_EPOCH))
+                  DAYS_REMAINING=\$((REMAINING / 86400))
+                  TOTAL_DAYS=\$((TOTAL / 86400))
+
+                  if [ \$TOTAL -gt 0 ]; then
+                    PCT_USED=\$(( (NOW_EPOCH - START_EPOCH) * 100 / TOTAL ))
+                  else
+                    PCT_USED=100
+                  fi
+
+                  echo \"DAYS:\$DAYS_REMAINING\"
+                  echo \"TOTAL_DAYS:\$TOTAL_DAYS\"
+                  echo \"PCT_USED:\$PCT_USED\"
+                '" 2>/dev/null) || true
+
+              # ── Parse structured output ────────────────────────────────
+              HOST_EXISTS=$(echo "$CERT_INFO" | grep -o 'EXISTS:[^ ]*' | cut -d: -f2)
+
+              if [ "$HOST_EXISTS" != "true" ] || [ -z "$CERT_INFO" ]; then
                 echo "   ℹ️  No certificate found on host filesystem"
                 echo "host_exists=false"   >> $GITHUB_OUTPUT
                 echo "host_type=none"      >> $GITHUB_OUTPUT
                 echo "host_days=0"         >> $GITHUB_OUTPUT
+                echo "host_total_days=0"   >> $GITHUB_OUTPUT
+                echo "host_pct_used=100"   >> $GITHUB_OUTPUT
                 echo "host_expiry="        >> $GITHUB_OUTPUT
                 echo "host_issuer=none"    >> $GITHUB_OUTPUT
                 exit 0
@@ -258,9 +334,17 @@ runs:
 
               echo "host_exists=true" >> $GITHUB_OUTPUT
 
-              # ── Parse issuer ───────────────────────────────────────────
-              HOST_ISSUER=$(echo "$HOST_CERT" | grep -i "issuer" || echo "unknown")
+              HOST_ISSUER=$(echo "$CERT_INFO" | grep 'ISSUER:' | cut -d: -f2-)
+              HOST_EXPIRY=$(echo "$CERT_INFO" | grep 'END_DATE:' | cut -d: -f2-)
+              HOST_DAYS=$(echo "$CERT_INFO" | grep -o 'DAYS:[^ ]*' | cut -d: -f2)
+              HOST_TOTAL_DAYS=$(echo "$CERT_INFO" | grep -o 'TOTAL_DAYS:[^ ]*' | cut -d: -f2)
+              HOST_PCT_USED=$(echo "$CERT_INFO" | grep -o 'PCT_USED:[^ ]*' | cut -d: -f2)
+
               echo "host_issuer=$HOST_ISSUER" >> $GITHUB_OUTPUT
+              echo "host_expiry=$HOST_EXPIRY" >> $GITHUB_OUTPUT
+              echo "host_days=${HOST_DAYS:-0}" >> $GITHUB_OUTPUT
+              echo "host_total_days=${HOST_TOTAL_DAYS:-0}" >> $GITHUB_OUTPUT
+              echo "host_pct_used=${HOST_PCT_USED:-100}" >> $GITHUB_OUTPUT
 
               if echo "$HOST_ISSUER" | grep -qi "Let's Encrypt\|R3\|R10\|R11\|E5\|E6\|E1\|E2\|ISRG"; then
                 HOST_TYPE="letsencrypt"
@@ -269,43 +353,19 @@ runs:
               fi
               echo "host_type=$HOST_TYPE" >> $GITHUB_OUTPUT
 
-              # ── Parse expiry ───────────────────────────────────────────
-              HOST_EXPIRY=$(echo "$HOST_CERT" | grep "notAfter" | cut -d= -f2)
-              echo "host_expiry=$HOST_EXPIRY" >> $GITHUB_OUTPUT
-
-              if [ -n "$HOST_EXPIRY" ]; then
-                HOST_EXPIRY_EPOCH=$(ssh -i ~/.ssh/ssl_check_key \
-                  -p "$SSH_PORT" \
-                  -o StrictHostKeyChecking=no \
-                  -o BatchMode=yes \
-                  "$SSH_USER@$SSH_HOST" \
-                  "$SUDO_CMD openssl x509 \
-                    -in $HOST_CERT_PATH \
-                    -noout -enddate 2>/dev/null \
-                    | cut -d= -f2 \
-                    | xargs -I{} date -d '{}' +%s 2>/dev/null || echo 0" 2>/dev/null) || true
-                NOW_EPOCH=$(date +%s)
-                if [ -n "$HOST_EXPIRY_EPOCH" ] && [ "$HOST_EXPIRY_EPOCH" -gt 0 ] 2>/dev/null; then
-                  HOST_DAYS=$(( (HOST_EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
-                else
-                  HOST_DAYS=0
-                fi
-              else
-                HOST_DAYS=0
-              fi
-              echo "host_days=$HOST_DAYS" >> $GITHUB_OUTPUT
-
               # ── Log ────────────────────────────────────────────────────
-              echo "   Type:           $HOST_TYPE"
-              echo "   Expires:        $HOST_EXPIRY"
-              echo "   Days remaining: $HOST_DAYS"
+              echo "   Type:            $HOST_TYPE"
+              echo "   Expires:         $HOST_EXPIRY"
+              echo "   Days remaining:  ${HOST_DAYS:-0}"
+              echo "   Total lifetime:  ${HOST_TOTAL_DAYS:-0} days"
+              echo "   Lifetime used:   ${HOST_PCT_USED:-?}%"
 
-              if [ "$HOST_TYPE" = "letsencrypt" ] && [ "$HOST_DAYS" -gt "$RENEWAL_THRESHOLD" ]; then
-                echo "   ✅ Certificate is healthy ($HOST_DAYS days > $RENEWAL_THRESHOLD threshold)"
-              elif [ "$HOST_TYPE" = "letsencrypt" ] && [ "$HOST_DAYS" -gt 0 ]; then
-                echo "   ⚠️  Certificate approaching expiry ($HOST_DAYS days ≤ $RENEWAL_THRESHOLD threshold)"
-              elif [ "$HOST_TYPE" = "self-signed" ] && [ "$HOST_DAYS" -gt 0 ]; then
-                echo "   ℹ️  Self-signed cert found ($HOST_DAYS days remaining)"
+              if [ "$HOST_TYPE" = "letsencrypt" ] && [ "${HOST_DAYS:-0}" -gt "$RENEWAL_THRESHOLD" ]; then
+                echo "   ✅ Certificate is healthy (${HOST_DAYS} days > $RENEWAL_THRESHOLD threshold)"
+              elif [ "$HOST_TYPE" = "letsencrypt" ] && [ "${HOST_DAYS:-0}" -gt 0 ]; then
+                echo "   ⚠️  Certificate approaching expiry (${HOST_DAYS} days ≤ $RENEWAL_THRESHOLD threshold)"
+              elif [ "$HOST_TYPE" = "self-signed" ] && [ "${HOST_DAYS:-0}" -gt 0 ]; then
+                echo "   ℹ️  Self-signed cert found (${HOST_DAYS} days remaining)"
               else
                 echo "   ❌ Certificate is expired or invalid"
               fi
@@ -318,16 +378,21 @@ runs:
           shell: bash
           env:
               RENEWAL_THRESHOLD: ${{ inputs.renewal-threshold-days }}
+              RENEWAL_THRESHOLD_PCT: ${{ inputs.renewal-threshold-percent }}
               # Docker volume results
               VOL_EXISTS: ${{ steps.check-volume.outputs.vol_exists }}
               VOL_TYPE: ${{ steps.check-volume.outputs.vol_type }}
               VOL_DAYS: ${{ steps.check-volume.outputs.vol_days }}
+              VOL_TOTAL_DAYS: ${{ steps.check-volume.outputs.vol_total_days }}
+              VOL_PCT_USED: ${{ steps.check-volume.outputs.vol_pct_used }}
               VOL_EXPIRY: ${{ steps.check-volume.outputs.vol_expiry }}
               VOL_ISSUER: ${{ steps.check-volume.outputs.vol_issuer }}
               # Host filesystem results
               HOST_EXISTS: ${{ steps.check-host.outputs.host_exists }}
               HOST_TYPE: ${{ steps.check-host.outputs.host_type }}
               HOST_DAYS: ${{ steps.check-host.outputs.host_days }}
+              HOST_TOTAL_DAYS: ${{ steps.check-host.outputs.host_total_days }}
+              HOST_PCT_USED: ${{ steps.check-host.outputs.host_pct_used }}
               HOST_EXPIRY: ${{ steps.check-host.outputs.host_expiry }}
               HOST_ISSUER: ${{ steps.check-host.outputs.host_issuer }}
           run: |
@@ -339,6 +404,8 @@ runs:
               BEST_SOURCE="none"
               BEST_TYPE="none"
               BEST_DAYS=0
+              BEST_TOTAL_DAYS=0
+              BEST_PCT_USED=100
               BEST_EXPIRY=""
               BEST_ISSUER="none"
               NEEDS_RENEWAL="true"
@@ -373,7 +440,7 @@ runs:
               # ── Score Docker volume cert ───────────────────────────────
               if [ "$VOL_EXISTS" = "true" ]; then
                 VOL_SCORE=$(score_cert "$VOL_TYPE" "${VOL_DAYS:-0}")
-                echo "📦 Docker volume:    type=$VOL_TYPE  days=${VOL_DAYS:-0}  score=$VOL_SCORE"
+                echo "📦 Docker volume:    type=$VOL_TYPE  days=${VOL_DAYS:-0}/${VOL_TOTAL_DAYS:-?}  ${VOL_PCT_USED:-?}% used  score=$VOL_SCORE"
               else
                 echo "📦 Docker volume:    (no certificate)"
               fi
@@ -381,7 +448,7 @@ runs:
               # ── Score host filesystem cert ─────────────────────────────
               if [ "$HOST_EXISTS" = "true" ]; then
                 HOST_SCORE=$(score_cert "$HOST_TYPE" "${HOST_DAYS:-0}")
-                echo "🖥️  Host filesystem:  type=$HOST_TYPE  days=${HOST_DAYS:-0}  score=$HOST_SCORE"
+                echo "🖥️  Host filesystem:  type=$HOST_TYPE  days=${HOST_DAYS:-0}/${HOST_TOTAL_DAYS:-?}  ${HOST_PCT_USED:-?}% used  score=$HOST_SCORE"
               else
                 echo "🖥️  Host filesystem:  (no certificate)"
               fi
@@ -394,27 +461,62 @@ runs:
                   BEST_SOURCE="docker-volume"
                   BEST_TYPE="$VOL_TYPE"
                   BEST_DAYS="${VOL_DAYS:-0}"
+                  BEST_TOTAL_DAYS="${VOL_TOTAL_DAYS:-0}"
+                  BEST_PCT_USED="${VOL_PCT_USED:-100}"
                   BEST_EXPIRY="$VOL_EXPIRY"
                   BEST_ISSUER="$VOL_ISSUER"
                 elif [ "$HOST_SCORE" -gt 0 ]; then
                   BEST_SOURCE="host-filesystem"
                   BEST_TYPE="$HOST_TYPE"
                   BEST_DAYS="${HOST_DAYS:-0}"
+                  BEST_TOTAL_DAYS="${HOST_TOTAL_DAYS:-0}"
+                  BEST_PCT_USED="${HOST_PCT_USED:-100}"
                   BEST_EXPIRY="$HOST_EXPIRY"
                   BEST_ISSUER="$HOST_ISSUER"
                 fi
               fi
 
               # ── Determine renewal / skip flags ─────────────────────────
-              if [ "$BEST_TYPE" = "letsencrypt" ] && [ "$BEST_DAYS" -gt "$RENEWAL_THRESHOLD" ]; then
-                NEEDS_RENEWAL="false"
-                SKIP_GENERATION="true"
-              elif [ "$BEST_TYPE" = "letsencrypt" ] && [ "$BEST_DAYS" -gt 0 ]; then
-                NEEDS_RENEWAL="true"
-                SKIP_GENERATION="false"
-              else
-                NEEDS_RENEWAL="true"
-                SKIP_GENERATION="false"
+              # Support both percentage-based and days-based thresholds.
+              # If renewal-threshold-percent > 0, use percentage of lifetime.
+              # Otherwise fall back to fixed days threshold.
+              if [ "$BEST_TYPE" = "letsencrypt" ] || [ "$BEST_TYPE" = "self-signed" ]; then
+                if [ "${RENEWAL_THRESHOLD_PCT:-0}" -gt 0 ] 2>/dev/null; then
+                  # ── Percentage-based threshold ───────────────────────────
+                  # Renew when PCT_USED >= threshold (e.g., 70% of lifetime elapsed)
+                  echo ""
+                  echo "📊 Using percentage-based threshold: renew when ≥${RENEWAL_THRESHOLD_PCT}% of lifetime elapsed"
+                  echo "   Current: ${BEST_PCT_USED}% elapsed (${BEST_DAYS} of ${BEST_TOTAL_DAYS} days remaining)"
+
+                  if [ "${BEST_DAYS:-0}" -le 0 ] 2>/dev/null; then
+                    echo "   ❌ Certificate is expired"
+                    NEEDS_RENEWAL="true"
+                    SKIP_GENERATION="false"
+                  elif [ "${BEST_PCT_USED:-100}" -ge "${RENEWAL_THRESHOLD_PCT}" ] 2>/dev/null; then
+                    echo "   ⚠️  ${BEST_PCT_USED}% ≥ ${RENEWAL_THRESHOLD_PCT}% → should renew"
+                    NEEDS_RENEWAL="true"
+                    SKIP_GENERATION="false"
+                  else
+                    echo "   ✅ ${BEST_PCT_USED}% < ${RENEWAL_THRESHOLD_PCT}% → skip generation"
+                    NEEDS_RENEWAL="false"
+                    SKIP_GENERATION="true"
+                  fi
+                else
+                  # ── Days-based threshold (legacy) ────────────────────────
+                  echo ""
+                  echo "📊 Using days-based threshold: renew when ≤${RENEWAL_THRESHOLD} days remaining"
+
+                  if [ "$BEST_DAYS" -gt "$RENEWAL_THRESHOLD" ]; then
+                    NEEDS_RENEWAL="false"
+                    SKIP_GENERATION="true"
+                  elif [ "$BEST_DAYS" -gt 0 ]; then
+                    NEEDS_RENEWAL="true"
+                    SKIP_GENERATION="false"
+                  else
+                    NEEDS_RENEWAL="true"
+                    SKIP_GENERATION="false"
+                  fi
+                fi
               fi
 
               # ── Summary ────────────────────────────────────────────────
@@ -423,10 +525,12 @@ runs:
               echo "📋 SSL DECISION"
               echo "   Best cert source: $BEST_SOURCE"
               echo "   Cert type:        $BEST_TYPE"
-              echo "   Days remaining:   $BEST_DAYS"
+              echo "   Days remaining:   $BEST_DAYS / $BEST_TOTAL_DAYS total"
+              echo "   Lifetime used:    ${BEST_PCT_USED}%"
               echo "   Needs renewal:    $NEEDS_RENEWAL"
               echo "   Skip generation:  $SKIP_GENERATION"
-              echo "   Threshold:        $RENEWAL_THRESHOLD days"
+              echo "   Threshold (pct):  ${RENEWAL_THRESHOLD_PCT}%"
+              echo "   Threshold (days): $RENEWAL_THRESHOLD"
               echo "════════════════════════════════════════════════════════════"
 
               # ── Outputs ────────────────────────────────────────────────
@@ -434,6 +538,8 @@ runs:
                 echo "cert_exists=$CERT_EXISTS"
                 echo "cert_type=$BEST_TYPE"
                 echo "days_remaining=$BEST_DAYS"
+                echo "total_days=$BEST_TOTAL_DAYS"
+                echo "pct_used=$BEST_PCT_USED"
                 echo "expiry_date=$BEST_EXPIRY"
                 echo "needs_renewal=$NEEDS_RENEWAL"
                 echo "skip_generation=$SKIP_GENERATION"
@@ -442,16 +548,16 @@ runs:
               } >> $GITHUB_OUTPUT
 
               # ── Human-readable verdict ─────────────────────────────────
-              if [ "$BEST_TYPE" = "letsencrypt" ] && [ "$SKIP_GENERATION" = "true" ]; then
+              if [ "$SKIP_GENERATION" = "true" ]; then
                 echo ""
-                echo "✅ Valid Let's Encrypt certificate found ($BEST_DAYS days remaining, source: $BEST_SOURCE)"
-                echo "⏭️  SSL generation can be skipped to avoid rate limits"
+                echo "✅ Valid ${BEST_TYPE} certificate found (${BEST_DAYS} days remaining, ${BEST_PCT_USED}% used, source: $BEST_SOURCE)"
+                echo "⏭️  SSL generation can be skipped"
               elif [ "$BEST_TYPE" = "letsencrypt" ]; then
                 echo ""
-                echo "🔄 Let's Encrypt certificate needs renewal ($BEST_DAYS days remaining, source: $BEST_SOURCE)"
+                echo "🔄 Let's Encrypt certificate needs renewal (${BEST_DAYS} days remaining, ${BEST_PCT_USED}% used, source: $BEST_SOURCE)"
               elif [ "$BEST_TYPE" = "self-signed" ]; then
                 echo ""
-                echo "⚠️  Self-signed certificate found ($BEST_DAYS days remaining, source: $BEST_SOURCE)"
+                echo "⚠️  Self-signed certificate found (${BEST_DAYS} days remaining, source: $BEST_SOURCE)"
                 echo "   Consider upgrading to Let's Encrypt"
               else
                 echo ""
