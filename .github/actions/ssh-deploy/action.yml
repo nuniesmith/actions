@@ -467,15 +467,26 @@ runs:
               echo "🐳 Compose:        ${COMPOSE_CMD}"
               echo "════════════════════════════════════════════════════════════"
 
+              # ── Normalize PROJECT_PATH ────────────────────────────────────
+              # Replace a leading ~ or ~/ with literal $HOME so that when the
+              # path lands inside double quotes on the remote shell, $HOME
+              # still expands correctly.  (Tilde expansion only works unquoted,
+              # but $HOME expands inside double quotes.)
+              if [[ "${PROJECT_PATH}" == "~/"* ]]; then
+                PROJECT_PATH='$HOME'"${PROJECT_PATH:1}"
+              elif [[ "${PROJECT_PATH}" == "~" ]]; then
+                PROJECT_PATH='$HOME'
+              fi
+
               # ── Phase 0: First-time clone ─────────────────────────────────
               if [ -n "${GIT_REPO_URL}" ]; then
                 echo ""
                 echo "📦 Checking for existing project..."
                 ssh_exec "
-                  if [ ! -d '${PROJECT_PATH}/.git' ]; then
+                  if [ ! -d \"${PROJECT_PATH}/.git\" ]; then
                     echo '📦 First-time setup — cloning repository...'
-                    rm -rf '${PROJECT_PATH}'
-                    git clone '${GIT_REPO_URL}' '${PROJECT_PATH}'
+                    rm -rf \"${PROJECT_PATH}\"
+                    git clone '${GIT_REPO_URL}' \"${PROJECT_PATH}\"
                     echo '✅ Repository cloned'
                   else
                     echo '✅ Project already exists'
@@ -489,7 +500,7 @@ runs:
                 echo "════════════════════════════════════════════════════════════"
                 echo "⚙️  PHASE 1: Pre-Deploy"
                 echo "════════════════════════════════════════════════════════════"
-                ssh_exec "cd '${PROJECT_PATH}' 2>/dev/null || cd ~
+                ssh_exec "cd \"${PROJECT_PATH}\" 2>/dev/null || cd ~
               ${PRE_DEPLOY_COMMAND}"
               fi
 
@@ -500,7 +511,7 @@ runs:
                 echo "📥 PHASE 2: Git Pull (${GIT_BRANCH})"
                 echo "════════════════════════════════════════════════════════════"
                 ssh_exec "
-                  cd '${PROJECT_PATH}'
+                  cd \"${PROJECT_PATH}\"
                   echo '📥 Fetching from origin...'
                   git fetch origin
                   git checkout '${GIT_BRANCH}' 2>/dev/null || true
@@ -516,7 +527,7 @@ runs:
                 echo "${ENV_FILES}" | jq -r 'to_entries[] | "\(.key):\(.value)"' 2>/dev/null | while IFS=: read -r filename content; do
                   if [ -n "$filename" ] && [ -n "$content" ]; then
                     echo "  📄 ${filename}"
-                    ssh_exec "echo '${content}' > '${PROJECT_PATH}/${filename}' && chmod 600 '${PROJECT_PATH}/${filename}'"
+                    ssh_exec "echo '${content}' > \"${PROJECT_PATH}/${filename}\" && chmod 600 \"${PROJECT_PATH}/${filename}\""
                   fi
                 done || echo "  (No env files to create or JSON parsing skipped)"
               fi
@@ -527,7 +538,7 @@ runs:
                 echo "════════════════════════════════════════════════════════════"
                 echo "📝 PHASE 3b: .env Generation"
                 echo "════════════════════════════════════════════════════════════"
-                ssh_exec "cd '${PROJECT_PATH}' || { echo 'FATAL: cannot cd to ${PROJECT_PATH}'; exit 1; }
+                ssh_exec "cd \"${PROJECT_PATH}\" || { echo \"FATAL: cannot cd to ${PROJECT_PATH}\"; exit 1; }
               ${ENV_SETUP_COMMAND}"
               fi
 
@@ -536,7 +547,7 @@ runs:
                 echo ""
                 echo "🔐 Injecting secrets into .env..."
                 # Build a remote script that injects each KEY=VALUE into .env
-                INJECT_SCRIPT="cd '${PROJECT_PATH}' || exit 1
+                INJECT_SCRIPT="cd \"${PROJECT_PATH}\" || exit 1
               if [ ! -f .env ]; then
                 echo '  ⚠️  No .env file found — creating one'
                 touch .env
@@ -572,7 +583,7 @@ runs:
               # If a custom deploy command is provided, it overrides everything
               if [ -n "${DEPLOY_COMMAND}" ]; then
                 echo "⚙️  Running custom deploy command..."
-                ssh_exec "cd '${PROJECT_PATH}' || { echo 'FATAL: cannot cd to ${PROJECT_PATH}'; exit 1; }
+                ssh_exec "cd \"${PROJECT_PATH}\" || { echo \"FATAL: cannot cd to ${PROJECT_PATH}\"; exit 1; }
               ${DEPLOY_COMMAND}"
                 echo "build_strategy=custom" >> $GITHUB_OUTPUT
                 echo "services=custom" >> $GITHUB_OUTPUT
@@ -594,27 +605,27 @@ runs:
                 # Stop app services (keep infra running)
                 if [ -n "${APP_SERVICES}" ]; then
                   echo "🛑 Stopping app services: ${APP_SERVICES}"
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} stop ${APP_SERVICES} 2>/dev/null || true && ${COMPOSE_CMD} rm -f ${APP_SERVICES} 2>/dev/null || true"
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} stop ${APP_SERVICES} 2>/dev/null || true && ${COMPOSE_CMD} rm -f ${APP_SERVICES} 2>/dev/null || true"
                 fi
 
                 # Pull images
                 if [ -n "${APP_SERVICES}" ]; then
                   echo "📥 Pulling images for: ${APP_SERVICES}"
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} pull ${APP_SERVICES}" 3 10
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} pull ${APP_SERVICES}" 3 10
                 else
                   echo "📥 Pulling all images..."
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} pull" 3 10
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} pull" 3 10
                 fi
 
                 # Ensure infra services are running
                 if [ -n "${INFRA_SERVICES}" ]; then
                   echo "🔧 Ensuring infrastructure services are running..."
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d --no-recreate ${INFRA_SERVICES}"
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} up -d --no-recreate ${INFRA_SERVICES}"
                 fi
 
                 # Start all services
                 echo "🚀 Starting services..."
-                ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d"
+                ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} up -d"
 
                 echo "build_strategy=dockerhub" >> $GITHUB_OUTPUT
                 echo "services=${APP_SERVICES:-all}" >> $GITHUB_OUTPUT
@@ -635,7 +646,7 @@ runs:
                 # Stop app services (keep infra running)
                 if [ -n "${APP_SERVICES}" ]; then
                   echo "🛑 Stopping app services: ${APP_SERVICES}"
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} stop ${APP_SERVICES} 2>/dev/null || true && ${COMPOSE_CMD} rm -f ${APP_SERVICES} 2>/dev/null || true"
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} stop ${APP_SERVICES} 2>/dev/null || true && ${COMPOSE_CMD} rm -f ${APP_SERVICES} 2>/dev/null || true"
                 fi
 
                 # Clean orphan containers
@@ -644,22 +655,22 @@ runs:
                 # Build images on server
                 if [ -n "${APP_SERVICES}" ]; then
                   echo "🔨 Building app images: ${APP_SERVICES}"
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} build --parallel ${APP_SERVICES}" 1 0
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} build --parallel ${APP_SERVICES}" 1 0
                 else
                   echo "🔨 Building all images..."
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} build --parallel" 1 0
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} build --parallel" 1 0
                 fi
                 echo "✅ Images built"
 
                 # Ensure infra services are running
                 if [ -n "${INFRA_SERVICES}" ]; then
                   echo "🔧 Ensuring infrastructure services are running..."
-                  ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d --no-recreate ${INFRA_SERVICES}"
+                  ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} up -d --no-recreate ${INFRA_SERVICES}"
                 fi
 
                 # Start all services
                 echo "🚀 Starting all services..."
-                ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d"
+                ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} up -d"
 
                 echo "build_strategy=server-build" >> $GITHUB_OUTPUT
                 echo "services=${APP_SERVICES:-all}" >> $GITHUB_OUTPUT
@@ -668,7 +679,7 @@ runs:
                 # ── None / Skip ─────────────────────────────────────────────
                 echo "⏭️  Build strategy: none — skipping build phase"
                 echo "🚀 Starting services with existing images..."
-                ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} up -d"
+                ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} up -d"
 
                 echo "build_strategy=none" >> $GITHUB_OUTPUT
                 echo "services=all" >> $GITHUB_OUTPUT
@@ -686,7 +697,7 @@ runs:
               echo "════════════════════════════════════════════════════════════"
               echo "📊 Container Status"
               echo "════════════════════════════════════════════════════════════"
-              ssh_exec "cd '${PROJECT_PATH}' && ${COMPOSE_CMD} ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || docker ps -a --filter 'name=${COMPOSE_PROJECT}' --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || echo 'Could not retrieve container status'" 1 0 || true
+              ssh_exec "cd \"${PROJECT_PATH}\" && ${COMPOSE_CMD} ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || docker ps -a --filter 'name=${COMPOSE_PROJECT}' --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || echo 'Could not retrieve container status'" 1 0 || true
 
               # ── Phase 7: Post-deploy command ──────────────────────────────
               if [ -n "${POST_DEPLOY_COMMAND}" ]; then
@@ -694,7 +705,7 @@ runs:
                 echo "════════════════════════════════════════════════════════════"
                 echo "⚙️  PHASE 7: Post-Deploy"
                 echo "════════════════════════════════════════════════════════════"
-                ssh_exec "cd '${PROJECT_PATH}' || { echo 'FATAL: cannot cd to ${PROJECT_PATH}'; exit 1; }
+                ssh_exec "cd \"${PROJECT_PATH}\" || { echo \"FATAL: cannot cd to ${PROJECT_PATH}\"; exit 1; }
               ${POST_DEPLOY_COMMAND}"
               fi
 
