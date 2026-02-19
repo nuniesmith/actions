@@ -447,7 +447,7 @@ runs:
                   \$SUDO_CMD chmod 600 $HOST_CERT_PATH/archive/*/privkey*.pem 2>/dev/null || true
 
                   # Cleanup
-                  rm -f /tmp/ssl-certs.tar.gz
+                  rm -f /tmp/ssl-certs.tar.gz || true
 
                   # Verify
                   echo '✅ Certificates deployed to host path: $HOST_CERT_PATH'
@@ -492,7 +492,7 @@ runs:
                     sh -c 'cd /etc/letsencrypt && tar -xzf /tmp/ssl-certs.tar.gz && chmod -R 755 /etc/letsencrypt && chmod 600 /etc/letsencrypt/archive/*/privkey*.pem 2>/dev/null || true'
 
                   # Cleanup
-                  rm -f /tmp/ssl-certs.tar.gz
+                  rm -f /tmp/ssl-certs.tar.gz || true
 
                   # Verify
                   echo '✅ Certificates deployed to Docker volume: $DOCKER_VOLUME'
@@ -504,7 +504,7 @@ runs:
               fi
 
               # Cleanup local SSH keys
-              rm -f ~/.ssh/id_rsa ~/.ssh/id_rsa_deploy
+              rm -f ~/.ssh/id_rsa ~/.ssh/id_rsa_deploy || true
 
               echo "✅ SSL certificates deployed to production"
               echo "deployed=true" >> $GITHUB_OUTPUT
