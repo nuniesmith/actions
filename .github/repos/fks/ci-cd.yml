@@ -92,6 +92,7 @@ permissions:
     packages: write
     checks: write
     actions: read
+    security-events: write
 
 env:
     RUST_VERSION: "1.92.0"
