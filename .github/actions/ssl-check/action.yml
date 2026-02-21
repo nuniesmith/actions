@@ -187,9 +187,13 @@ runs:
                 '" 2>/dev/null) || true
 
               # ── Parse structured output ────────────────────────────────
-              VOL_EXISTS=$(echo "$CERT_INFO" | grep -o 'EXISTS:[^ ]*' | cut -d: -f2)
+              if [ -z "$CERT_INFO" ]; then
+                VOL_EXISTS="false"
+              else
+                VOL_EXISTS=$(echo "$CERT_INFO" | grep -o 'EXISTS:[^ ]*' | cut -d: -f2 || echo "false")
+              fi
 
-              if [ "$VOL_EXISTS" != "true" ] || [ -z "$CERT_INFO" ]; then
+              if [ "$VOL_EXISTS" != "true" ]; then
                 echo "   ❌ No certificate found in Docker volume"
                 echo "vol_exists=false"   >> $GITHUB_OUTPUT
                 echo "vol_type=none"      >> $GITHUB_OUTPUT
@@ -203,11 +207,11 @@ runs:
 
               echo "vol_exists=true" >> $GITHUB_OUTPUT
 
-              VOL_ISSUER=$(echo "$CERT_INFO" | grep 'ISSUER:' | cut -d: -f2-)
-              VOL_EXPIRY=$(echo "$CERT_INFO" | grep 'END_DATE:' | cut -d: -f2-)
-              VOL_DAYS=$(echo "$CERT_INFO" | grep -o 'DAYS:[^ ]*' | cut -d: -f2)
-              VOL_TOTAL_DAYS=$(echo "$CERT_INFO" | grep -o 'TOTAL_DAYS:[^ ]*' | cut -d: -f2)
-              VOL_PCT_USED=$(echo "$CERT_INFO" | grep -o 'PCT_USED:[^ ]*' | cut -d: -f2)
+              VOL_ISSUER=$(echo "$CERT_INFO" | grep 'ISSUER:' | cut -d: -f2- || echo "unknown")
+              VOL_EXPIRY=$(echo "$CERT_INFO" | grep 'END_DATE:' | cut -d: -f2- || echo "")
+              VOL_DAYS=$(echo "$CERT_INFO" | grep '^DAYS:' | cut -d: -f2 || echo "0")
+              VOL_TOTAL_DAYS=$(echo "$CERT_INFO" | grep '^TOTAL_DAYS:' | cut -d: -f2 || echo "0")
+              VOL_PCT_USED=$(echo "$CERT_INFO" | grep '^PCT_USED:' | cut -d: -f2 || echo "100")
 
               echo "vol_issuer=$VOL_ISSUER" >> $GITHUB_OUTPUT
               echo "vol_expiry=$VOL_EXPIRY" >> $GITHUB_OUTPUT
@@ -318,9 +322,13 @@ runs:
                 '" 2>/dev/null) || true
 
               # ── Parse structured output ────────────────────────────────
-              HOST_EXISTS=$(echo "$CERT_INFO" | grep -o 'EXISTS:[^ ]*' | cut -d: -f2)
+              if [ -z "$CERT_INFO" ]; then
+                HOST_EXISTS="false"
+              else
+                HOST_EXISTS=$(echo "$CERT_INFO" | grep -o 'EXISTS:[^ ]*' | cut -d: -f2 || echo "false")
+              fi
 
-              if [ "$HOST_EXISTS" != "true" ] || [ -z "$CERT_INFO" ]; then
+              if [ "$HOST_EXISTS" != "true" ]; then
                 echo "   ℹ️  No certificate found on host filesystem"
                 echo "host_exists=false"   >> $GITHUB_OUTPUT
                 echo "host_type=none"      >> $GITHUB_OUTPUT
@@ -334,11 +342,11 @@ runs:
 
               echo "host_exists=true" >> $GITHUB_OUTPUT
 
-              HOST_ISSUER=$(echo "$CERT_INFO" | grep 'ISSUER:' | cut -d: -f2-)
-              HOST_EXPIRY=$(echo "$CERT_INFO" | grep 'END_DATE:' | cut -d: -f2-)
-              HOST_DAYS=$(echo "$CERT_INFO" | grep -o 'DAYS:[^ ]*' | cut -d: -f2)
-              HOST_TOTAL_DAYS=$(echo "$CERT_INFO" | grep -o 'TOTAL_DAYS:[^ ]*' | cut -d: -f2)
-              HOST_PCT_USED=$(echo "$CERT_INFO" | grep -o 'PCT_USED:[^ ]*' | cut -d: -f2)
+              HOST_ISSUER=$(echo "$CERT_INFO" | grep 'ISSUER:' | cut -d: -f2- || echo "unknown")
+              HOST_EXPIRY=$(echo "$CERT_INFO" | grep 'END_DATE:' | cut -d: -f2- || echo "")
+              HOST_DAYS=$(echo "$CERT_INFO" | grep '^DAYS:' | cut -d: -f2 || echo "0")
+              HOST_TOTAL_DAYS=$(echo "$CERT_INFO" | grep '^TOTAL_DAYS:' | cut -d: -f2 || echo "0")
+              HOST_PCT_USED=$(echo "$CERT_INFO" | grep '^PCT_USED:' | cut -d: -f2 || echo "100")
 
               echo "host_issuer=$HOST_ISSUER" >> $GITHUB_OUTPUT
               echo "host_expiry=$HOST_EXPIRY" >> $GITHUB_OUTPUT
