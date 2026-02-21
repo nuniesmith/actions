@@ -1,0 +1,389 @@
+# =============================================================================
+# FKS SSL Certificate Renewal
+# =============================================================================
+# Manually-triggered workflow to obtain Let's Encrypt certificates via Certbot
+# with Cloudflare DNS validation and deploy them to the production server,
+# replacing any existing self-signed certificates.
+#
+# This follows the same Tailscale → SSH → SSL flow as the main CI/CD pipeline
+# but can be run independently without building/deploying containers.
+#
+# Required Secrets:
+# - PROD_TAILSCALE_IP, PROD_SSH_KEY, PROD_SSH_USER, PROD_SSH_PORT
+# - PROD_ROOT_SSH_KEY (root SSH key for SSL cert deployment)
+# - TAILSCALE_OAUTH_CLIENT_ID, TAILSCALE_OAUTH_SECRET
+# - CLOUDFLARE_API_KEY, CLOUDFLARE_ZONE_ID
+# - SSL_EMAIL
+# - DOCKER_USERNAME, DOCKER_TOKEN
+# - DISCORD_WEBHOOK_ACTIONS (optional)
+# =============================================================================
+
+name: 🔐 SSL Certificate Renewal
+
+on:
+    workflow_dispatch:
+        inputs:
+            environment:
+                description: "Target environment"
+                required: false
+                type: choice
+                options:
+                    - production
+                    - staging
+                default: production
+            force_renewal:
+                description: "Force renewal even if certs are still valid"
+                required: false
+                type: boolean
+                default: false
+            restart_nginx:
+                description: "Restart nginx after certificate deployment"
+                required: false
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
+
+env:
+    DOMAIN: fkstrading.xyz
+    STAGING_DOMAIN: staging.fkstrading.xyz
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    # =========================================================================
+    # SETUP
+    # =========================================================================
+    setup:
+        name: 📋 Setup
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            deploy_env: ${{ steps.determine-env.outputs.environment }}
+            target_domain: ${{ steps.determine-env.outputs.domain }}
+        steps:
+            - name: 🎯 Determine environment
+              id: determine-env
+              env:
+                  INPUT_ENV: ${{ inputs.environment }}
+                  PROD_DOMAIN: ${{ env.DOMAIN }}
+                  STAGE_DOMAIN: ${{ env.STAGING_DOMAIN }}
+              run: |
+                  ENV="${INPUT_ENV:-production}"
+
+                  if [ "$ENV" = "production" ]; then
+                    DOMAIN="$PROD_DOMAIN"
+                  else
+                    DOMAIN="$STAGE_DOMAIN"
+                  fi
+
+                  echo "🎯 Environment: $ENV"
+                  echo "🌐 Domain: $DOMAIN"
+                  echo "🔄 Force renewal: ${{ inputs.force_renewal }}"
+
+                  echo "environment=$ENV" >> $GITHUB_OUTPUT
+                  echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  ## 🔐 SSL Renewal Configuration
+                  | Property | Value |
+                  |----------|-------|
+                  | Environment | \`$ENV\` |
+                  | Domain | \`$DOMAIN\` |
+                  | Force Renewal | \`${{ inputs.force_renewal }}\` |
+                  | Restart Nginx | \`${{ inputs.restart_nginx }}\` |
+                  | Triggered by | \`${{ github.actor }}\` |
+                  EOF
+
+    # =========================================================================
+    # SSL RENEWAL
+    # =========================================================================
+    ssl-renew:
+        name: 🔐 Renew SSL Certificates
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        needs: [setup]
+        environment:
+            name: ${{ needs.setup.outputs.deploy_env }}
+            url: https://${{ needs.setup.outputs.target_domain }}
+        outputs:
+            cert_type: ${{ steps.ssl.outputs.cert-type }}
+            ssl_deployed: ${{ steps.ssl.outputs.deployed }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            # -----------------------------------------------------------------
+            # RESOLVE TARGET HOST (in-job — secrets require environment: context)
+            # -----------------------------------------------------------------
+            - name: 🎯 Resolve target host
+              id: resolve-host
+              env:
+                  DEPLOY_ENV: ${{ needs.setup.outputs.deploy_env }}
+                  PROD_IP: ${{ secrets.PROD_TAILSCALE_IP }}
+                  STAGING_IP: ${{ secrets.STAGING_TAILSCALE_IP }}
+              run: |
+                  if [ "$DEPLOY_ENV" = "production" ]; then
+                    HOST="$PROD_IP"
+                  else
+                    HOST="${STAGING_IP:-$PROD_IP}"
+                  fi
+
+                  if [ -z "$HOST" ]; then
+                    echo "❌ FATAL: Could not resolve target host IP!"
+                    echo "   DEPLOY_ENV=$DEPLOY_ENV"
+                    echo "## ❌ Missing Required Secret" >> $GITHUB_STEP_SUMMARY
+                    echo "The \`PROD_TAILSCALE_IP\` secret must be configured in the \`$DEPLOY_ENV\` environment." >> $GITHUB_STEP_SUMMARY
+                    exit 1
+                  fi
+
+                  echo "target_host=$HOST" >> "$GITHUB_OUTPUT"
+                  echo "✅ Target host: $HOST (env: $DEPLOY_ENV)"
+
+            # -----------------------------------------------------------------
+            # TAILSCALE CONNECTION
+            # -----------------------------------------------------------------
+            - name: 🔌 Connect to Tailscale
+              id: tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ steps.resolve-host.outputs.target_host }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: ❌ Fail if Tailscale not connected
+              if: steps.tailscale.outputs.connected != 'true'
+              run: |
+                  echo "❌ Failed to connect to Tailscale. Cannot proceed with SSL renewal."
+                  exit 1
+
+            # -----------------------------------------------------------------
+            # SSL CERTIFICATE CHECK
+            # -----------------------------------------------------------------
+            - name: 🔍 Check Existing SSL Certificates
+              id: ssl-check
+              if: ${{ !inputs.force_renewal }}
+              uses: nuniesmith/actions/.github/actions/ssl-check@main
+              continue-on-error: true
+              with:
+                  ssh-host: ${{ steps.resolve-host.outputs.target_host }}
+                  ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  domain: ${{ needs.setup.outputs.target_domain }}
+                  docker-volume-name: "fks_ssl_certs"
+                  host-cert-path: "/var/lib/docker/volumes/fks_ssl_certs/_data/live/{domain}/fullchain.pem"
+                  renewal-threshold-days: "30"
+                  renewal-threshold-percent: "0"
+
+            - name: 📋 SSL Check Results
+              if: ${{ !inputs.force_renewal }}
+              run: |
+                  echo "## 🔍 Existing Certificate Check" >> $GITHUB_STEP_SUMMARY
+
+                  CERT_TYPE="${{ steps.ssl-check.outputs.cert-type || 'unknown' }}"
+                  SKIP="${{ steps.ssl-check.outputs.skip-generation || 'false' }}"
+                  EXPIRY="${{ steps.ssl-check.outputs.expiry-date || 'N/A' }}"
+                  DAYS="${{ steps.ssl-check.outputs.days-remaining || 'N/A' }}"
+
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  | Property | Value |
+                  |----------|-------|
+                  | Current Cert Type | \`$CERT_TYPE\` |
+                  | Expiry Date | \`$EXPIRY\` |
+                  | Days Until Expiry | \`$DAYS\` |
+                  | Skip Generation | \`$SKIP\` |
+                  EOF
+
+                  if [ "$SKIP" = "true" ]; then
+                    echo ""
+                    echo "ℹ️ Certificates are still valid. Use **Force renewal** to override." >> $GITHUB_STEP_SUMMARY
+                  fi
+
+            # -----------------------------------------------------------------
+            # SSL CERTIFICATE GENERATION
+            # -----------------------------------------------------------------
+            - name: 🔐 Generate & Deploy Let's Encrypt Certificates
+              id: ssl
+              if: ${{ inputs.force_renewal || steps.ssl-check.outputs.skip-generation != 'true' }}
+              uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+              with:
+                  domain: ${{ needs.setup.outputs.target_domain }}
+                  additional-domains: "www.${{ needs.setup.outputs.target_domain }}"
+                  cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_KEY }}
+                  email: ${{ secrets.SSL_EMAIL }}
+                  fallback-to-self-signed: "false"
+                  self-signed-days: "365"
+                  deploy-to-server: true
+                  ssh-host: ${{ steps.resolve-host.outputs.target_host }}
+                  ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  root-ssh-key: ${{ secrets.PROD_ROOT_SSH_KEY }}
+                  docker-volume-name: "fks_ssl_certs"
+                  docker-username: ${{ secrets.DOCKER_USERNAME }}
+                  docker-token: ${{ secrets.DOCKER_TOKEN }}
+
+            - name: ℹ️ Skipped — Certificates still valid
+              if: ${{ !inputs.force_renewal && steps.ssl-check.outputs.skip-generation == 'true' }}
+              run: |
+                  echo "✅ Certificates are still valid and don't need renewal."
+                  echo "   Use 'Force renewal' option to override this check."
+
+            # -----------------------------------------------------------------
+            # RESTART NGINX
+            # -----------------------------------------------------------------
+            - name: 🔄 Restart Nginx to apply certificates
+              id: restart-nginx
+              if: |
+                  inputs.restart_nginx &&
+                  steps.ssl.outcome == 'success' &&
+                  steps.ssl.outputs.deployed == 'true'
+              env:
+                  SSH_HOST: ${{ steps.resolve-host.outputs.target_host }}
+                  SSH_PORT: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  SSH_USER: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+              run: |
+                  echo "🔄 Restarting nginx to pick up new certificates..."
+
+                  # Set up SSH key
+                  mkdir -p ~/.ssh
+                  echo "$SSH_KEY" > ~/.ssh/deploy_key
+                  chmod 600 ~/.ssh/deploy_key
+                  ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+                  SSH_CMD="ssh -i ~/.ssh/deploy_key -p $SSH_PORT -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST"
+
+                  # Verify certs exist in the volume
+                  DOMAIN="${{ needs.setup.outputs.target_domain }}"
+                  export DOMAIN
+                  $SSH_CMD "docker run --rm -v fks_ssl_certs:/certs:ro busybox ls -la /certs/live/$DOMAIN/ 2>/dev/null" || true
+
+                  # Restart nginx
+                  $SSH_CMD "docker restart fks_nginx" 2>&1
+                  RESTART_EXIT=$?
+
+                  # Wait for nginx to come back up
+                  sleep 5
+
+                  # Verify nginx is running
+                  $SSH_CMD "docker ps -f name=fks_nginx --format '{{.Status}}'" 2>&1
+
+                  if [ $RESTART_EXIT -eq 0 ]; then
+                    echo "✅ Nginx restarted successfully"
+                    echo "nginx_restarted=true" >> $GITHUB_OUTPUT
+                  else
+                    echo "❌ Nginx restart failed"
+                    echo "nginx_restarted=false" >> $GITHUB_OUTPUT
+                    exit 1
+                  fi
+
+                  # Clean up SSH key
+                  rm -f ~/.ssh/deploy_key
+
+            # -----------------------------------------------------------------
+            # VERIFY SSL
+            # -----------------------------------------------------------------
+            - name: ✅ Verify SSL certificate
+              id: verify
+              if: |
+                  steps.ssl.outcome == 'success' &&
+                  steps.ssl.outputs.deployed == 'true'
+              run: |
+                  DOMAIN="${{ needs.setup.outputs.target_domain }}"
+                  echo "🔍 Verifying SSL certificate for $DOMAIN..."
+
+                  # Give nginx a moment to fully start
+                  sleep 5
+
+                  # Check the certificate via openssl
+                  CERT_INFO=$(echo | openssl s_client -servername "$DOMAIN" -connect "${{ steps.resolve-host.outputs.target_host }}:443" 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>/dev/null) || true
+
+                  if echo "$CERT_INFO" | grep -qi "Let's Encrypt\|R3\|R10\|R11\|E5\|E6"; then
+                    echo "✅ Let's Encrypt certificate verified!"
+                    echo "cert_verified=true" >> $GITHUB_OUTPUT
+                    echo "cert_issuer=letsencrypt" >> $GITHUB_OUTPUT
+                  elif echo "$CERT_INFO" | grep -qi "issuer"; then
+                    echo "⚠️ Certificate found but may not be Let's Encrypt"
+                    echo "cert_verified=true" >> $GITHUB_OUTPUT
+                    echo "cert_issuer=other" >> $GITHUB_OUTPUT
+                  else
+                    echo "⚠️ Could not verify certificate (server may not be directly reachable from GitHub Actions)"
+                    echo "cert_verified=unknown" >> $GITHUB_OUTPUT
+                    echo "cert_issuer=unknown" >> $GITHUB_OUTPUT
+                  fi
+
+                  if [ -n "$CERT_INFO" ]; then
+                    echo ""
+                    echo "📜 Certificate details:"
+                    echo "$CERT_INFO"
+                  fi
+
+            # -----------------------------------------------------------------
+            # NOTIFICATION
+            # -----------------------------------------------------------------
+            - name: 📣 Notify SSL renewal result
+              if: always()
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "${{ steps.ssl.outcome == 'success' && '🔐 SSL Certificates Renewed' || (steps.ssl-check.outputs.skip-generation == 'true' && '✅ SSL Certificates Still Valid' || '❌ SSL Renewal Failed') }}"
+                  description: "SSL renewal for ${{ needs.setup.outputs.target_domain }} (${{ needs.setup.outputs.deploy_env }})"
+                  status: ${{ steps.ssl.outcome == 'success' && 'success' || (steps.ssl-check.outputs.skip-generation == 'true' && 'success' || 'failure') }}
+                  include-repo-info: "true"
+                  fields: |
+                      [
+                        {"name": "Environment", "value": "${{ needs.setup.outputs.deploy_env }}", "inline": true},
+                        {"name": "Domain", "value": "${{ needs.setup.outputs.target_domain }}", "inline": true},
+                        {"name": "Cert Type", "value": "${{ steps.ssl.outputs.cert-type || steps.ssl-check.outputs.cert-type || 'N/A' }}", "inline": true},
+                        {"name": "Force Renewal", "value": "${{ inputs.force_renewal }}", "inline": true},
+                        {"name": "Nginx Restarted", "value": "${{ steps.restart-nginx.outputs.nginx_restarted || 'skipped' }}", "inline": true},
+                        {"name": "Triggered by", "value": "${{ github.actor }}", "inline": true}
+                      ]
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    summary:
+        name: 📊 SSL Renewal Summary
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        needs: [setup, ssl-renew]
+        if: always()
+        steps:
+            - name: 📊 Generate summary
+              run: |
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  # 🔐 SSL Certificate Renewal Summary
+
+                  ## Configuration
+                  | Property | Value |
+                  |----------|-------|
+                  | Environment | \`${{ needs.setup.outputs.deploy_env }}\` |
+                  | Domain | \`${{ needs.setup.outputs.target_domain }}\` |
+                  | Force Renewal | \`${{ inputs.force_renewal }}\` |
+                  | Restart Nginx | \`${{ inputs.restart_nginx }}\` |
+
+                  ## Results
+                  | Step | Status |
+                  |------|--------|
+                  | 📋 Setup | ${{ needs.setup.result }} |
+                  | 🔐 SSL Renewal | ${{ needs.ssl-renew.result }} |
+                  | Certificate Type | \`${{ needs.ssl-renew.outputs.cert_type || 'N/A' }}\` |
+                  | Deployed | \`${{ needs.ssl-renew.outputs.ssl_deployed || 'N/A' }}\` |
+
+                  ---
+                  **Triggered by:** \`${{ github.actor }}\` | **Run:** \`#${{ github.run_number }}\`
+                  EOF
+
+            - name: ❌ Fail if renewal failed
+              if: needs.ssl-renew.result == 'failure'
+              run: |
+                  echo "❌ SSL certificate renewal failed. Check the logs above for details."
+                  exit 1
