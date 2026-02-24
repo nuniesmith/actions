@@ -1,0 +1,439 @@
+# =============================================================================
+# Futures - CI/CD Pipeline
+# =============================================================================
+# Automated build, push, and deployment of Futures to Raspberry Pi via Tailscale
+#
+# Pipeline: Lint → Test → Docker Build & Push → Deploy to Prod (Raspberry Pi)
+#
+# Required Secrets:
+#   - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
+#   - TAILSCALE_OAUTH_SECRET: Tailscale OAuth Secret
+#   - PROD_TAILSCALE_IP: Production server Tailscale IP
+#   - PROD_SSH_KEY: SSH private key for deployment
+#   - PROD_SSH_USER: SSH username (default: actions)
+#   - PROD_SSH_PORT: SSH port (default: 22)
+#   - DOCKER_USERNAME: Docker Hub username
+#   - DOCKER_TOKEN: Docker Hub access token
+#   - DISCORD_WEBHOOK_ACTIONS: Discord webhook for CI/CD notifications
+# =============================================================================
+
+name: 🚀 CI/CD Pipeline
+
+on:
+    push:
+        branches: [main]
+        paths-ignore:
+            - "**.md"
+            - "LICENSE"
+            - ".gitignore"
+            - "docs/**"
+    pull_request:
+        branches: [main]
+    workflow_dispatch:
+        inputs:
+            skip_deploy:
+                description: "Skip deployment (build only)"
+                required: false
+                type: boolean
+                default: false
+            skip_tests:
+                description: "Skip tests (deploy only)"
+                required: false
+                type: boolean
+                default: false
+
+permissions:
+    contents: read
+    packages: write
+    checks: write
+
+env:
+    PYTHON_VERSION: "3.12"
+    PACKAGE_MANAGER: "pip"
+    REGISTRY: docker.io
+    IMAGE_NAME: nuniesmith/futures
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    # =========================================================================
+    # Stage 1: Lint & Format
+    # =========================================================================
+    lint:
+        name: ✨ Lint & Format
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        if: ${{ !inputs.skip_tests }}
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 📣 Notify build started
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🔨 Futures CI/CD Started"
+                  description: "Running lint and format checks"
+                  status: started
+                  include-repo-info: "true"
+
+            - name: 🐍 Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: 📦 Install linting tools
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install ruff mypy
+
+            - name: ✨ Run Ruff linting
+              run: |
+                  echo "🔍 Running Ruff linter..."
+                  ruff check . --output-format=github
+                  ruff format --check .
+
+            - name: 🔍 Run mypy type check
+              run: |
+                  echo "🔍 Running mypy type checker..."
+                  if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+                  if [ -f pyproject.toml ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
+                  mypy . --ignore-missing-imports || true
+
+    # =========================================================================
+    # Stage 2: Test
+    # =========================================================================
+    test:
+        name: 🧪 Test
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        if: ${{ !inputs.skip_tests }}
+        needs: lint
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🐍 Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+                  cache: "pip"
+
+            - name: 📦 Install dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install pytest pytest-cov pytest-asyncio
+                  if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+                  if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+                  if [ -f pyproject.toml ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
+
+            - name: 🧪 Run tests
+              run: |
+                  pytest --cov=. --cov-report=xml --cov-report=term-missing -v
+
+            - name: ✅ Notify tests passed
+              if: success()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "✅ Futures Tests Passed"
+                  description: "All tests and lint checks passed"
+                  status: success
+
+            - name: ❌ Notify tests failed
+              if: failure()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "❌ Futures Tests Failed"
+                  description: "Tests or lint checks failed"
+                  status: failure
+                  fields: '[{"name": "Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+    # =========================================================================
+    # Stage 3: Docker Build & Push to Docker Hub
+    # =========================================================================
+    docker:
+        name: 🐳 Build & Push Docker Image
+        needs: test
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🐳 Build and Push
+              uses: nuniesmith/actions/.github/actions/docker-build-push@main
+              with:
+                  image-name: ${{ env.IMAGE_NAME }}
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
+                  dockerfile: Dockerfile
+                  context: .
+                  platforms: linux/amd64,linux/arm64
+                  push: "true"
+                  tags: |
+                      type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+                      type=sha,prefix=,format=short
+                      type=ref,event=branch
+
+            - name: ✅ Notify Docker build complete
+              if: success()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "🐳 Futures Docker Image Pushed"
+                  description: "Multi-arch image pushed to Docker Hub"
+                  status: success
+                  fields: '[{"name": "Image", "value": "`${{ env.IMAGE_NAME }}:latest`", "inline": true}, {"name": "Platforms", "value": "amd64, arm64", "inline": true}]'
+
+            - name: ❌ Notify Docker build failed
+              if: failure()
+              continue-on-error: true
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "❌ Futures Docker Build Failed"
+                  description: "Failed to build or push Docker image"
+                  status: failure
+                  fields: '[{"name": "Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+
+    # =========================================================================
+    # Stage 4: Deploy to Production (Raspberry Pi)
+    # =========================================================================
+    deploy:
+        name: 🚀 Deploy to Raspberry Pi
+        needs: docker
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        if: |
+            github.event_name == 'push' && github.ref == 'refs/heads/main'
+            && (github.event_name != 'workflow_dispatch' || inputs.skip_deploy != true)
+        steps:
+            - name: 📥 Checkout code
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              id: tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ secrets.PROD_TAILSCALE_IP }}
+                  target-ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+
+            - name: 🚀 Deploy via SSH
+              id: deploy
+              if: steps.tailscale.outputs.connected == 'true'
+              uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+              with:
+                  host: ${{ secrets.PROD_TAILSCALE_IP }}
+                  port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  username: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  project-path: ~/futures
+                  git-pull: false
+                  git-branch: main
+                  docker-prune: false
+                  pre-deploy-command: |
+                      echo "📦 Deploying Futures to Raspberry Pi..."
+
+                      # Handle git repository setup
+                      if [ ! -d "$HOME/futures/.git" ]; then
+                        if [ -d "$HOME/futures" ]; then
+                          echo "📁 Directory exists but is not a git repo — initializing..."
+                          cd ~/futures
+                          git init
+                          git remote add origin https://github.com/${{ github.repository }}.git
+                          git fetch origin
+                          git checkout -f main
+                          git branch --set-upstream-to=origin/main main
+                        else
+                          echo "📥 First deployment — cloning repository..."
+                          git clone https://github.com/${{ github.repository }}.git ~/futures
+                          cd ~/futures
+                          git checkout main
+                        fi
+                      else
+                        cd ~/futures
+                        echo "📥 Pulling latest changes..."
+                        git fetch origin
+                        git checkout main
+                        git pull origin main
+                      fi
+
+                      # Ensure scripts are executable
+                      find . -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+
+                      # Create .env file if it doesn't exist
+                      if [ ! -f ".env" ]; then
+                        echo "📝 Creating default .env..."
+                        cat > .env <<'ENVEOF'
+                      # Futures Environment Configuration
+                      PYTHONUNBUFFERED=1
+                      LOG_LEVEL=info
+                      ENVEOF
+                        chmod 600 .env
+                        echo "✅ Created .env file"
+                      else
+                        echo "✅ Using existing .env file"
+                      fi
+
+                      # Create required directories
+                      echo "📁 Ensuring data directories exist..."
+                      mkdir -p data config
+                      chmod 755 data config
+                      echo "✅ Directories ready"
+
+                  deploy-command: |
+                      cd ~/futures
+
+                      # Stop existing services
+                      echo "🐳 Stopping existing services..."
+                      docker compose -f docker-compose.prod.yml down 2>/dev/null || \
+                        docker compose down 2>/dev/null || true
+
+                      # Log in to Docker Hub and pull latest images
+                      echo "🐳 Pulling latest images from Docker Hub..."
+                      echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin 2>/dev/null || true
+                      docker compose -f docker-compose.prod.yml pull 2>/dev/null || \
+                        docker pull ${{ env.IMAGE_NAME }}:latest
+
+                      # Start services
+                      echo "🚀 Starting services..."
+                      docker compose -f docker-compose.prod.yml up -d --remove-orphans 2>/dev/null || \
+                        docker compose up -d --remove-orphans
+
+                  post-deploy-command: |
+                      cd ~/futures
+
+                      echo ""
+                      echo "📊 Container status:"
+                      docker compose -f docker-compose.prod.yml ps 2>/dev/null || \
+                        docker ps --filter "name=futures" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+                      echo ""
+                      echo "📊 Storage usage:"
+                      df -h / | grep -v Filesystem
+                      docker system df 2>/dev/null || true
+
+                      # Prune old images to save space on Raspberry Pi
+                      echo ""
+                      echo "🧹 Pruning unused Docker resources..."
+                      docker image prune -f 2>/dev/null || true
+                      docker system prune -f 2>/dev/null || true
+
+                      echo ""
+                      echo "🎯 Architecture:"
+                      uname -m
+                      docker info --format '{{.Architecture}}' 2>/dev/null || true
+
+                      echo ""
+                      echo "✅ Futures deployment complete!"
+
+            - name: 🏥 Run Health Checks
+              id: health-checks
+              if: always() && steps.deploy.outcome == 'success'
+              uses: nuniesmith/actions/.github/actions/health-check@main
+              with:
+                  containers: futures
+                  ssh-host: ${{ secrets.PROD_TAILSCALE_IP }}
+                  ssh-port: ${{ secrets.PROD_SSH_PORT || '22' }}
+                  ssh-user: ${{ secrets.PROD_SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.PROD_SSH_KEY }}
+                  initial-delay: 15
+                  retry-count: 3
+                  retry-delay: 10
+                  fail-on-unhealthy: false
+
+            - name: 📣 Notify deployment
+              if: always()
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "${{ steps.deploy.outcome == 'success' && '🚀 Futures Deployed' || '❌ Futures Deploy Failed' }}"
+                  description: "${{ steps.deploy.outcome == 'success' && 'Futures deployed to Raspberry Pi' || 'Failed to deploy Futures to Raspberry Pi' }}"
+                  status: ${{ steps.deploy.outcome == 'success' && 'success' || 'failure' }}
+                  include-repo-info: "true"
+                  fields: |
+                      [
+                        {"name": "Platform", "value": "🥧 Raspberry Pi (ARM64)", "inline": true},
+                        {"name": "Image", "value": "`${{ env.IMAGE_NAME }}:latest`", "inline": true},
+                        {"name": "Network", "value": "🔒 Tailscale VPN", "inline": true},
+                        {"name": "Health", "value": "${{ steps.health-checks.outputs.healthy == 'true' && '✅ Healthy' || '⚠️ Check logs' }}", "inline": true}
+                      ]
+
+    # =========================================================================
+    # Pipeline Summary
+    # =========================================================================
+    summary:
+        name: 📊 Pipeline Summary
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        needs: [lint, test, docker, deploy]
+        if: always()
+        steps:
+            - name: 📊 Generate summary
+              run: |
+                  echo "## 📊 Futures CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+                  echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| ✨ Lint & Format | \`${{ needs.lint.result }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 🧪 Test | \`${{ needs.test.result }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 🐳 Docker Build & Push | \`${{ needs.docker.result }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 🚀 Deploy to Raspberry Pi | \`${{ needs.deploy.result }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+
+                  if [ "${{ needs.lint.result }}" = "success" ] && \
+                     [ "${{ needs.test.result }}" = "success" ] && \
+                     [ "${{ needs.docker.result }}" = "success" ] && \
+                     [ "${{ needs.deploy.result }}" = "success" ]; then
+                    echo "### ✅ All stages completed successfully!" >> $GITHUB_STEP_SUMMARY
+                  elif [ "${{ needs.lint.result }}" = "failure" ]; then
+                    echo "### ❌ Pipeline failed at lint stage" >> $GITHUB_STEP_SUMMARY
+                    echo "Fix linting/formatting errors before proceeding." >> $GITHUB_STEP_SUMMARY
+                  elif [ "${{ needs.test.result }}" = "failure" ]; then
+                    echo "### ❌ Pipeline failed at test stage" >> $GITHUB_STEP_SUMMARY
+                    echo "Fix failing tests before deployment can proceed." >> $GITHUB_STEP_SUMMARY
+                  elif [ "${{ needs.docker.result }}" = "failure" ]; then
+                    echo "### ❌ Pipeline failed at Docker build stage" >> $GITHUB_STEP_SUMMARY
+                    echo "Check Dockerfile and build configuration." >> $GITHUB_STEP_SUMMARY
+                  elif [ "${{ needs.deploy.result }}" = "failure" ]; then
+                    echo "### ❌ Pipeline failed at deployment stage" >> $GITHUB_STEP_SUMMARY
+                    echo "Check SSH/Tailscale connectivity and Raspberry Pi status." >> $GITHUB_STEP_SUMMARY
+                  elif [ "${{ needs.deploy.result }}" = "skipped" ]; then
+                    echo "### ⏭️ Deployment skipped" >> $GITHUB_STEP_SUMMARY
+                    echo "Deploy only runs on push to main." >> $GITHUB_STEP_SUMMARY
+                  fi
+
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+                  echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| 🐍 Python | \`${{ env.PYTHON_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 📦 Image | \`nuniesmith/futures\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 🏗️ Platforms | \`amd64, arm64\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 🌿 Branch | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 🔗 Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+            - name: ❌ Fail on critical errors
+              if: needs.lint.result == 'failure' || needs.test.result == 'failure' || needs.docker.result == 'failure' || needs.deploy.result == 'failure'
+              run: |
+                  echo "❌ Pipeline had failures"
+                  echo "  Lint:   ${{ needs.lint.result }}"
+                  echo "  Test:   ${{ needs.test.result }}"
+                  echo "  Docker: ${{ needs.docker.result }}"
+                  echo "  Deploy: ${{ needs.deploy.result }}"
+                  exit 1
