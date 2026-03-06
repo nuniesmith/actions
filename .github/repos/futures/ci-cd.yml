@@ -24,6 +24,9 @@
 #   - DOCKER_USERNAME: Docker Hub username
 #   - DOCKER_TOKEN: Docker Hub access token
 #   - DISCORD_WEBHOOK_ACTIONS: Discord webhook for CI/CD notifications
+#   - XAI_API_KEY: xAI (Grok) API key injected into prod .env
+#   - MASSIVE_API_KEY: Massive API key injected into prod .env
+#   - KRAKEN_API_KEY: Kraken API key injected into prod .env
 # =============================================================================
 
 name: 🚀 CI/CD Pipeline
@@ -349,6 +352,22 @@ jobs:
                       else
                         echo "✅ Using existing .env file"
                       fi
+
+                      # Upsert API keys — always overwrite so rotated secrets stay current
+                      echo "🔑 Injecting API keys into .env..."
+                      upsert_env() {
+                        local key="$1" val="$2"
+                        if grep -q "^${key}=" .env 2>/dev/null; then
+                          sed -i "s|^${key}=.*|${key}=${val}|" .env
+                        else
+                          echo "${key}=${val}" >> .env
+                        fi
+                      }
+                      upsert_env "XAI_API_KEY"    "${{ secrets.XAI_API_KEY }}"
+                      upsert_env "MASSIVE_API_KEY" "${{ secrets.MASSIVE_API_KEY }}"
+                      upsert_env "KRAKEN_API_KEY"  "${{ secrets.KRAKEN_API_KEY }}"
+                      chmod 600 .env
+                      echo "✅ API keys injected"
 
                       # Create required directories
                       echo "📁 Ensuring data directories exist..."
