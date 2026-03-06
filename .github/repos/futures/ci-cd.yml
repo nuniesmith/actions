@@ -3,7 +3,16 @@
 # =============================================================================
 # Automated build, push, and deployment of Futures to Raspberry Pi via Tailscale
 #
-# Pipeline: Lint → Test → Docker Build & Push → Deploy to Prod (Raspberry Pi)
+# Pipeline: Lint → Test → Docker Build & Push (matrix) → Deploy to Pi → Health Check
+#
+# Single DockerHub repo (nuniesmith/futures) with tag-per-service:
+#   nuniesmith/futures:engine          — Engine + Data API (arm64 + amd64, runs on Pi)
+#   nuniesmith/futures:web             — HTMX Dashboard (arm64 + amd64, runs on Pi)
+#   nuniesmith/futures:trainer         — GPU Training Server (amd64 only, dedicated rig)
+#   nuniesmith/futures:engine-<sha>    — Pinned engine build
+#   nuniesmith/futures:web-<sha>       — Pinned web build
+#   nuniesmith/futures:trainer-<sha>   — Pinned trainer build
+#   nuniesmith/futures:latest          — Alias for :engine (default pull)
 #
 # Required Secrets:
 #   - TAILSCALE_OAUTH_CLIENT_ID: Tailscale OAuth Client ID
@@ -31,13 +40,18 @@ on:
         branches: [main]
     workflow_dispatch:
         inputs:
-            skip_deploy:
-                description: "Skip deployment (build only)"
+            skip_tests:
+                description: "Skip tests (build only)"
                 required: false
                 type: boolean
                 default: false
-            skip_tests:
-                description: "Skip tests (deploy only)"
+            skip_docker:
+                description: "Skip Docker build (test only)"
+                required: false
+                type: boolean
+                default: false
+            skip_deploy:
+                description: "Skip Pi deploy (build only)"
                 required: false
                 type: boolean
                 default: false
@@ -48,8 +62,7 @@ permissions:
     checks: write
 
 env:
-    PYTHON_VERSION: "3.12"
-    PACKAGE_MANAGER: "pip"
+    PYTHON_VERSION: "3.13"
     REGISTRY: docker.io
     IMAGE_NAME: nuniesmith/futures
 
@@ -103,7 +116,6 @@ jobs:
             - name: 🔍 Run mypy type check
               run: |
                   echo "🔍 Running mypy type checker..."
-                  if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
                   if [ -f pyproject.toml ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
                   mypy . --ignore-missing-imports || true
 
@@ -129,9 +141,7 @@ jobs:
             - name: 📦 Install dependencies
               run: |
                   python -m pip install --upgrade pip
-                  pip install pytest pytest-cov pytest-asyncio
-                  if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-                  if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+                  pip install pytest pytest-cov pytest-asyncio pytest-timeout
                   if [ -f pyproject.toml ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
 
             - name: 🧪 Run tests
@@ -160,57 +170,103 @@ jobs:
                   fields: '[{"name": "Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
 
     # =========================================================================
-    # Stage 3: Docker Build & Push to Docker Hub
+    # Stage 3: Build & Push Docker Images
+    # =========================================================================
+    #
+    # Single DockerHub repo (nuniesmith/futures) with tag-per-service.
+    # Each matrix entry produces two tags:
+    #   :engine           (rolling latest for that service)
+    #   :engine-abc1234   (pinned to commit SHA)
+    # The engine build also tags :latest as the default pull target.
+    #
+    # Builds run in parallel via matrix strategy:
+    #   engine  — Combined FastAPI data service + engine worker (arm64 + amd64)
+    #   web     — HTMX dashboard reverse-proxy (arm64 + amd64)
+    #   trainer — GPU CNN training server (amd64 only — CUDA base image)
     # =========================================================================
     docker:
-        name: 🐳 Build & Push Docker Image
+        name: "🐳 Build :${{ matrix.service }}"
         needs: test
         runs-on: ubuntu-latest
-        timeout-minutes: 45
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        timeout-minutes: 60
+        if: |
+            github.event_name == 'push' && github.ref == 'refs/heads/main'
+            && (github.event_name != 'workflow_dispatch' || inputs.skip_docker != true)
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - service: engine
+                      dockerfile: docker/engine/Dockerfile
+                      platforms: linux/amd64,linux/arm64
+                      is_default: true
+                    - service: web
+                      dockerfile: docker/web/Dockerfile
+                      platforms: linux/amd64,linux/arm64
+                      is_default: false
+                    - service: trainer
+                      dockerfile: docker/trainer/Dockerfile
+                      platforms: linux/amd64
+                      is_default: false
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
 
-            - name: 🐳 Build and Push
+            - name: 🔢 Compute short SHA
+              id: vars
+              run: echo "sha_short=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+            - name: 🐳 Build and Push — :${{ matrix.service }}
               uses: nuniesmith/actions/.github/actions/docker-build-push@main
               with:
                   image-name: ${{ env.IMAGE_NAME }}
                   username: ${{ secrets.DOCKER_USERNAME }}
                   password: ${{ secrets.DOCKER_TOKEN }}
-                  dockerfile: Dockerfile
+                  dockerfile: ${{ matrix.dockerfile }}
                   context: .
-                  platforms: linux/amd64,linux/arm64
+                  platforms: ${{ matrix.platforms }}
                   push: "true"
                   tags: |
-                      type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-                      type=sha,prefix=,format=short
-                      type=ref,event=branch
+                      type=raw,value=${{ matrix.service }}
+                      type=raw,value=${{ matrix.service }}-${{ steps.vars.outputs.sha_short }}
+                      type=raw,value=latest,enable=${{ matrix.is_default }}
 
-            - name: ✅ Notify Docker build complete
+            - name: ✅ Notify :${{ matrix.service }} pushed
               if: success()
               continue-on-error: true
               uses: nuniesmith/actions/.github/actions/discord-notify@main
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
-                  title: "🐳 Futures Docker Image Pushed"
-                  description: "Multi-arch image pushed to Docker Hub"
+                  title: "🐳 :${{ matrix.service }} Image Pushed"
+                  description: "Docker image pushed to Docker Hub"
                   status: success
-                  fields: '[{"name": "Image", "value": "`${{ env.IMAGE_NAME }}:latest`", "inline": true}, {"name": "Platforms", "value": "amd64, arm64", "inline": true}]'
+                  fields: '[{"name": "Tags", "value": "`${{ env.IMAGE_NAME }}:${{ matrix.service }}`\n`${{ env.IMAGE_NAME }}:${{ matrix.service }}-${{ steps.vars.outputs.sha_short }}`", "inline": true}, {"name": "Platforms", "value": "`${{ matrix.platforms }}`", "inline": true}]'
 
-            - name: ❌ Notify Docker build failed
+            - name: ❌ Notify :${{ matrix.service }} build failed
               if: failure()
               continue-on-error: true
               uses: nuniesmith/actions/.github/actions/discord-notify@main
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
-                  title: "❌ Futures Docker Build Failed"
-                  description: "Failed to build or push Docker image"
+                  title: "❌ :${{ matrix.service }} Docker Build Failed"
+                  description: "Failed to build or push :${{ matrix.service }} image"
                   status: failure
-                  fields: '[{"name": "Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
+                  fields: '[{"name": "Dockerfile", "value": "`${{ matrix.dockerfile }}`", "inline": true}, {"name": "Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}]'
 
     # =========================================================================
-    # Stage 4: Deploy to Production (Raspberry Pi)
+    # Stage 4: Deploy to Production (Raspberry Pi via Tailscale)
+    # =========================================================================
+    #
+    # Connects to the Pi over Tailscale VPN, then uses the shared ssh-deploy
+    # action to pull the freshly-pushed :engine and :web images (arm64 variants)
+    # and restart the services via docker compose.
+    #
+    # The :trainer image is NOT deployed to the Pi (GPU rig only).
+    #
+    # Gates:
+    #   - Only runs on push to main (same gate as docker stage)
+    #   - Only runs after ALL docker matrix jobs succeed
+    #   - Can be skipped manually via workflow_dispatch skip_deploy input
     # =========================================================================
     deploy:
         name: 🚀 Deploy to Raspberry Pi
@@ -223,6 +279,10 @@ jobs:
         steps:
             - name: 📥 Checkout code
               uses: actions/checkout@v4
+
+            - name: 🔢 Compute short SHA
+              id: vars
+              run: echo "sha_short=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
             - name: 🔌 Connect to Tailscale
               id: tailscale
@@ -247,7 +307,7 @@ jobs:
                   git-branch: main
                   docker-prune: false
                   pre-deploy-command: |
-                      echo "📦 Deploying Futures to Raspberry Pi..."
+                      echo "📦 Preparing Futures deployment on Raspberry Pi..."
 
                       # Handle git repository setup
                       if [ ! -d "$HOME/futures/.git" ]; then
@@ -304,23 +364,27 @@ jobs:
                       docker compose -f docker-compose.prod.yml down 2>/dev/null || \
                         docker compose down 2>/dev/null || true
 
-                      # Log in to Docker Hub and pull latest images
+                      # Log in to Docker Hub and pull latest per-service images
                       echo "🐳 Pulling latest images from Docker Hub..."
                       echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin 2>/dev/null || true
-                      docker compose -f docker-compose.prod.yml pull 2>/dev/null || \
-                        docker pull ${{ env.IMAGE_NAME }}:latest
 
-                      # Start services
-                      echo "🚀 Starting services..."
-                      docker compose -f docker-compose.prod.yml up -d --remove-orphans 2>/dev/null || \
-                        docker compose up -d --remove-orphans
+                      echo "==> Pulling :engine image..."
+                      docker pull ${{ env.IMAGE_NAME }}:engine
+
+                      echo "==> Pulling :web image..."
+                      docker pull ${{ env.IMAGE_NAME }}:web
+
+                      # Start services (trainer is GPU-rig only — not deployed to Pi)
+                      echo "🚀 Starting engine and web services..."
+                      docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans engine web 2>/dev/null || \
+                        docker compose up -d --no-build --remove-orphans
 
                   post-deploy-command: |
                       cd ~/futures
 
                       echo ""
                       echo "📊 Container status:"
-                      docker compose -f docker-compose.prod.yml ps 2>/dev/null || \
+                      docker compose -f docker-compose.prod.yml ps engine web 2>/dev/null || \
                         docker ps --filter "name=futures" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
                       echo ""
@@ -328,11 +392,10 @@ jobs:
                       df -h / | grep -v Filesystem
                       docker system df 2>/dev/null || true
 
-                      # Prune old images to save space on Raspberry Pi
+                      # Prune dangling images to save space on Raspberry Pi
                       echo ""
-                      echo "🧹 Pruning unused Docker resources..."
+                      echo "🧹 Pruning dangling Docker images..."
                       docker image prune -f 2>/dev/null || true
-                      docker system prune -f 2>/dev/null || true
 
                       echo ""
                       echo "🎯 Architecture:"
@@ -363,14 +426,15 @@ jobs:
               continue-on-error: true
               with:
                   webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
-                  title: "${{ steps.deploy.outcome == 'success' && '🚀 Futures Deployed' || '❌ Futures Deploy Failed' }}"
-                  description: "${{ steps.deploy.outcome == 'success' && 'Futures deployed to Raspberry Pi' || 'Failed to deploy Futures to Raspberry Pi' }}"
+                  title: "${{ steps.deploy.outcome == 'success' && '🚀 Futures Deployed to Pi' || '❌ Futures Pi Deploy Failed' }}"
+                  description: "${{ steps.deploy.outcome == 'success' && 'Engine + Web updated on Raspberry Pi' || 'Failed to deploy Futures to Raspberry Pi' }}"
                   status: ${{ steps.deploy.outcome == 'success' && 'success' || 'failure' }}
                   include-repo-info: "true"
                   fields: |
                       [
                         {"name": "Platform", "value": "🥧 Raspberry Pi (ARM64)", "inline": true},
-                        {"name": "Image", "value": "`${{ env.IMAGE_NAME }}:latest`", "inline": true},
+                        {"name": "Images", "value": "`${{ env.IMAGE_NAME }}:engine`\n`${{ env.IMAGE_NAME }}:web`", "inline": true},
+                        {"name": "Commit", "value": "`${{ steps.vars.outputs.sha_short }}`", "inline": true},
                         {"name": "Network", "value": "🔒 Tailscale VPN", "inline": true},
                         {"name": "Health", "value": "${{ steps.health-checks.outputs.healthy == 'true' && '✅ Healthy' || '⚠️ Check logs' }}", "inline": true}
                       ]
@@ -387,6 +451,8 @@ jobs:
         steps:
             - name: 📊 Generate summary
               run: |
+                  SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+
                   echo "## 📊 Futures CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
                   echo "" >> $GITHUB_STEP_SUMMARY
                   echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
@@ -399,9 +465,17 @@ jobs:
 
                   if [ "${{ needs.lint.result }}" = "success" ] && \
                      [ "${{ needs.test.result }}" = "success" ] && \
-                     [ "${{ needs.docker.result }}" = "success" ] && \
-                     [ "${{ needs.deploy.result }}" = "success" ]; then
-                    echo "### ✅ All stages completed successfully!" >> $GITHUB_STEP_SUMMARY
+                     [ "${{ needs.docker.result }}" = "success" ]; then
+                    DEPLOY="${{ needs.deploy.result }}"
+                    if [ "$DEPLOY" = "success" ]; then
+                      echo "### ✅ All stages completed — Pi updated!" >> $GITHUB_STEP_SUMMARY
+                    elif [ "$DEPLOY" = "skipped" ]; then
+                      echo "### ✅ Build + test passed (Pi deploy skipped)" >> $GITHUB_STEP_SUMMARY
+                    elif [ "$DEPLOY" = "failure" ]; then
+                      echo "### ⚠️ Build passed but Pi deploy failed — check Tailscale / SSH secrets" >> $GITHUB_STEP_SUMMARY
+                    else
+                      echo "### ✅ All stages completed successfully!" >> $GITHUB_STEP_SUMMARY
+                    fi
                   elif [ "${{ needs.lint.result }}" = "failure" ]; then
                     echo "### ❌ Pipeline failed at lint stage" >> $GITHUB_STEP_SUMMARY
                     echo "Fix linting/formatting errors before proceeding." >> $GITHUB_STEP_SUMMARY
@@ -410,21 +484,26 @@ jobs:
                     echo "Fix failing tests before deployment can proceed." >> $GITHUB_STEP_SUMMARY
                   elif [ "${{ needs.docker.result }}" = "failure" ]; then
                     echo "### ❌ Pipeline failed at Docker build stage" >> $GITHUB_STEP_SUMMARY
-                    echo "Check Dockerfile and build configuration." >> $GITHUB_STEP_SUMMARY
-                  elif [ "${{ needs.deploy.result }}" = "failure" ]; then
-                    echo "### ❌ Pipeline failed at deployment stage" >> $GITHUB_STEP_SUMMARY
-                    echo "Check SSH/Tailscale connectivity and Raspberry Pi status." >> $GITHUB_STEP_SUMMARY
-                  elif [ "${{ needs.deploy.result }}" = "skipped" ]; then
-                    echo "### ⏭️ Deployment skipped" >> $GITHUB_STEP_SUMMARY
-                    echo "Deploy only runs on push to main." >> $GITHUB_STEP_SUMMARY
+                    echo "Check Dockerfiles and build configuration." >> $GITHUB_STEP_SUMMARY
+                  elif [ "${{ needs.docker.result }}" = "skipped" ]; then
+                    echo "### ⏭️ Docker build skipped" >> $GITHUB_STEP_SUMMARY
+                    echo "Docker builds only run on push to main." >> $GITHUB_STEP_SUMMARY
                   fi
 
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "### 🐳 Docker Tags" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "| Service | Tag | Pinned Tag | Platforms |" >> $GITHUB_STEP_SUMMARY
+                  echo "|---------|-----|------------|-----------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| Engine | \`${{ env.IMAGE_NAME }}:engine\` | \`:engine-${SHA_SHORT}\` | amd64, arm64 |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Web | \`${{ env.IMAGE_NAME }}:web\` | \`:web-${SHA_SHORT}\` | amd64, arm64 |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Trainer | \`${{ env.IMAGE_NAME }}:trainer\` | \`:trainer-${SHA_SHORT}\` | amd64 |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Default | \`${{ env.IMAGE_NAME }}:latest\` | — | amd64, arm64 |" >> $GITHUB_STEP_SUMMARY
                   echo "" >> $GITHUB_STEP_SUMMARY
                   echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
                   echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
                   echo "| 🐍 Python | \`${{ env.PYTHON_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
-                  echo "| 📦 Image | \`nuniesmith/futures\` |" >> $GITHUB_STEP_SUMMARY
-                  echo "| 🏗️ Platforms | \`amd64, arm64\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| 📦 Repo | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
                   echo "| 🌿 Branch | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
                   echo "| 🔗 Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
 
