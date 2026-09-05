@@ -34,6 +34,10 @@ inputs:
         description: "Timeout in seconds for remote commands (0 = no timeout)"
         required: false
         default: "0"
+    command-retries:
+        description: "Default number of remote command attempts; use 1 for deployments with database migrations"
+        required: false
+        default: "2"
     use-tailscale-ssh:
         description: "Try Tailscale SSH first before regular SSH"
         required: false
@@ -357,6 +361,7 @@ runs:
               DOCKER_PRUNE: ${{ inputs.docker-prune }}
               # Timeout
               CMD_TIMEOUT: ${{ inputs.command-timeout }}
+              COMMAND_RETRIES: ${{ inputs.command-retries }}
               # Env generation
               ENV_SETUP_COMMAND: ${{ inputs.env-setup-command }}
               ENV_INJECT_SECRETS: ${{ inputs.env-inject-secrets }}
@@ -365,6 +370,11 @@ runs:
           run: |
               set -euo pipefail
 
+              if ! [[ "$COMMAND_RETRIES" =~ ^[1-9][0-9]*$ ]]; then
+                echo "❌ command-retries must be a positive integer" >&2
+                exit 1
+              fi
+
               # ── SSH execution helper ──────────────────────────────────────
               # Wraps commands with retry logic, optional timeout, and proper
               # error handling.  The command is piped via stdin to bash -s so
@@ -372,7 +382,7 @@ runs:
               # Usage: ssh_exec "command" [retries] [delay]
               ssh_exec() {
                 local cmd="$1"
-                local max_retries="${2:-2}"
+                local max_retries="${2:-${COMMAND_RETRIES}}"
                 local retry_delay="${3:-5}"
                 local attempt=0
                 local exit_code=0

@@ -53,26 +53,9 @@ uses: nuniesmith/actions/.github/actions/tailscale-connect@main
 
 ## Creating a Release
 
-### Using the Release Script
-
-```bash
-# Preview what would happen
-./scripts/release.sh 1.0.0 --dry-run
-
-# Create a release
-./scripts/release.sh 1.0.0
-
-# Create a minor release
-./scripts/release.sh 1.1.0
-
-# Create a major release (breaking changes)
-./scripts/release.sh 2.0.0
-
-# List existing releases
-./scripts/release.sh --list
-```
-
 ### Manual Release Process
+
+The former local release script has been removed. Create release tags directly:
 
 ```bash
 # Ensure you're on main with no uncommitted changes
@@ -135,7 +118,7 @@ When releasing a major version, create a migration guide:
 
 ## Current Releases
 
-Run `./scripts/release.sh --list` or check the [releases page](https://github.com/nuniesmith/actions/tags).
+Run `git tag --list 'v*' --sort=-version:refname` or check the [releases page](https://github.com/nuniesmith/actions/tags).
 
 ## Best Practices
 

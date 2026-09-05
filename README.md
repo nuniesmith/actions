@@ -70,12 +70,9 @@ A monorepo of reusable GitHub Actions composite actions and CI/CD workflow templ
     setup-server.yml
 docs/
   VERSIONING.md         # Release and tagging guide
-scripts/
-  release.sh            # Tag and publish a new version
-  generate-secrets.sh   # Bootstrap secrets for a new server
-  setup-dev-server.sh
-  setup-prod-server.sh
 ```
+
+Server setup and secrets generation live in [`nuniesmith/scripts`](https://github.com/nuniesmith/scripts/tree/main/scripts/setup). The setup workflow checks out that repository explicitly; this repository owns the shared actions and workflow wiring.
 
 ---
 
@@ -282,6 +279,7 @@ See [Workflow Templates](#workflow-templates) for the full list.
 | `docker-prune` | `true` | Run `docker system prune` |
 | `env-inject-secrets` | `""` | Newline-separated `KEY=VALUE` secrets to write to `.env` |
 | `ssh-retries` | `3` | SSH connection retry count |
+| `command-retries` | `2` | Deployment command attempts; use `1` when hooks run migrations or other operations that must not repeat |
 
 **Outputs:** `deployed`, `ssh-method`, `services-started`, `build-strategy-used`
 
@@ -303,7 +301,7 @@ See [Workflow Templates](#workflow-templates) for the full list.
 
 **Outputs:** `connected`, `tailscale-ip`, `target-reachable`, `ssh-reachable`
 
-Tailscale is automatically logged out in a cleanup step that runs on `always()`.
+Tailscale stays connected for subsequent steps and logs out through the Tailscale action's post-job cleanup.
 
 ---
 
@@ -638,15 +636,7 @@ This repo uses semantic versioning with both floating major tags (`v1`) and pinn
 
 ### Creating a release
 
-```bash
-# Dry-run first
-./scripts/release.sh 1.2.0 --dry-run
-
-# Publish
-./scripts/release.sh 1.2.0
-```
-
-This tags `v1.2.0` and force-moves the `v1` floating tag. See `docs/VERSIONING.md` for full guidance including major-version migration guide templates.
+Use the [manual release process](docs/VERSIONING.md#manual-release-process) to create an immutable version tag and update the matching floating major tag. The old local release script has been removed with the scripts migration.
 
 ---
 
@@ -665,6 +655,7 @@ Secrets are configured at the organisation or repository level. Not every workfl
 | `PROD_SSH_KEY` | `ssh-deploy`, `health-check`, `ssl-*` | SSH private key for the deploy user |
 | `PROD_SSH_USER` | deploy workflows | SSH username (typically `actions`) |
 | `PROD_SSH_PORT` | deploy workflows | SSH port (typically `22`) |
+| `SERVER_SETUP_SSH_PASSWORD` | manual server setup | Existing administrator's SSH/sudo password; preferred over the legacy workflow input |
 | `CLOUDFLARE_API_TOKEN` | `cloudflare-dns-update`, `ssl-certbot-cloudflare` | Cloudflare API token with DNS edit permission |
 | `CLOUDFLARE_ZONE_ID` | `cloudflare-dns-update` | Cloudflare Zone ID |
 | `DISCORD_WEBHOOK` | `discord-notify` | Discord webhook URL |
@@ -676,12 +667,17 @@ Secrets are configured at the organisation or repository level. Not every workfl
 ### Bootstrap a new server
 
 ```bash
-# Generate all secrets for a fresh host and print them for copying into GitHub
-./scripts/generate-secrets.sh
-
-# Interactive guided setup over SSH
-./scripts/setup-prod-server.sh
+# Run on the server. Download the raw script, not the GitHub HTML page.
+curl -fL https://raw.githubusercontent.com/nuniesmith/scripts/main/scripts/setup/generate-secrets.sh \
+  -o generate-secrets.sh
+bash -n generate-secrets.sh && sudo bash generate-secrets.sh --env prod
 ```
+
+If the `actions` user is missing, the generator runs canonical production setup first. To use an existing key without prompting, add `--no-confirm`. The credentials file identifies `PROD_TAILSCALE_IP`, `PROD_SSH_USER`, `PROD_SSH_PORT`, and `PROD_SSH_KEY`; copy them into the application repository's Actions secrets, such as [`nuniesmith/lifeos`](https://github.com/nuniesmith/lifeos/settings/secrets/actions). Read the private key on the server with `sudo cat /home/actions/.ssh/id_ed25519` and copy the entire BEGIN/END block.
+
+Alternatively, run this repository's **Server Setup** workflow after connecting the server to Tailscale. Configure `TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_SECRET`, and `SERVER_SETUP_SSH_PASSWORD` in this repository, then supply the existing server address, SSH user, and port. The optional `scripts_ref` chooses the canonical scripts branch, tag, or commit. Setup fails when provisioning or generation fails and prints the path to a root-owned report on the server. Read that report locally for the credentials file location; private keys are never printed in the workflow logs.
+
+Optional repository cloning requires Git access on the server, including credentials for private repositories. Setup prepares the checkout; the application's deployment workflow starts production services. Configure Tailscale HTTPS separately. Docker registry and Tailscale OAuth credentials come from those accounts, so the server generator cannot create them.
 
 ---
 

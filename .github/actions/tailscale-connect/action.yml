@@ -133,12 +133,5 @@ runs:
               echo ""
               echo "🎉 Tailscale setup complete!"
 
-        - name: 🧹 Cleanup Tailscale
-          if: always()
-          shell: bash
-          run: |
-              if command -v tailscale &> /dev/null; then
-                echo "🧹 Logging out of Tailscale..."
-                tailscale logout 2>/dev/null || true
-                echo "✅ Tailscale cleanup complete"
-              fi
+        # tailscale/github-action registers post-job cleanup. Keep the runner
+        # connected here so subsequent SSH deploy and health-check steps work.
