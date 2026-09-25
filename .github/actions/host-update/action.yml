@@ -54,6 +54,10 @@ inputs:
         description: "Space-separated services NOT rolled back when unhealthy, because they migrate their data on start"
         required: false
         default: ""
+    allow-major-services:
+        description: "Space-separated no-rollback services allowed a MAJOR version upgrade on this run (for a run started by hand, to watch)"
+        required: false
+        default: ""
     health-timeout:
         description: "Seconds a recreated service gets to become healthy"
         required: false
@@ -224,6 +228,7 @@ runs:
               SKIP: ${{ inputs.skip-services }}
               REBUILD: ${{ inputs.rebuild-services }}
               NO_ROLLBACK: ${{ inputs.no-rollback-services }}
+              ALLOW_MAJOR: ${{ inputs.allow-major-services }}
               HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
           run: |
               set -uo pipefail
@@ -232,8 +237,8 @@ runs:
               # upgrade can restart dockerd) and check nothing stayed down.
               mode=update
               [ "$DOCKER" = true ] || mode=verify
-              vars=$(printf 'MODE=%q PROJECT_PATH=%q BASELINE=%q SKIP=%q REBUILD=%q NO_ROLLBACK=%q HEALTH_TIMEOUT=%q' \
-                "$mode" "$PROJECT_PATH" "$(cat "$D/baseline")" "$SKIP" "$REBUILD" "$NO_ROLLBACK" "$HEALTH_TIMEOUT")
+              vars=$(printf 'MODE=%q PROJECT_PATH=%q BASELINE=%q SKIP=%q REBUILD=%q NO_ROLLBACK=%q ALLOW_MAJOR=%q HEALTH_TIMEOUT=%q' \
+                "$mode" "$PROJECT_PATH" "$(cat "$D/baseline")" "$SKIP" "$REBUILD" "$NO_ROLLBACK" "$ALLOW_MAJOR" "$HEALTH_TIMEOUT")
               "$D/ssh" "$vars bash -s" < "$GITHUB_ACTION_PATH/docker-update.sh" | tee "$D/docker.out"
               rc=${PIPESTATUS[0]}
               sed -n 's/^::report:://p' "$D/docker.out" > "$D/docker.report"

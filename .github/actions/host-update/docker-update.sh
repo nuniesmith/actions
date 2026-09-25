@@ -22,6 +22,9 @@
 #                             are rolled out by their own CI at an exact revision
 #   - pinned by digest, named in SKIP, or not running -> left alone
 #
+# A service in NO_ROLLBACK also takes only same-major updates, unless it is
+# named in ALLOW_MAJOR: that is for a run someone started by hand, to watch.
+#
 # Every new image is in place BEFORE anything is recreated. A recreated service
 # must come back running, unrestarted and healthy (or, with no healthcheck,
 # stay up 30s) within HEALTH_TIMEOUT. If it does not, it goes back to the image
@@ -38,7 +41,7 @@
 # image that loses its last tag cannot be tagged again.
 #
 # Env:    MODE, PROJECT_PATH (directory under $HOME), BASELINE (from snapshot),
-#         SKIP, REBUILD, NO_ROLLBACK (space-separated service names),
+#         SKIP, REBUILD, NO_ROLLBACK, ALLOW_MAJOR (space-separated services),
 #         HEALTH_TIMEOUT (seconds, default 600)
 # Output: "::report::<line>" lines for the notification, then "::changed::<n>"
 #         and "::status::ok|warn|fail". Everything else is log.
@@ -252,6 +255,20 @@ for svc in "${pull[@]}" "${rebuild[@]}"; do
         drop_pre "$svc"
         echo "  $svc: $(ver "$new") failed here before; waiting for a newer image"
         continue
+    fi
+    # A service that cannot be rolled back only takes updates within its major
+    # version. A major jump -- a floating tag moving on, or a rebuild from a
+    # checkout whose version pin never arrived -- is for a deliberate deploy,
+    # not an unattended morning with no way back.
+    if has "${NO_ROLLBACK:-}" "$svc" && ! has "${ALLOW_MAJOR:-}" "$svc"; then
+        old_v=$(ver "${PRE[$svc]:-${OLD[$svc]}}") new_v=$(ver "$new")
+        if [[ "$old_v" =~ ^[0-9]+\. && "$new_v" =~ ^[0-9]+\. && "${old_v%%.*}" != "${new_v%%.*}" ]]; then
+            if [ -n "${PRE[$svc]}" ]; then docker tag "${PRE[$svc]}" "${REF[$svc]}"; fi
+            drop_pre "$svc"
+            report "⏸️ $svc $old_v → $new_v is a major upgrade, and $svc cannot be rolled back: not applied. To take it, run the daily update by hand with allow_major: $svc"
+            warn
+            continue
+        fi
     fi
     NEW[$svc]=$new
     changed+=("$svc")
