@@ -1,0 +1,364 @@
+name: "Host Update"
+description: "Daily maintenance for one docker compose host: apt upgrade through the host's homelab-apt-upgrade helper, then refresh container images, recreate only what changed, verify, roll back failures, and report"
+author: "nuniesmith"
+
+branding:
+    icon: "refresh-cw"
+    color: "orange"
+
+# The runner must already be on the tailnet (tailscale-connect). What happens
+# on the host is in docker-update.sh and in nuniesmith/scripts
+# src/updates/homelab-apt-upgrade; this file only carries it there and reports.
+#
+# Posts to Discord when something changed or went wrong, and stays quiet on a
+# morning with nothing to do. The run's summary always has the full picture.
+
+inputs:
+    host-name:
+        description: "Name used in the report, e.g. freddy"
+        required: true
+    host:
+        description: "Host to SSH to (its Tailscale IP)"
+        required: true
+    ssh-key:
+        description: "Private key for ssh-user"
+        required: true
+    ssh-user:
+        description: "Deploy user: in the docker group, and allowed to run the apt helper through its one sudo rule"
+        required: false
+        default: "actions"
+    ssh-port:
+        description: "SSH port"
+        required: false
+        default: "22"
+    project-path:
+        description: "Compose project directory, relative to ssh-user's home"
+        required: true
+    apt:
+        description: "Upgrade apt packages (needs nuniesmith/scripts src/updates/install.sh run once on the host)"
+        required: false
+        default: "true"
+    docker:
+        description: "Refresh container images. With apt only, containers are still checked afterwards"
+        required: false
+        default: "true"
+    skip-services:
+        description: "Space-separated compose services never touched"
+        required: false
+        default: ""
+    rebuild-services:
+        description: "Space-separated locally built services to rebuild on a freshly pulled base image"
+        required: false
+        default: ""
+    no-rollback-services:
+        description: "Space-separated services NOT rolled back when unhealthy, because they migrate their data on start"
+        required: false
+        default: ""
+    health-timeout:
+        description: "Seconds a recreated service gets to become healthy"
+        required: false
+        default: "600"
+    discord-webhook:
+        description: "Discord webhook for the report"
+        required: false
+        default: ""
+    wait-for-other-runs:
+        description: "Wait for other in-progress runs in this repository (deploys) before starting"
+        required: false
+        default: "true"
+    keepalive:
+        description: "On scheduled runs, re-enable the calling workflow so GitHub's 60-day inactivity rule cannot switch its schedule off (needs permissions: actions: write)"
+        required: false
+        default: "true"
+    keepalive-workflows:
+        description: "More workflow files in this repository to keep alive the same way, e.g. one that renews TLS certificates on a schedule"
+        required: false
+        default: ""
+
+outputs:
+    status:
+        description: "ok, warn or fail"
+        value: ${{ steps.report.outputs.status }}
+    changed:
+        description: "Containers recreated on a new image"
+        value: ${{ steps.report.outputs.changed }}
+    apt-upgraded:
+        description: "Packages upgraded or newly installed"
+        value: ${{ steps.report.outputs.apt-upgraded }}
+
+runs:
+    using: "composite"
+    steps:
+        - name: ⏳ Wait for deploys already running
+          if: inputs.wait-for-other-runs == 'true'
+          shell: bash
+          env:
+              GH_TOKEN: ${{ github.token }}
+          run: |
+              # A deploy recreating containers while this pulls and recreates
+              # them would leave nobody sure which image is running.
+              for _ in $(seq 1 60); do
+                others=$(gh run list -R "$GITHUB_REPOSITORY" --status in_progress --json databaseId,workflowName \
+                  -q "[.[] | select(.databaseId != $GITHUB_RUN_ID) | .workflowName] | join(\", \")" 2>/dev/null || true)
+                [ -z "$others" ] && exit 0
+                echo "waiting for: $others"
+                sleep 30
+              done
+              echo "::warning::still running after 30 minutes: $others -- going ahead"
+
+        - name: 🔑 Connect
+          shell: bash
+          env:
+              SSH_KEY: ${{ inputs.ssh-key }}
+              HOST: ${{ inputs.host }}
+              PORT: ${{ inputs.ssh-port }}
+              SSH_USER: ${{ inputs.ssh-user }}
+          run: |
+              set -euo pipefail
+              D="$RUNNER_TEMP/host-update"
+              mkdir -p "$D"
+              umask 077
+              printf '%s\n' "$SSH_KEY" > "$D/key"
+              if ! ssh-keygen -y -f "$D/key" >/dev/null 2>&1; then
+                echo "::error::ssh-key is not a valid private key"; exit 1
+              fi
+              cat > "$D/ssh" <<EOF
+              #!/usr/bin/env bash
+              exec ssh -i "$D/key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=8 "$SSH_USER@$HOST" "\$@"
+              EOF
+              chmod 700 "$D/ssh"
+              for attempt in 1 2 3 4 5 6; do
+                if "$D/ssh" true; then touch "$D/connected"; exit 0; fi
+                echo "ssh attempt $attempt failed; retrying in 10s"
+                sleep 10
+              done
+              echo "::error::cannot SSH to $SSH_USER@$HOST"
+              exit 1
+
+        - name: 📸 Record what is up
+          shell: bash
+          env:
+              PROJECT_PATH: ${{ inputs.project-path }}
+          run: |
+              set -euo pipefail
+              D="$RUNNER_TEMP/host-update"
+              "$D/ssh" "MODE=snapshot PROJECT_PATH=$(printf %q "$PROJECT_PATH") bash -s" \
+                < "$GITHUB_ACTION_PATH/docker-update.sh" > "$D/baseline.out"
+              sed -n 's/^::baseline:://p' "$D/baseline.out" > "$D/baseline"
+              echo "up before the run: $(cat "$D/baseline")"
+
+        - name: 📦 Upgrade apt packages
+          if: inputs.apt == 'true'
+          shell: bash
+          env:
+              SSH_USER: ${{ inputs.ssh-user }}
+          run: |
+              set -uo pipefail
+              D="$RUNNER_TEMP/host-update"
+              out="$D/apt.out"
+              err="$D/apt.err"
+              # The upgrade runs as a systemd unit ON the host, so a dropped
+              # connection cannot kill dpkg halfway -- and upgrading tailscale
+              # does drop it. Running the helper again re-attaches to the
+              # upgrade, or collects the report of one that finished meanwhile,
+              # rather than starting another.
+              rc=255
+              for attempt in 1 2 3 4 5 6; do
+                "$D/ssh" sudo -n /usr/local/sbin/homelab-apt-upgrade > "$out" 2> "$err"
+                rc=$?
+                cat "$err" >&2
+                [ "$rc" -ne 255 ] && break
+                echo "connection lost (attempt $attempt); re-attaching in 30s"
+                sleep 30
+              done
+              cat "$out"
+              get() { sed -n "s/^$1=//p" "$out" | head -n1; }
+              result=$(get result)
+              count=0
+              status=fail
+              {
+                if grep -qE "a password is required|command not found|not allowed to execute" "$err"; then
+                  echo "❌ apt: homelab-apt-upgrade is not set up for $SSH_USER here (run nuniesmith/scripts src/updates/install.sh on the host)"
+                elif [ "$rc" = 255 ]; then
+                  echo "❌ apt: lost the connection and could not re-attach; the upgrade may still be running (journalctl -u homelab-apt-upgrade)"
+                elif [ -z "$result" ]; then
+                  echo "❌ apt: no report (exit $rc): $(tail -n 3 "$err" | tr '\n' ' ')"
+                else
+                  count=$(( $(get upgraded) + $(get installed) ))
+                  if [ "$count" -gt 0 ]; then
+                    names=$( { get changes; echo ", "; get new; } | tr ',' '\n' | awk 'NF {print $1}')
+                    list=$(printf '%s\n' "$names" | head -n 20 | paste -sd' ')
+                    [ "$count" -gt 20 ] && list="$list and $((count - 20)) more"
+                    echo "📦 $count package(s) upgraded: $list"
+                  fi
+                  reboot=$(get reboot)
+                  kernel=$(get kernel)
+                  [ -n "$reboot" ] && echo "🔁 reboot needed${kernel:+ ($kernel)}, for: $reboot"
+                  warnings=$(get warnings)
+                  [ -n "$warnings" ] && echo "⚠️ apt: $warnings"
+                  if [ "$result" = failed ]; then
+                    echo "❌ apt upgrade failed: $(get log_tail | tr '|' '\n' | grep -v '^$' | tail -n 3 | paste -sd' ')"
+                  fi
+                  status=$result
+                  [ "$status" = failed ] && status=fail
+                fi
+              } > "$D/apt.report"
+              echo "$status" > "$D/apt.status"
+              echo "$count" > "$D/apt.count"
+              {
+                echo "- changes: $(get changes)"
+                echo "- new: $(get new)"
+                echo "- held back: $(get kept_back)"
+                echo "- still running old libraries until restarted: $(get stale_services)"
+              } > "$D/apt.details"
+              exit 0
+
+        - name: 🐳 Refresh container images
+          if: inputs.docker == 'true' || inputs.apt == 'true'
+          shell: bash
+          env:
+              DOCKER: ${{ inputs.docker }}
+              PROJECT_PATH: ${{ inputs.project-path }}
+              SKIP: ${{ inputs.skip-services }}
+              REBUILD: ${{ inputs.rebuild-services }}
+              NO_ROLLBACK: ${{ inputs.no-rollback-services }}
+              HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
+          run: |
+              set -uo pipefail
+              D="$RUNNER_TEMP/host-update"
+              # With apt only, still wait for every container that was up (the
+              # upgrade can restart dockerd) and check nothing stayed down.
+              mode=update
+              [ "$DOCKER" = true ] || mode=verify
+              vars=$(printf 'MODE=%q PROJECT_PATH=%q BASELINE=%q SKIP=%q REBUILD=%q NO_ROLLBACK=%q HEALTH_TIMEOUT=%q' \
+                "$mode" "$PROJECT_PATH" "$(cat "$D/baseline")" "$SKIP" "$REBUILD" "$NO_ROLLBACK" "$HEALTH_TIMEOUT")
+              "$D/ssh" "$vars bash -s" < "$GITHUB_ACTION_PATH/docker-update.sh" | tee "$D/docker.out"
+              rc=${PIPESTATUS[0]}
+              sed -n 's/^::report:://p' "$D/docker.out" > "$D/docker.report"
+              status=$(sed -n 's/^::status:://p' "$D/docker.out" | tail -n1)
+              if [ -z "$status" ]; then
+                # No verdict is a failure, never a pass: the script prints one
+                # on every path it controls.
+                echo "❌ containers: the check ended without a verdict (exit $rc; 255 means the connection dropped)" >> "$D/docker.report"
+                status=fail
+              fi
+              echo "$status" > "$D/docker.status"
+              sed -n 's/^::changed:://p' "$D/docker.out" | tail -n1 > "$D/docker.changed"
+              sed -n 's/^::checked:://p' "$D/docker.out" | tail -n1 > "$D/docker.checked"
+              exit 0
+
+        - name: 📝 Report
+          id: report
+          if: always()
+          shell: bash
+          env:
+              HOST_NAME: ${{ inputs.host-name }}
+              APT: ${{ inputs.apt }}
+              DOCKER: ${{ inputs.docker }}
+          run: |
+              set -uo pipefail
+              D="$RUNNER_TEMP/host-update"
+              worst=ok
+              bump() { case "$1" in ok) ;; warn) [ "$worst" = fail ] || worst=warn ;; *) worst=fail ;; esac; }
+              lines=()
+              if [ ! -f "$D/connected" ]; then
+                lines+=("❌ could not SSH to the host, so nothing was checked")
+                worst=fail
+              elif [ ! -f "$D/baseline" ]; then
+                lines+=("❌ could not read the compose project, so nothing was checked")
+                worst=fail
+              fi
+              for phase in apt docker; do
+                if [ -f "$D/$phase.status" ]; then
+                  bump "$(cat "$D/$phase.status")"
+                  mapfile -t -O "${#lines[@]}" lines < "$D/$phase.report"
+                fi
+              done
+              # A phase that should have run and left no verdict failed.
+              if [ -f "$D/baseline" ]; then
+                if [ "$APT" = true ] && [ ! -f "$D/apt.status" ]; then lines+=("❌ apt: did not run"); worst=fail; fi
+                if [ ! -f "$D/docker.status" ]; then lines+=("❌ containers: not checked"); worst=fail; fi
+              fi
+              changed=$(cat "$D/docker.changed" 2>/dev/null || true)
+              upgraded=$(cat "$D/apt.count" 2>/dev/null || true)
+              changed=${changed:-0}
+              upgraded=${upgraded:-0}
+
+              notify=false
+              if [ "$changed" -gt 0 ] || [ "$upgraded" -gt 0 ] || [ "$worst" != ok ]; then notify=true; fi
+              run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+              if [ ${#lines[@]} -eq 0 ]; then lines=("✅ everything already up to date"); fi
+              text=$(printf '%s\n' "${lines[@]}" | cut -c1-600)
+              text="${text:0:3800}"$'\n'"[run log]($run_url)"
+
+              {
+                echo "## 🌅 $HOST_NAME daily update: $worst"
+                echo
+                printf -- '- %s\n' "${lines[@]}"
+                echo
+                echo "Images checked: $(cat "$D/docker.checked" 2>/dev/null || echo "not run"). Recreated: $changed. Packages upgraded: $upgraded."
+                if [ -f "$D/apt.details" ]; then
+                  echo; echo "<details><summary>apt details</summary>"; echo; cat "$D/apt.details"; echo; echo "</details>"
+                fi
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              case "$worst" in ok) colour=success ;; warn) colour=warning ;; *) colour=failure ;; esac
+              {
+                echo "status=$worst"
+                echo "changed=$changed"
+                echo "apt-upgraded=$upgraded"
+                echo "notify=$notify"
+                echo "discord-status=$colour"
+                echo "report<<__HOST_UPDATE_REPORT__"
+                printf '%s\n' "$text"
+                echo "__HOST_UPDATE_REPORT__"
+              } >> "$GITHUB_OUTPUT"
+              printf '%s\n' "$text"
+
+        - name: 📣 Discord
+          if: always() && inputs.discord-webhook != '' && steps.report.outputs.notify == 'true'
+          uses: nuniesmith/actions/.github/actions/discord-notify@main
+          continue-on-error: true
+          with:
+              webhook-url: ${{ inputs.discord-webhook }}
+              title: "🌅 ${{ inputs.host-name }} daily update"
+              description: ${{ steps.report.outputs.report }}
+              status: ${{ steps.report.outputs.discord-status }}
+              include-timestamp: "true"
+
+        - name: 🫀 Keep the schedule alive
+          if: always() && inputs.keepalive == 'true' && github.event_name == 'schedule'
+          shell: bash
+          env:
+              GH_TOKEN: ${{ github.token }}
+              MORE: ${{ inputs.keepalive-workflows }}
+          run: |
+              # GitHub switches off a PUBLIC repository's scheduled workflows
+              # after 60 days with no activity, and says nothing: the updates
+              # (or a certificate renewal) would simply stop. Re-enabling a
+              # workflow through the API resets that clock without a commit
+              # (keepalive-workflow's method).
+              self=${GITHUB_WORKFLOW_REF%@*}
+              self=${self##*/}
+              for wf in $self $MORE; do
+                if gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/enable" >/dev/null; then
+                  echo "re-enabled $wf"
+                else
+                  echo "::warning::could not re-enable $wf (the job needs permissions: actions: write); its schedule stops after 60 quiet days"
+                fi
+              done
+
+        - name: 🏁 Result
+          if: always()
+          shell: bash
+          env:
+              STATUS: ${{ steps.report.outputs.status }}
+              HOST_NAME: ${{ inputs.host-name }}
+          run: |
+              case "$STATUS" in
+                ok) echo "✅ $HOST_NAME: done" ;;
+                warn) echo "::warning::$HOST_NAME: finished with warnings -- see the run summary" ;;
+                *) echo "::error::$HOST_NAME: the daily update needs attention -- see the run summary"; exit 1 ;;
+              esac

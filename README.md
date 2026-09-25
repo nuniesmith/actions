@@ -15,6 +15,7 @@ A monorepo of reusable GitHub Actions composite actions and CI/CD workflow templ
   - [ssh-deploy](#ssh-deploy)
   - [tailscale-connect](#tailscale-connect)
   - [health-check](#health-check)
+  - [host-update](#host-update)
   - [discord-notify](#discord-notify)
   - [cloudflare-dns-update](#cloudflare-dns-update)
   - [ssl-certbot-cloudflare](#ssl-certbot-cloudflare)
@@ -42,6 +43,7 @@ A monorepo of reusable GitHub Actions composite actions and CI/CD workflow templ
     ssh-deploy/
     tailscale-connect/
     health-check/
+    host-update/
     discord-notify/
     cloudflare-dns-update/
     ssl-certbot-cloudflare/
@@ -337,6 +339,34 @@ Tailscale stays connected for subsequent steps and logs out through the Tailscal
 ```
 
 **Outputs:** `healthy`, `endpoints-healthy`, `containers-healthy`, `failed-checks`
+
+---
+
+### `host-update`
+
+> Daily maintenance for one docker compose host: apt upgrade, then fresh images for third-party services, recreated only where the image changed, each proven healthy or rolled back. Posts to Discord when something changed or went wrong; quiet otherwise.
+
+```yaml
+- uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+  with:
+    oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+    oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+- uses: nuniesmith/actions/.github/actions/host-update@main
+  with:
+    host-name: freddy
+    host: ${{ secrets.FREDDY_TAILSCALE_IP }}
+    ssh-key: ${{ secrets.SSH_KEY }}
+    project-path: freddy                  # compose project dir under ~actions
+    rebuild-services: nextcloud           # built here: rebuild on a fresh base
+    no-rollback-services: nextcloud       # migrates data on start: report, never revert
+    discord-webhook: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+```
+
+- **apt** runs through `homelab-apt-upgrade` on the host (nuniesmith/scripts `src/updates`, installed once with its `install.sh`), which the deploy user may run through one no-arguments sudo rule. The upgrade runs as a systemd unit, so a dropped connection cannot kill dpkg halfway. It never reboots; the report says when a reboot is needed.
+- **Images:** first-party images (`ghcr.io/nuniesmith/*`, `nuniesmith/*`) are skipped because their own CI rolls them out at an exact revision. Every new image is pulled before anything is recreated. An image that failed is not retried until its tag moves on, and the one a service ran before stays tagged `rollback/<project>-<service>:previous`.
+- **Scheduling:** call it from a `schedule:` workflow with `permissions: actions: write`, so it can wait for deploys in progress and keep the schedule alive. GitHub disables a public repository's schedules after 60 days without a commit.
+
+**Outputs:** `status` (`ok`/`warn`/`fail`), `changed`, `apt-upgraded`
 
 ---
 
