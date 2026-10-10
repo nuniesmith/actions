@@ -1,0 +1,91 @@
+# Reusable workflow: publish a Rust crate to crates.io.
+#
+# Usage from a crate repo:
+#   jobs:
+#     publish:
+#       uses: nuniesmith/actions/.github/workflows/rust-crate-publish.yml@v1
+#       with:
+#         crate-path: crates/my-crate   # default: "."
+#         tag-prefix: "v"               # default: "v"
+#       secrets: inherit                # must provide CRATES_IO_TOKEN (org secret)
+#
+# Trigger it on tag push, e.g.:
+#   on:
+#     push:
+#       tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+name: Publish Rust crate to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      crate-path:
+        description: "Crate directory, relative to repo root"
+        required: false
+        default: "."
+        type: string
+      package:
+        description: "cargo -p selector (for workspaces); empty = the crate at crate-path"
+        required: false
+        default: ""
+        type: string
+      tag-prefix:
+        description: "Tag prefix stripped before comparing to Cargo.toml version"
+        required: false
+        default: "v"
+        type: string
+      publish-args:
+        description: "Extra args appended to cargo publish (e.g. --no-verify)"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      CRATES_IO_TOKEN:
+        description: "crates.io API token (org-level secret)"
+        required: true
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.crate-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags needed for the version check
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.package }}" ]; then
+            VER=$(cargo metadata --no-deps --format-version 1 -p "${{ inputs.package }}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+          else
+            VER=$(cargo metadata --no-deps --format-version 1 --manifest-path Cargo.toml \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+          fi
+          TAG="${GITHUB_REF_NAME#${{ inputs.tag-prefix }}}"
+          echo "Cargo.toml version: $VER"
+          echo "Tag version:        $TAG"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::Tag '${{ github.ref_name }}' does not match Cargo.toml version '$VER'. Refusing to publish."
+            exit 1
+          fi
+
+      - name: Dry run
+        run: cargo publish --dry-run ${{ inputs.publish-args }}
+
+      - name: Publish
+        run: cargo publish ${{ inputs.publish-args }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
