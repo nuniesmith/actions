@@ -1,0 +1,36 @@
+name: "Crate version bump"
+description: "Bump version strings in Cargo.toml (single crate or workspace lockstep). Does not commit."
+author: "nuniesmith"
+
+branding:
+  icon: "tag"
+  color: "orange"
+
+inputs:
+  new-version:
+    description: "New version, e.g. 1.2.3"
+    required: true
+  manifest-dir:
+    description: "Directory containing Cargo.toml, relative to repo root"
+    required: false
+    default: "."
+  workspace-mode:
+    description: "true = bump [workspace.package] version + internal dependency pins"
+    required: false
+    default: "false"
+  internal-crates:
+    description: "Comma-separated crate names whose version pins to update (workspace mode)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Bump version
+      shell: bash
+      run: python3 "${{ github.action_path }}/bump.py"
+      env:
+        NEW_VERSION: ${{ inputs.new-version }}
+        MANIFEST_DIR: ${{ inputs.manifest-dir }}
+        WORKSPACE_MODE: ${{ inputs.workspace-mode }}
+        INTERNAL_CRATES: ${{ inputs.internal-crates }}
